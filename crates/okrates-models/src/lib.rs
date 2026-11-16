@@ -4,4 +4,6 @@
 #![warn(missing_docs)]
 
 pub mod bcc;
+pub mod fecr;
+pub mod multi_vacancy;
 pub mod vacancy;

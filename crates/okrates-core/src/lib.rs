@@ -5,6 +5,8 @@
 
 pub mod checkpoint;
 pub mod clock;
+pub mod ensemble;
+pub mod incremental;
 pub mod model;
 pub mod rate;
 pub mod reference;
@@ -13,6 +15,8 @@ pub mod simulation;
 
 pub use checkpoint::{CheckpointError, Checkpointable, SCHEMA_VERSION};
 pub use clock::{Clock, ClockError};
+pub use ensemble::{EnsembleError, Replica, run_replicas};
+pub use incremental::{IncrementalModel, IncrementalSimulation, SumTree};
 pub use model::Model;
 pub use rate::{Rate, RateError};
 pub use rng::KmcRng;

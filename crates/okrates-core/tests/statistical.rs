@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use okrates_core::reference::GraphRandomWalk;
-use okrates_core::{Simulation, Step};
+use okrates_core::{IncrementalSimulation, Simulation, Step};
 
 const N_HUB: usize = 200_000;
 const N_LEAF: usize = 200_000;
@@ -31,38 +31,57 @@ fn star() -> GraphRandomWalk {
     .unwrap()
 }
 
-fn sample() -> &'static Sample {
+fn build_sample(seed: u64, incremental: bool) -> Sample {
+    let mut direct = Simulation::new(star(), 0, seed);
+    let mut inc = IncrementalSimulation::new(star(), 0, seed).unwrap();
+    let mut hub_departures = Vec::with_capacity(N_HUB);
+    let mut leaf_waiting_times = Vec::with_capacity(N_LEAF);
+    for _ in 0..(N_HUB + N_LEAF) {
+        let (before, step, after) = if incremental {
+            let before = *inc.state();
+            let step = inc.step().unwrap();
+            (before, step, *inc.state())
+        } else {
+            let before = *direct.state();
+            let step = direct.step().unwrap();
+            (before, step, *direct.state())
+        };
+        // Invariants after every event: the event was enumerated from the
+        // current state, apply moved the walker to its target, and the
+        // state stays inside the graph.
+        if let Step::Fired { event, .. } = &step {
+            assert_eq!(event.from, before);
+            assert_eq!(after, event.to);
+        }
+        assert!(after < star_nodes());
+        match step {
+            Step::Fired { event, dt } if event.from == 0 => {
+                hub_departures.push((event.to, dt));
+            }
+            Step::Fired { dt, .. } => leaf_waiting_times.push(dt),
+            Step::Absorbed => panic!("star graph unexpectedly absorbed"),
+        }
+    }
+    assert_eq!(hub_departures.len(), N_HUB);
+    assert_eq!(leaf_waiting_times.len(), N_LEAF);
+    Sample {
+        hub_departures,
+        leaf_waiting_times,
+    }
+}
+
+fn star_nodes() -> usize {
+    star().node_count()
+}
+
+fn sample_direct() -> &'static Sample {
     static SAMPLE: OnceLock<Sample> = OnceLock::new();
-    SAMPLE.get_or_init(|| {
-        let mut simulation = Simulation::new(star(), 0, 20261116);
-        let mut hub_departures = Vec::with_capacity(N_HUB);
-        let mut leaf_waiting_times = Vec::with_capacity(N_LEAF);
-        for _ in 0..(N_HUB + N_LEAF) {
-            let before = *simulation.state();
-            let step = simulation.step().unwrap();
-            // Invariants after every event: the event was enumerated from the
-            // current state, apply moved the walker to its target, and the
-            // state stays inside the graph.
-            if let Step::Fired { event, .. } = &step {
-                assert_eq!(event.from, before);
-                assert_eq!(*simulation.state(), event.to);
-            }
-            assert!(*simulation.state() < simulation.model().node_count());
-            match step {
-                Step::Fired { event, dt } if event.from == 0 => {
-                    hub_departures.push((event.to, dt));
-                }
-                Step::Fired { dt, .. } => leaf_waiting_times.push(dt),
-                Step::Absorbed => panic!("star graph unexpectedly absorbed"),
-            }
-        }
-        assert_eq!(hub_departures.len(), N_HUB);
-        assert_eq!(leaf_waiting_times.len(), N_LEAF);
-        Sample {
-            hub_departures,
-            leaf_waiting_times,
-        }
-    })
+    SAMPLE.get_or_init(|| build_sample(20261116, false))
+}
+
+fn sample_incremental() -> &'static Sample {
+    static SAMPLE: OnceLock<Sample> = OnceLock::new();
+    SAMPLE.get_or_init(|| build_sample(20261118, true))
 }
 
 fn mean(values: impl Iterator<Item = f64>, n: usize) -> f64 {
@@ -83,9 +102,7 @@ fn ks_exponential(samples: &[f64], rate: f64) -> f64 {
     nf.sqrt() * d
 }
 
-#[test]
-fn selection_frequencies_match_rates() {
-    let sample = sample();
+fn check_selection_frequencies_match_rates(sample: &Sample) {
     let weights = [1.0, 2.0, 3.0, 4.0];
     let mut chi2 = 0.0;
     for (index, weight) in weights.into_iter().enumerate() {
@@ -110,27 +127,21 @@ fn selection_frequencies_match_rates() {
     println!("chi2={chi2}");
 }
 
-#[test]
-fn hub_waiting_time_mean() {
-    let sample = sample();
+fn check_hub_waiting_time_mean(sample: &Sample) {
     let observed_mean = mean(sample.hub_departures.iter().map(|&(_, dt)| dt), N_HUB);
     let z = (observed_mean - 0.1) / (0.1 / (N_HUB as f64).sqrt());
     assert!(z.abs() <= Z_CRIT, "z={z}");
     println!("hub z={z}");
 }
 
-#[test]
-fn hub_waiting_time_ks() {
-    let sample = sample();
+fn check_hub_waiting_time_ks(sample: &Sample) {
     let waiting_times: Vec<f64> = sample.hub_departures.iter().map(|&(_, dt)| dt).collect();
     let ks = ks_exponential(&waiting_times, 10.0);
     assert!(ks <= KS_LAMBDA_CRIT, "ks={ks}");
     println!("hub ks={ks}");
 }
 
-#[test]
-fn leaf_waiting_time_mean_and_ks() {
-    let sample = sample();
+fn check_leaf_waiting_time_mean_and_ks(sample: &Sample) {
     let observed_mean = mean(sample.leaf_waiting_times.iter().copied(), N_LEAF);
     let z = (observed_mean - 2.0) / (2.0 / (N_LEAF as f64).sqrt());
     assert!(z.abs() <= Z_CRIT, "leaf z={z}");
@@ -140,9 +151,7 @@ fn leaf_waiting_time_mean_and_ks() {
     println!("leaf ks={ks}");
 }
 
-#[test]
-fn waiting_time_independent_of_selected_event() {
-    let sample = sample();
+fn check_waiting_time_independent_of_selected_event(sample: &Sample) {
     let mut z_values = Vec::with_capacity(4);
     for target in 1..=4 {
         let values: Vec<f64> = sample
@@ -157,4 +166,54 @@ fn waiting_time_independent_of_selected_event() {
         z_values.push(z);
     }
     println!("conditioned z={z_values:?}");
+}
+
+#[test]
+fn selection_frequencies_match_rates_direct() {
+    check_selection_frequencies_match_rates(sample_direct());
+}
+
+#[test]
+fn selection_frequencies_match_rates_incremental() {
+    check_selection_frequencies_match_rates(sample_incremental());
+}
+
+#[test]
+fn hub_waiting_time_mean_direct() {
+    check_hub_waiting_time_mean(sample_direct());
+}
+
+#[test]
+fn hub_waiting_time_mean_incremental() {
+    check_hub_waiting_time_mean(sample_incremental());
+}
+
+#[test]
+fn hub_waiting_time_ks_direct() {
+    check_hub_waiting_time_ks(sample_direct());
+}
+
+#[test]
+fn hub_waiting_time_ks_incremental() {
+    check_hub_waiting_time_ks(sample_incremental());
+}
+
+#[test]
+fn leaf_waiting_time_mean_and_ks_direct() {
+    check_leaf_waiting_time_mean_and_ks(sample_direct());
+}
+
+#[test]
+fn leaf_waiting_time_mean_and_ks_incremental() {
+    check_leaf_waiting_time_mean_and_ks(sample_incremental());
+}
+
+#[test]
+fn waiting_time_independent_of_selected_event_direct() {
+    check_waiting_time_independent_of_selected_event(sample_direct());
+}
+
+#[test]
+fn waiting_time_independent_of_selected_event_incremental() {
+    check_waiting_time_independent_of_selected_event(sample_incremental());
 }

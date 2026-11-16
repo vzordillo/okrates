@@ -1,6 +1,7 @@
 use std::env;
 use std::process;
 
+use okrates_core::ensemble::{run_replicas, thread_count};
 use okrates_core::{Simulation, Step};
 use okrates_models::bcc::BccLattice;
 use okrates_models::vacancy::{VacancyDiffusion, jump_rate};
@@ -101,10 +102,12 @@ fn main() {
     let mut estimates = Vec::with_capacity(runs);
     let mut total_fired_steps = 0_u64;
 
-    for run in 0..runs {
-        let seed = seed_base + run as u64;
-        let (estimate, fired_steps) =
-            estimate_one_run(&lattice, seed, rate, LATTICE_PARAMETER_M, t_end);
+    let replicas = run_replicas(seed_base, runs as u64, |_, seed| {
+        estimate_one_run(&lattice, seed, rate, LATTICE_PARAMETER_M, t_end)
+    })
+    .expect("the argument parser rejects seed overflow");
+    for replica in replicas {
+        let (estimate, fired_steps) = replica.value;
         estimates.push(estimate);
         total_fired_steps += fired_steps;
     }
@@ -142,4 +145,5 @@ fn main() {
     println!("runs = {runs}");
     println!("seed_base = {seed_base}");
     println!("total_fired_steps = {total_fired_steps}");
+    eprintln!("threads = {}", thread_count());
 }

@@ -23,7 +23,7 @@ cargo test
 cargo run --example random_walk -- 42 5
 ```
 
-Python (in any virtualenv or conda environment):
+Python (in any virtualenv or conda environment; numpy >= 2.2 is installed as a dependency):
 
 ```console
 pip install maturin==1.16.0

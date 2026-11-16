@@ -3,6 +3,7 @@
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import okrates
@@ -33,8 +34,12 @@ def test_parity_with_rust_example(seed):
         cells=CELLS, jump_rate=rate, lattice_parameter_m=A, seed=seed, steps=steps
     )
     assert len(py_times) == steps + 1
-    assert py_times == times
-    assert py_sq == sq
+    for array in (py_times, py_sq):
+        assert isinstance(array, np.ndarray)
+        assert array.dtype == np.float64
+        assert array.ndim == 1
+    assert py_times.tolist() == times
+    assert py_sq.tolist() == sq
 
 
 @pytest.mark.parametrize("kwargs", [

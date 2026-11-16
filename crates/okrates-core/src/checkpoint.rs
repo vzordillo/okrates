@@ -3,7 +3,9 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::clock::Clock;
 use crate::model::Model;
+use crate::rng::KmcRng;
 
 /// The checkpoint schema version written and accepted by this crate.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -123,4 +125,91 @@ impl<'a> Reader<'a> {
     pub(crate) fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
+}
+
+/// Encodes a checkpoint in schema version 1.
+pub(crate) fn encode<M: Checkpointable>(
+    steps: u64,
+    clock: &Clock,
+    rng: &KmcRng,
+    model: &M,
+    state: &M::State,
+) -> Vec<u8> {
+    let (seed, stream, word_pos) = rng.export_state();
+    let mut out = Vec::new();
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    out.extend_from_slice(&steps.to_le_bytes());
+    out.extend_from_slice(&clock.time().to_bits().to_le_bytes());
+    out.extend_from_slice(&seed);
+    out.extend_from_slice(&stream.to_le_bytes());
+    out.extend_from_slice(&word_pos.to_le_bytes());
+    let id = M::MODEL_ID.as_bytes();
+    out.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    out.extend_from_slice(id);
+    let mut params = Vec::new();
+    model.encode_params(&mut params);
+    out.extend_from_slice(&(params.len() as u64).to_le_bytes());
+    out.extend_from_slice(&params);
+    let mut state_bytes = Vec::new();
+    model.encode_state(state, &mut state_bytes);
+    out.extend_from_slice(&(state_bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(&state_bytes);
+    out
+}
+
+/// Decodes and validates a checkpoint against `model`.
+pub(crate) fn decode<M: Checkpointable>(
+    model: &M,
+    bytes: &[u8],
+) -> Result<(u64, Clock, KmcRng, M::State), CheckpointError> {
+    let mut reader = Reader::new(bytes);
+    if reader.take(MAGIC.len())? != MAGIC {
+        return Err(CheckpointError::BadMagic);
+    }
+    let version = reader.u32()?;
+    if version != SCHEMA_VERSION {
+        return Err(CheckpointError::UnsupportedVersion(version));
+    }
+    let steps = reader.u64()?;
+    let time = f64::from_bits(reader.u64()?);
+    let seed = reader.array::<32>()?;
+    let stream = reader.u64()?;
+    let word_pos = reader.u128()?;
+    let id_len = usize::try_from(reader.u32()?).map_err(|_| CheckpointError::Truncated)?;
+    let id = reader.take(id_len)?;
+    let params = reader.section()?;
+    let state_bytes = reader.section()?;
+    if !reader.is_empty() {
+        return Err(CheckpointError::TrailingBytes);
+    }
+    // A negative sign bit also rejects -0.0, which Clock::new cannot restore bitwise.
+    if !time.is_finite() || time.is_sign_negative() {
+        return Err(CheckpointError::InvalidTime(time));
+    }
+    if id != M::MODEL_ID.as_bytes() {
+        return Err(CheckpointError::ModelMismatch);
+    }
+    let mut expected = Vec::new();
+    model.encode_params(&mut expected);
+    if params != expected {
+        return Err(CheckpointError::ParamsMismatch);
+    }
+    let state = model
+        .decode_state(state_bytes)
+        .map_err(CheckpointError::InvalidState)?;
+
+    // 0.0 + time is exact, so advancing a new clock restores the stored bits.
+    let mut clock = Clock::new();
+    if time > 0.0 {
+        clock
+            .advance(time)
+            .map_err(|_| CheckpointError::InvalidTime(time))?;
+    }
+    Ok((
+        steps,
+        clock,
+        KmcRng::from_state(seed, stream, word_pos),
+        state,
+    ))
 }

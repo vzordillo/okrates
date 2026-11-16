@@ -1,5 +1,6 @@
 //! Validates the vacancy MSD against D_v = r a^2.
 
+use okrates_core::ensemble::run_replicas;
 use okrates_core::{Simulation, Step};
 use okrates_models::bcc::{BccLattice, DISPLACEMENTS};
 use okrates_models::vacancy::VacancyDiffusion;
@@ -81,9 +82,13 @@ fn invariants_hold_after_every_event() {
 #[test]
 fn vacancy_msd_matches_rate_times_a_squared() {
     let lattice = BccLattice::new(CELLS).unwrap();
-    let estimates = (0..M)
-        .map(|run| estimate_one_run(&lattice, SEED_BASE + run as u64, RATE, A, T_END))
-        .collect::<Vec<_>>();
+    let estimates = run_replicas(SEED_BASE, M as u64, |_, seed| {
+        estimate_one_run(&lattice, seed, RATE, A, T_END)
+    })
+    .unwrap()
+    .into_iter()
+    .map(|r| r.value)
+    .collect::<Vec<_>>();
     let d_hat = estimates.iter().sum::<f64>() / M as f64;
     let variance = estimates
         .iter()

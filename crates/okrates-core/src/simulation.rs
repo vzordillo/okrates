@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::checkpoint::{CheckpointError, Checkpointable, MAGIC, Reader, SCHEMA_VERSION};
+use crate::checkpoint::{self, CheckpointError, Checkpointable};
 use crate::clock::{Clock, ClockError};
 use crate::model::Model;
 use crate::rate::{Rate, RateError};
@@ -204,79 +204,17 @@ impl<M: Model> Simulation<M> {
 impl<M: Checkpointable> Simulation<M> {
     /// Encodes the simulation as a checkpoint in schema version 1.
     pub fn checkpoint(&self) -> Vec<u8> {
-        let (seed, stream, word_pos) = self.rng.export_state();
-        let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
-        out.extend_from_slice(&self.steps.to_le_bytes());
-        out.extend_from_slice(&self.clock.time().to_bits().to_le_bytes());
-        out.extend_from_slice(&seed);
-        out.extend_from_slice(&stream.to_le_bytes());
-        out.extend_from_slice(&word_pos.to_le_bytes());
-        let id = M::MODEL_ID.as_bytes();
-        out.extend_from_slice(&(id.len() as u32).to_le_bytes());
-        out.extend_from_slice(id);
-        let mut params = Vec::new();
-        self.model.encode_params(&mut params);
-        out.extend_from_slice(&(params.len() as u64).to_le_bytes());
-        out.extend_from_slice(&params);
-        let mut state = Vec::new();
-        self.model.encode_state(&self.state, &mut state);
-        out.extend_from_slice(&(state.len() as u64).to_le_bytes());
-        out.extend_from_slice(&state);
-        out
+        checkpoint::encode(self.steps, &self.clock, &self.rng, &self.model, &self.state)
     }
 
     /// Rebuilds a simulation from `bytes`, validating them against `model`.
     pub fn resume(model: M, bytes: &[u8]) -> Result<Self, CheckpointError> {
-        let mut reader = Reader::new(bytes);
-        if reader.take(MAGIC.len())? != MAGIC {
-            return Err(CheckpointError::BadMagic);
-        }
-        let version = reader.u32()?;
-        if version != SCHEMA_VERSION {
-            return Err(CheckpointError::UnsupportedVersion(version));
-        }
-        let steps = reader.u64()?;
-        let time = f64::from_bits(reader.u64()?);
-        let seed = reader.array::<32>()?;
-        let stream = reader.u64()?;
-        let word_pos = reader.u128()?;
-        let id_len = usize::try_from(reader.u32()?).map_err(|_| CheckpointError::Truncated)?;
-        let id = reader.take(id_len)?;
-        let params = reader.section()?;
-        let state_bytes = reader.section()?;
-        if !reader.is_empty() {
-            return Err(CheckpointError::TrailingBytes);
-        }
-        // A negative sign bit also rejects -0.0, which Clock::new cannot restore bitwise.
-        if !time.is_finite() || time.is_sign_negative() {
-            return Err(CheckpointError::InvalidTime(time));
-        }
-        if id != M::MODEL_ID.as_bytes() {
-            return Err(CheckpointError::ModelMismatch);
-        }
-        let mut expected = Vec::new();
-        model.encode_params(&mut expected);
-        if params != expected {
-            return Err(CheckpointError::ParamsMismatch);
-        }
-        let state = model
-            .decode_state(state_bytes)
-            .map_err(CheckpointError::InvalidState)?;
-
-        // 0.0 + time is exact, so advancing a new clock restores the stored bits.
-        let mut clock = Clock::new();
-        if time > 0.0 {
-            clock
-                .advance(time)
-                .map_err(|_| CheckpointError::InvalidTime(time))?;
-        }
+        let (steps, clock, rng, state) = checkpoint::decode(&model, bytes)?;
         Ok(Self {
             model,
             state,
             clock,
-            rng: KmcRng::from_state(seed, stream, word_pos),
+            rng,
             steps,
             events: Vec::new(),
             rates: Vec::new(),

@@ -10,3 +10,4 @@ license = "MIT"
 
 [workspace.dependencies]
 rand_chacha = "0.10.0"
+rayon = "1.12.0"

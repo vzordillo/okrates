@@ -5,6 +5,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::checkpoint::Checkpointable;
+use crate::incremental::IncrementalModel;
 use crate::model::Model;
 
 /// A hop from one graph node to another.
@@ -23,6 +24,8 @@ pub struct Hop {
 #[derive(Clone, Debug)]
 pub struct GraphRandomWalk {
     adjacency: Vec<Vec<(usize, f64)>>,
+    offsets: Vec<usize>,
+    slot_source: Vec<usize>,
 }
 
 impl GraphRandomWalk {
@@ -36,7 +39,18 @@ impl GraphRandomWalk {
                 }
             }
         }
-        Ok(Self { adjacency })
+        let mut offsets = Vec::with_capacity(nodes + 1);
+        let mut slot_source = Vec::new();
+        offsets.push(0);
+        for (from, edges) in adjacency.iter().enumerate() {
+            slot_source.extend(std::iter::repeat_n(from, edges.len()));
+            offsets.push(slot_source.len());
+        }
+        Ok(Self {
+            adjacency,
+            offsets,
+            slot_source,
+        })
     }
 
     /// Returns the number of nodes in this graph.
@@ -92,6 +106,36 @@ impl Model for GraphRandomWalk {
     fn apply(&self, state: &mut Self::State, event: &Self::Event) -> Result<(), Self::Error> {
         *state = event.to;
         Ok(())
+    }
+}
+
+impl IncrementalModel for GraphRandomWalk {
+    /// Returns the total number of edges; slots are global edge indices.
+    fn slot_count(&self, _state: &Self::State) -> usize {
+        self.slot_source.len()
+    }
+
+    fn slot_rate(&self, state: &Self::State, slot: usize) -> f64 {
+        let from = self.slot_source[slot];
+        if from == *state {
+            self.adjacency[from][slot - self.offsets[from]].1
+        } else {
+            0.0
+        }
+    }
+
+    fn slot_event(&self, _state: &Self::State, slot: usize) -> Self::Event {
+        let from = self.slot_source[slot];
+        Hop {
+            from,
+            to: self.adjacency[from][slot - self.offsets[from]].0,
+        }
+    }
+
+    fn affected_slots(&self, _state: &Self::State, event: &Self::Event, out: &mut Vec<usize>) {
+        for node in [event.from, event.to] {
+            out.extend(self.offsets[node]..self.offsets[node + 1]);
+        }
     }
 }
 
