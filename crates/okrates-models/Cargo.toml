@@ -1,0 +1,10 @@
+[package]
+name = "okrates-models"
+description = "Concrete kinetic Monte Carlo models for okrates: BCC topology and single-vacancy diffusion."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+okrates-core = { path = "../okrates-core" }

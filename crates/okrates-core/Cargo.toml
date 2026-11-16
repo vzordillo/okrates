@@ -1,0 +1,10 @@
+[package]
+name = "okrates-core"
+description = "Kinetic Monte Carlo engine core: model contract, rates, clock, RNG, direct-method scheduler."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rand_chacha.workspace = true

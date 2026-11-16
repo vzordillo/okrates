@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin==1.16.0"]
+build-backend = "maturin"
+
+[project]
+name = "okrates"
+version = "0.0.1"
+requires-python = ">=3.10"
+license = "MIT"
+description = "Python bindings for the okrates kinetic Monte Carlo framework."
+
+[tool.maturin]
+manifest-path = "crates/okrates-python/Cargo.toml"
+python-source = "python"
+module-name = "okrates._okrates"
+features = ["pyo3/extension-module"]
+
+[dependency-groups]
+test = ["pytest==9.2.0"]

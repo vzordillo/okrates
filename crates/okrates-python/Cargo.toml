@@ -1,0 +1,17 @@
+[package]
+name = "okrates-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Thin PyO3 bindings for the okrates kinetic Monte Carlo framework."
+
+[lib]
+name = "_okrates"
+crate-type = ["cdylib"]
+
+[dependencies]
+okrates-core = { path = "../okrates-core" }
+okrates-models = { path = "../okrates-models" }
+pyo3 = { version = "0.30.1", features = ["abi3-py310"] }

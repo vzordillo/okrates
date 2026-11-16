@@ -1,0 +1,10 @@
+/target
+.claude/handoff.md
+.venv/
+__pycache__/
+.pytest_cache/
+python/okrates/*.so
+# Local development notes, not published
+/OKRATES_REPO_PLAN.md
+/CHANGELOG.md
+/docs/
