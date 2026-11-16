@@ -17,7 +17,7 @@ use std::fmt;
 
 use okrates_core::{KmcRng, Model};
 
-use crate::bcc::BccLattice;
+use crate::bcc::{BccLattice, DISPLACEMENTS};
 use crate::vacancy::BOLTZMANN_EV_PER_K;
 
 /// The species occupying a lattice site.
@@ -191,6 +191,12 @@ pub struct FeCrJump {
 pub struct FeCrState {
     occupancy: Vec<Species>,
     vacancy: usize,
+    /// Entity id on each site. Ids equal the initial site index.
+    atom_at: Vec<usize>,
+    /// Initial site of each entity, indexed by entity id.
+    origin: Vec<usize>,
+    /// Unwrapped displacement of each entity in half-lattice units, indexed by entity id.
+    disp: Vec<[i64; 3]>,
 }
 
 impl FeCrState {
@@ -211,6 +217,46 @@ impl FeCrState {
             counts[species.index()] += 1;
         }
         counts
+    }
+
+    /// Returns the unwrapped displacement of the vacancy in half-lattice units (a/2).
+    pub fn vacancy_displacement(&self) -> [i64; 3] {
+        self.disp[self.atom_at[self.vacancy]]
+    }
+
+    /// Returns the unwrapped displacement (a/2 units) of the entity currently on `site`.
+    pub fn displacement_of_site(&self, site: usize) -> [i64; 3] {
+        self.disp[self.atom_at[site]]
+    }
+
+    /// Returns the species and unwrapped displacement (a/2 units) of every atom, in site order.
+    pub fn atom_displacements(&self) -> impl Iterator<Item = (Species, [i64; 3])> + '_ {
+        self.occupancy
+            .iter()
+            .enumerate()
+            .filter(|&(_, &species)| species != Species::Vacancy)
+            .map(|(site, &species)| (species, self.displacement_of_site(site)))
+    }
+
+    /// Returns the summed unwrapped displacement (a/2 units) of all atoms of `species`.
+    pub fn collective_displacement(&self, species: Species) -> [i64; 3] {
+        let mut sum = [0; 3];
+        for (s, d) in self.atom_displacements() {
+            if s == species {
+                for axis in 0..3 {
+                    sum[axis] += d[axis];
+                }
+            }
+        }
+        sum
+    }
+
+    /// Returns the sum of squared unwrapped displacements (a/2 units squared) of all atoms of `species`.
+    pub fn tracer_squared_sum(&self, species: Species) -> i64 {
+        self.atom_displacements()
+            .filter(|&(s, _)| s == species)
+            .map(|(_, d)| d.iter().map(|c| c * c).sum::<i64>())
+            .sum()
     }
 }
 
@@ -288,6 +334,9 @@ impl<E: Energetics> FeCrModel<E> {
         }
         Ok(FeCrState {
             vacancy: vacancies[0],
+            atom_at: (0..expected).collect(),
+            origin: (0..expected).collect(),
+            disp: vec![[0; 3]; expected],
             occupancy,
         })
     }
@@ -328,7 +377,8 @@ impl<E: Energetics> FeCrModel<E> {
         self.attempt_frequency * (-self.barrier(state, direction) / self.kt()).exp()
     }
 
-    /// Checks occupancy length, vacancy count and the vacancy field.
+    /// Checks occupancy length, vacancy count, the vacancy field, that displacements
+    /// sum to zero and that each entity's displacement matches its current site.
     pub fn check_invariants(&self, state: &FeCrState) -> Result<(), FeCrError> {
         let expected = self.lattice.site_count();
         if state.occupancy.len() != expected {
@@ -343,6 +393,37 @@ impl<E: Energetics> FeCrModel<E> {
         }
         if state.vacancy >= expected || state.occupancy[state.vacancy] != Species::Vacancy {
             return Err(FeCrError::VacancyMismatch);
+        }
+        for len in [state.atom_at.len(), state.origin.len(), state.disp.len()] {
+            if len != expected {
+                return Err(FeCrError::SiteCount {
+                    expected,
+                    found: len,
+                });
+            }
+        }
+        let mut total = [0_i64; 3];
+        for d in &state.disp {
+            for axis in 0..3 {
+                total[axis] += d[axis];
+            }
+        }
+        if total != [0; 3] {
+            return Err(FeCrError::DisplacementSum);
+        }
+        let period: [i64; 3] = std::array::from_fn(|axis| 2 * self.lattice.cells()[axis] as i64);
+        for site in 0..expected {
+            let entity = state.atom_at[site];
+            if entity >= expected || state.origin[entity] >= expected {
+                return Err(FeCrError::UnwrappedMismatch { site });
+            }
+            let here = self.lattice.position(site);
+            let start = self.lattice.position(state.origin[entity]);
+            let d = state.disp[entity];
+            if (0..3).any(|axis| (here[axis] - start[axis] - d[axis]).rem_euclid(period[axis]) != 0)
+            {
+                return Err(FeCrError::UnwrappedMismatch { site });
+            }
         }
         Ok(())
     }
@@ -360,8 +441,17 @@ impl<E: Energetics> Model for FeCrModel<E> {
     }
 
     fn apply(&self, state: &mut Self::State, event: &Self::Event) -> Result<(), Self::Error> {
-        let target = self.lattice.neighbor(state.vacancy, event.direction);
-        state.occupancy.swap(state.vacancy, target);
+        let v = state.vacancy;
+        let target = self.lattice.neighbor(v, event.direction);
+        let shift = DISPLACEMENTS[event.direction];
+        let vacancy_id = state.atom_at[v];
+        let atom_id = state.atom_at[target];
+        for axis in 0..3 {
+            state.disp[vacancy_id][axis] += shift[axis];
+            state.disp[atom_id][axis] -= shift[axis];
+        }
+        state.occupancy.swap(v, target);
+        state.atom_at.swap(v, target);
         state.vacancy = target;
         Ok(())
     }
@@ -402,6 +492,13 @@ pub enum FeCrError {
     VacancyMismatch,
     /// More Cr atoms and vacancies were requested than there are sites.
     TooManyAtoms,
+    /// The unwrapped displacements of all entities do not sum to zero.
+    DisplacementSum,
+    /// An entity's unwrapped displacement does not map its origin to its current site.
+    UnwrappedMismatch {
+        /// The site holding the inconsistent entity.
+        site: usize,
+    },
 }
 
 impl fmt::Display for FeCrError {
@@ -426,6 +523,11 @@ impl fmt::Display for FeCrError {
             Self::VacancyCount(n) => write!(f, "occupancy has {n} vacancies, expected 1"),
             Self::VacancyMismatch => write!(f, "vacancy field does not point to the vacancy"),
             Self::TooManyAtoms => write!(f, "more Cr atoms and vacancies than sites"),
+            Self::DisplacementSum => write!(f, "displacements do not sum to zero"),
+            Self::UnwrappedMismatch { site } => write!(
+                f,
+                "entity on site {site} has an unwrapped displacement inconsistent with its site"
+            ),
         }
     }
 }
