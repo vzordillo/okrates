@@ -7,9 +7,18 @@
 //! Λ = L·k_B·T·Ω/c_v with the vacancy concentration c_v = 1/N; details are in the
 //! local theory notes.
 
+use okrates_core::ensemble::run_replicas;
 use okrates_core::{Simulation, Step};
 
-use crate::fecr::{Energetics, FeCrModel, FeCrState, Species};
+use crate::fecr::{Energetics, FeCrError, FeCrModel, FeCrState, Species};
+use crate::fecr_anneal::anneal;
+
+/// Offset between a replica's dynamics seed and its `random_state` seed, so that
+/// the initial labels are independent of the dynamics stream.
+pub const STATE_SEED_OFFSET: u64 = 1_000_000_000;
+
+/// Offset between a replica's dynamics seed and its pre-anneal seed.
+pub const ANNEAL_SEED_OFFSET: u64 = 2_000_000_000;
 
 /// Squared and dot-product observables of one Fe–Cr state, computed in (a/2)² integer
 /// units, converted to `f64` and multiplied by a²/4.
@@ -160,5 +169,124 @@ pub fn estimate(
         ],
         s: fit(&|o| o.s),
         vacancy: fit(&|o| o.vacancy),
+    }
+}
+
+/// The outcome of one replica of [`run_composition`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplicaRun {
+    /// The coefficients estimated from the replica.
+    pub estimate: ReplicaEstimate,
+    /// The number of fired steps.
+    pub fired: u64,
+    /// Total configuration energy in eV after each anneal sweep (entry 0 is the
+    /// initial energy); empty when no anneal ran.
+    pub anneal_energy: Vec<f64>,
+}
+
+/// Runs `runs` replicas of one composition with `cr_count` Cr atoms, seeds
+/// `seed_base`, `seed_base + 1`, ..., and returns them in replica order.
+///
+/// Each replica draws a random state with seed `seed + STATE_SEED_OFFSET`. If
+/// `anneal_sweeps > 0` it is annealed for that many sweeps with seed
+/// `seed + ANNEAL_SEED_OFFSET`. The dynamics then run through [`sample_run`] and
+/// the coefficients are fitted with [`origin_slope`].
+///
+/// # Errors
+///
+/// Returns the [`FeCrError`] of the first failing replica, such as too many atoms.
+///
+/// # Panics
+///
+/// Panics if the replica seeds overflow `u64`, or under the conditions of [`sample_run`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_composition<E: Energetics + Clone + Sync>(
+    model: &FeCrModel<E>,
+    cr_count: usize,
+    seed_base: u64,
+    runs: u64,
+    t_end: f64,
+    k_count: usize,
+    lattice_parameter: f64,
+    anneal_sweeps: u64,
+) -> Result<Vec<ReplicaRun>, FeCrError> {
+    run_replicas(seed_base, runs, |_, seed| {
+        let mut state = model.random_state(cr_count, seed + STATE_SEED_OFFSET)?;
+        let mut anneal_energy = Vec::new();
+        if anneal_sweeps > 0 {
+            let a = anneal(
+                model,
+                state.occupancy().to_vec(),
+                anneal_sweeps,
+                seed + ANNEAL_SEED_OFFSET,
+            )?;
+            state = model.state(a.occupancy)?;
+            anneal_energy = a.energy;
+        }
+        let (times, samples, fired) = sample_run(
+            model.clone(),
+            state,
+            seed,
+            t_end,
+            k_count,
+            lattice_parameter,
+        );
+        Ok(ReplicaRun {
+            estimate: estimate(&times, &samples, origin_slope),
+            fired,
+            anneal_energy,
+        })
+    })
+    .expect("seeds do not overflow")
+    .into_iter()
+    .map(|replica| replica.value)
+    .collect()
+}
+
+/// Means and standard errors, each `(mean, se)`, over the replicas of one composition.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Summary {
+    /// D_v.
+    pub vacancy: (f64, f64),
+    /// D*_Fe and D*_Cr; Cr is `(NaN, NaN)` when there is no Cr.
+    pub tracer: [(f64, f64); 2],
+    /// D*_all.
+    pub tracer_all: (f64, f64),
+    /// Λ_FeFe, Λ_FeCr, Λ_CrCr.
+    pub collective: [(f64, f64); 3],
+    /// The correlation factor `n_atoms · D*_all / D_v`, computed per replica.
+    pub f: (f64, f64),
+    /// Mean number of fired steps per replica.
+    pub mean_jumps: f64,
+}
+
+/// Summarizes `runs` for a composition with `n_cr` Cr atoms among `n_atoms` atoms.
+pub fn summarize(runs: &[ReplicaRun], n_cr: usize, n_atoms: usize) -> Summary {
+    let column = |f: &dyn Fn(&ReplicaEstimate) -> f64| {
+        let values: Vec<f64> = runs.iter().map(|r| f(&r.estimate)).collect();
+        mean_se(&values)
+    };
+    let f_values: Vec<f64> = runs
+        .iter()
+        .map(|r| n_atoms as f64 * r.estimate.tracer_all / r.estimate.vacancy)
+        .collect();
+    Summary {
+        vacancy: column(&|e| e.vacancy),
+        tracer: [
+            column(&|e| e.tracer[0]),
+            if n_cr == 0 {
+                (f64::NAN, f64::NAN)
+            } else {
+                column(&|e| e.tracer[1])
+            },
+        ],
+        tracer_all: column(&|e| e.tracer_all),
+        collective: [
+            column(&|e| e.collective[0]),
+            column(&|e| e.collective[1]),
+            column(&|e| e.collective[2]),
+        ],
+        f: mean_se(&f_values),
+        mean_jumps: runs.iter().map(|r| r.fired).sum::<u64>() as f64 / runs.len() as f64,
     }
 }

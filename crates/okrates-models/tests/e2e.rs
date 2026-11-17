@@ -143,6 +143,30 @@ fn fecr_diffusion_bad_environment() {
     );
 }
 
+/// Fast-tier smoke test: the binary rejects a non-positive `ANNEAL_SWEEPS` before any work.
+#[test]
+fn fecr_diffusion_bad_anneal_sweeps() {
+    assert_usage_error(
+        example("fecr_diffusion").env("ANNEAL_SWEEPS", "0"),
+        "ANNEAL_SWEEPS must be an integer >= 1",
+    );
+}
+
+#[test]
+fn fecr_observables_small() {
+    let (code, stdout, stderr) = run(example("fecr_observables").args(["22", "7", "2", "20"]));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, include_str!("data/fecr_observables_small.txt"));
+}
+
+#[test]
+fn fecr_observables_bad_args() {
+    assert_usage_error(
+        example("fecr_observables").args(["22", "7", "1", "0"]),
+        "usage: fecr_observables <cr_count> <seed_base> <runs>=2 <anneal_sweeps>",
+    );
+}
+
 #[test]
 fn multi_vacancy_scaling_small() {
     let (code, stdout, stderr) = run(example("multi_vacancy_scaling")

@@ -4,6 +4,8 @@
 
 use okrates_core::{Simulation, Step};
 use okrates_models::bcc::BccLattice;
+use okrates_models::fecr::{Energetics, FeCrModel, PairEnergetics, Species};
+use okrates_models::fecr_diffusion::{run_composition, summarize};
 use okrates_models::vacancy::VacancyDiffusion;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -73,9 +75,116 @@ fn vacancy_trajectory(
     result.map_err(PyRuntimeError::new_err)
 }
 
+/// Returns the ILLUSTRATIVE Fe-Cr energetics as `(pair_energies_ev, kra_fe, kra_cr)`.
+///
+/// The pair energies are a symmetric 3x3 nested list in eV indexed Fe, Cr,
+/// vacancy. The values are round numbers with no source, not DFT or literature.
+#[pyfunction]
+fn fecr_illustrative_energetics() -> ([[f64; 3]; 3], f64, f64) {
+    let e = PairEnergetics::illustrative();
+    (*e.pair(), e.kra(Species::Fe), e.kra(Species::Cr))
+}
+
+fn value_error(message: impl Into<String>) -> PyErr {
+    PyValueError::new_err(message.into())
+}
+
+/// Raw output of the Fe-Cr diffusion pipeline: ten scalars
+/// `[D_v, se, D_Fe, se, D_Cr, se, D_all, se, f, se]`, the Lambda means
+/// `[FeFe, FeCr, CrCr]`, their standard errors, and the mean jump count.
+type FeCrRaw = (Vec<f64>, Vec<f64>, Vec<f64>, f64);
+
+/// Runs the Fe-Cr single-vacancy diffusion pipeline for one composition.
+///
+/// Returns `(scalars, lambda, lambda_se, mean_jumps)`; see the Python wrapper
+/// `okrates.fecr_diffusion`. Raises `ValueError` for invalid arguments.
+#[pyfunction]
+#[pyo3(signature = (
+    *, cells, cr_count, temperature_k, attempt_frequency, t_end, k_count,
+    lattice_parameter_m, seed, runs, anneal_sweeps = 0,
+    pair_energies_ev = None, kra_ev = None
+))]
+#[allow(clippy::too_many_arguments)]
+fn fecr_diffusion(
+    py: Python<'_>,
+    cells: [usize; 3],
+    cr_count: usize,
+    temperature_k: f64,
+    attempt_frequency: f64,
+    t_end: f64,
+    k_count: usize,
+    lattice_parameter_m: f64,
+    seed: u64,
+    runs: u64,
+    anneal_sweeps: u64,
+    pair_energies_ev: Option<[[f64; 3]; 3]>,
+    kra_ev: Option<(f64, f64)>,
+) -> PyResult<FeCrRaw> {
+    if runs < 2 {
+        return Err(value_error(format!("runs must be at least 2, got {runs}")));
+    }
+    if k_count < 1 {
+        return Err(value_error("k_count must be at least 1"));
+    }
+    if !t_end.is_finite() || t_end <= 0.0 {
+        return Err(value_error(format!(
+            "t_end must be finite and positive, got {t_end}"
+        )));
+    }
+    if !lattice_parameter_m.is_finite() || lattice_parameter_m <= 0.0 {
+        return Err(value_error(format!(
+            "lattice_parameter_m must be finite and positive, got {lattice_parameter_m}"
+        )));
+    }
+    let energetics = match (pair_energies_ev, kra_ev) {
+        (None, None) => PairEnergetics::illustrative(),
+        (Some(pair), Some((kra_fe, kra_cr))) => {
+            PairEnergetics::new(pair, kra_fe, kra_cr).map_err(|err| value_error(err.to_string()))?
+        }
+        _ => {
+            return Err(value_error(
+                "pair_energies_ev and kra_ev must be given together or both omitted",
+            ));
+        }
+    };
+    let lattice = BccLattice::new(cells).map_err(|err| value_error(err.to_string()))?;
+    let n_sites = lattice.site_count();
+    let model = FeCrModel::new(lattice, energetics, attempt_frequency, temperature_k)
+        .map_err(|err| value_error(err.to_string()))?;
+    if cr_count + 1 > n_sites {
+        return Err(value_error(format!(
+            "cr_count {cr_count} plus one vacancy exceeds the {n_sites} lattice sites"
+        )));
+    }
+
+    let result = py.detach(move || {
+        run_composition(
+            &model,
+            cr_count,
+            seed,
+            runs,
+            t_end,
+            k_count,
+            lattice_parameter_m,
+            anneal_sweeps,
+        )
+        .map(|replicas| summarize(&replicas, cr_count, n_sites - 1))
+    });
+    let s = result.map_err(|err| value_error(err.to_string()))?;
+    let scalars = [s.vacancy, s.tracer[0], s.tracer[1], s.tracer_all, s.f]
+        .iter()
+        .flat_map(|&(mean, se)| [mean, se])
+        .collect();
+    let lambda = s.collective.iter().map(|&(mean, _)| mean).collect();
+    let lambda_se = s.collective.iter().map(|&(_, se)| se).collect();
+    Ok((scalars, lambda, lambda_se, s.mean_jumps))
+}
+
 #[pymodule]
 fn _okrates(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(jump_rate, m)?)?;
     m.add_function(wrap_pyfunction!(vacancy_trajectory, m)?)?;
+    m.add_function(wrap_pyfunction!(fecr_illustrative_energetics, m)?)?;
+    m.add_function(wrap_pyfunction!(fecr_diffusion, m)?)?;
     Ok(())
 }

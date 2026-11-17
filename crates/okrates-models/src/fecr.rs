@@ -54,6 +54,15 @@ pub trait Energetics {
         vacancy_site: usize,
         atom_site: usize,
     ) -> f64;
+    /// E_after − E_before in eV for swapping the atoms on sites `i` and `j`, neither of which is the vacancy.
+    ///
+    /// The default recomputes [`total_energy`](Self::total_energy) before and after the swap.
+    fn swap_delta(&self, lattice: &BccLattice, occupancy: &[Species], i: usize, j: usize) -> f64 {
+        let before = self.total_energy(lattice, occupancy);
+        let mut after = occupancy.to_vec();
+        after.swap(i, j);
+        self.total_energy(lattice, &after) - before
+    }
     /// Kinetically resolved activation energy of `atom` (Fe or Cr) in eV.
     fn kra(&self, atom: Species) -> f64;
     /// A bound B with |exchange_delta| ≤ B for every single-vacancy configuration in which `atom` jumps.
@@ -162,6 +171,30 @@ impl Energetics for PairEnergetics {
             .map(|&k| self.d(atom, occupancy[k]))
             .sum();
         gained - lost
+    }
+
+    fn swap_delta(&self, lattice: &BccLattice, occupancy: &[Species], i: usize, j: usize) -> f64 {
+        let a = occupancy[i].index();
+        let b = occupancy[j].index();
+        let around_i: f64 = lattice
+            .neighbors(i)
+            .iter()
+            .filter(|&&k| k != j)
+            .map(|&k| {
+                let o = occupancy[k].index();
+                self.pair[b][o] - self.pair[a][o]
+            })
+            .sum();
+        let around_j: f64 = lattice
+            .neighbors(j)
+            .iter()
+            .filter(|&&k| k != i)
+            .map(|&k| {
+                let o = occupancy[k].index();
+                self.pair[a][o] - self.pair[b][o]
+            })
+            .sum();
+        around_i + around_j
     }
 
     fn kra(&self, atom: Species) -> f64 {

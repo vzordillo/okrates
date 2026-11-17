@@ -4,7 +4,8 @@ use okrates_core::ensemble::{run_replicas, thread_count};
 use okrates_models::bcc::BccLattice;
 use okrates_models::fecr::{FeCrModel, PairEnergetics};
 use okrates_models::fecr_diffusion::{
-    ReplicaEstimate, estimate, mean_se, ols_slope, origin_slope, sample_run,
+    ANNEAL_SEED_OFFSET, ReplicaEstimate, STATE_SEED_OFFSET, estimate, mean_se, ols_slope,
+    origin_slope, run_composition, sample_run,
 };
 use okrates_models::vacancy::BOLTZMANN_EV_PER_K;
 
@@ -18,6 +19,20 @@ fn env_usize(name: &str, default: usize) -> usize {
             }
         },
         Err(_) => default,
+    }
+}
+
+/// Reads `ANNEAL_SWEEPS`: unset means no anneal, otherwise an integer >= 1.
+fn env_anneal_sweeps() -> u64 {
+    match env::var("ANNEAL_SWEEPS") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(v) if v >= 1 => v,
+            _ => {
+                eprintln!("ANNEAL_SWEEPS must be an integer >= 1");
+                std::process::exit(2);
+            }
+        },
+        Err(_) => 0,
     }
 }
 
@@ -71,7 +86,7 @@ fn correlation_factor() {
     println!("total_fired_steps = {total_fired}");
 }
 
-fn illustrative() {
+fn illustrative(anneal_sweeps: u64) {
     let runs = env_usize("RUNS", 500);
     let seed_base = 20261121_u64;
     let (nu, temperature, k_count) = (1e13, 800.0, 10);
@@ -93,22 +108,24 @@ fn illustrative() {
     println!("units = a^2/s with a = 1");
     println!("runs = {runs}");
     println!("seed_base = {seed_base}");
+    if anneal_sweeps > 0 {
+        println!("anneal_sweeps = {anneal_sweeps}");
+        println!("anneal_seed_offset = {ANNEAL_SEED_OFFSET}");
+    }
     for n_cr in [0_usize, 22, 43, 86] {
-        let replicas = run_replicas(seed_base, runs as u64, |_, seed| {
-            let state = model
-                .random_state(n_cr, seed + STATE_SEED_OFFSET)
-                .expect("valid state");
-            let (times, samples, fired) =
-                sample_run(model.clone(), state, seed, t_end, k_count, 1.0);
-            (estimate(&times, &samples, origin_slope), fired)
-        })
-        .expect("seeds do not overflow");
-        let mut estimates: Vec<ReplicaEstimate> = Vec::with_capacity(runs);
-        let mut total_fired = 0_u64;
-        for replica in replicas {
-            estimates.push(replica.value.0);
-            total_fired += replica.value.1;
-        }
+        let replicas = run_composition(
+            &model,
+            n_cr,
+            seed_base,
+            runs as u64,
+            t_end,
+            k_count,
+            1.0,
+            anneal_sweeps,
+        )
+        .expect("valid state");
+        let estimates: Vec<ReplicaEstimate> = replicas.iter().map(|r| r.estimate).collect();
+        let total_fired: u64 = replicas.iter().map(|r| r.fired).sum();
         let column =
             |f: &dyn Fn(&ReplicaEstimate) -> f64| -> Vec<f64> { estimates.iter().map(f).collect() };
         println!("n_cr = {n_cr}");
@@ -117,6 +134,17 @@ fn illustrative() {
             "mean_jumps_per_run = {:.12e}",
             total_fired as f64 / runs as f64
         );
+        if anneal_sweeps > 0 {
+            let per_site = |index: u64| -> Vec<f64> {
+                replicas
+                    .iter()
+                    .map(|r| r.anneal_energy[index as usize] / n_sites)
+                    .collect()
+            };
+            report("anneal_E_site_q1", &per_site(anneal_sweeps / 4));
+            report("anneal_E_site_half", &per_site(anneal_sweeps / 2));
+            report("anneal_E_site_end", &per_site(anneal_sweeps));
+        }
         report("D_v", &column(&|e| e.vacancy));
         report("D_Fe", &column(&|e| e.tracer[0]));
         if n_cr == 0 {
@@ -138,12 +166,9 @@ fn illustrative() {
     }
 }
 
-/// Offset between a replica's dynamics seed and its `random_state` seed, so that
-/// the initial labels are independent of the dynamics stream.
-const STATE_SEED_OFFSET: u64 = 1_000_000_000;
-
 fn main() {
+    let anneal_sweeps = env_anneal_sweeps();
     correlation_factor();
-    illustrative();
+    illustrative(anneal_sweeps);
     eprintln!("threads = {}", thread_count());
 }
