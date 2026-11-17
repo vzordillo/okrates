@@ -23,3 +23,13 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo run --locked --example random_walk -- 42 5
+
+  full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rustup reads rust-toolchain.toml and installs the pinned toolchain and components.
+      - run: rustup show
+      - run: cargo test --locked -- --include-ignored

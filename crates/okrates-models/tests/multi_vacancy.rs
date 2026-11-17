@@ -137,10 +137,10 @@ fn catalog_matches_rebuild_after_random_sequences() {
     assert!(pair_changes > 0);
 }
 
-#[test]
-fn one_vacancy_msd_on_incremental_scheduler() {
+/// Tests D_hat = r a^2 for one vacancy on the incremental scheduler over `runs` replicas.
+fn one_vacancy_msd(base_seed: u64, runs: u64) {
     let model = model(ONE_CELLS, ONE_RATE);
-    let estimates = run_replicas(ONE_SEED_BASE, ONE_RUNS, |_, seed| {
+    let estimates = run_replicas(base_seed, runs, |_, seed| {
         let state = model.initial_state(&[0]).unwrap();
         let mut sim = IncrementalSimulation::new(model.clone(), state, seed).unwrap();
         estimate_one_run(
@@ -163,10 +163,49 @@ fn one_vacancy_msd_on_incremental_scheduler() {
 }
 
 #[test]
-fn high_density_direct_and_incremental_agree() {
-    let model = model(DENSE_CELLS, DENSE_RATE);
-    let direct = run_replicas(DENSE_DIRECT_SEED_BASE, DENSE_RUNS, |_, seed| {
-        let sites = model.random_sites(DENSE_VACANCIES, seed).unwrap();
+fn one_vacancy_msd_on_incremental_smoke() {
+    one_vacancy_msd(41_000_000, 200);
+}
+
+#[test]
+#[ignore = "full tier: statistical"]
+fn one_vacancy_msd_on_incremental_scheduler() {
+    one_vacancy_msd(ONE_SEED_BASE, ONE_RUNS);
+}
+
+/// Parameters of a direct-versus-incremental agreement test.
+struct Dense {
+    cells: [usize; 3],
+    vacancies: usize,
+    t_end: f64,
+    runs: u64,
+    direct_seed_base: u64,
+    incremental_seed_base: u64,
+}
+
+const DENSE_FULL: Dense = Dense {
+    cells: DENSE_CELLS,
+    vacancies: DENSE_VACANCIES,
+    t_end: DENSE_T_END,
+    runs: DENSE_RUNS,
+    direct_seed_base: DENSE_DIRECT_SEED_BASE,
+    incremental_seed_base: DENSE_INCREMENTAL_SEED_BASE,
+};
+
+const DENSE_SMOKE: Dense = Dense {
+    cells: [4, 4, 4],
+    vacancies: 16,
+    t_end: 5.0,
+    runs: 40,
+    direct_seed_base: 51_000_000,
+    incremental_seed_base: 61_000_000,
+};
+
+/// Tests that the direct and incremental schedulers give the same mean MSD estimate.
+fn direct_and_incremental_agree(p: &Dense) {
+    let model = model(p.cells, DENSE_RATE);
+    let direct = run_replicas(p.direct_seed_base, p.runs, |_, seed| {
+        let sites = model.random_sites(p.vacancies, seed).unwrap();
         let state = model.initial_state(&sites).unwrap();
         let mut sim = Simulation::new(model.clone(), state, seed);
         estimate_one_run(
@@ -175,15 +214,15 @@ fn high_density_direct_and_incremental_agree() {
                 assert!(matches!(sim.step().unwrap(), Step::Fired { .. }));
                 (held, sim.time())
             },
-            DENSE_T_END,
+            p.t_end,
         )
     })
     .unwrap()
     .into_iter()
     .map(|r| r.value)
     .collect::<Vec<_>>();
-    let incremental = run_replicas(DENSE_INCREMENTAL_SEED_BASE, DENSE_RUNS, |_, seed| {
-        let sites = model.random_sites(DENSE_VACANCIES, seed).unwrap();
+    let incremental = run_replicas(p.incremental_seed_base, p.runs, |_, seed| {
+        let sites = model.random_sites(p.vacancies, seed).unwrap();
         let state = model.initial_state(&sites).unwrap();
         let mut sim = IncrementalSimulation::new(model.clone(), state, seed).unwrap();
         estimate_one_run(
@@ -192,7 +231,7 @@ fn high_density_direct_and_incremental_agree() {
                 assert!(matches!(sim.step().unwrap(), Step::Fired { .. }));
                 (held, sim.time())
             },
-            DENSE_T_END,
+            p.t_end,
         )
     })
     .unwrap()
@@ -204,6 +243,17 @@ fn high_density_direct_and_incremental_agree() {
     let z = (m_d - m_i) / (se_d * se_d + se_i * se_i).sqrt();
     println!("direct={m_d:.12} se_d={se_d:.12} incremental={m_i:.12} se_i={se_i:.12} z={z:.12}");
     assert!(z.abs() <= Z_CRIT, "z = {z}, threshold = {Z_CRIT}");
+}
+
+#[test]
+fn high_density_direct_and_incremental_smoke() {
+    direct_and_incremental_agree(&DENSE_SMOKE);
+}
+
+#[test]
+#[ignore = "full tier: equivalence"]
+fn high_density_direct_and_incremental_agree() {
+    direct_and_incremental_agree(&DENSE_FULL);
 }
 
 #[test]

@@ -245,8 +245,9 @@ fn chi2_quantile_matches_textbook() {
     }
 }
 
-#[test]
-fn equilibrium_matches_boltzmann() {
+/// Runs `replicas` replicas started from the Boltzmann distribution and applies
+/// a chi-square test to the occupation of energy groups at time `t_s`.
+fn equilibrium_chi2(base_seed: u64, replicas: u64) {
     let model = model([2, 2, 2]);
     let kt = model.kt();
     let n = model.lattice().site_count();
@@ -307,7 +308,7 @@ fn equilibrium_matches_boltzmann() {
     }
 
     // Groups with expected count at least 5.
-    let r = R as f64;
+    let r = replicas as f64;
     let mut class_group = vec![0_usize; class_prob.len()];
     let mut group_prob = vec![0.0];
     for (c, &p) in class_prob.iter().enumerate() {
@@ -332,7 +333,7 @@ fn equilibrium_matches_boltzmann() {
     let state_group: Vec<usize> = state_class.iter().map(|&c| class_group[c]).collect();
 
     let t_s = 1000.0 / (8.0 * ATTEMPT_FREQUENCY * (-0.60 / kt).exp());
-    let results = run_replicas(BASE, R, |_, seed| {
+    let results = run_replicas(base_seed, replicas, |_, seed| {
         let u = KmcRng::from_seed(seed + INIT_OFFSET).open01();
         let start = cumulative
             .iter()
@@ -364,4 +365,15 @@ fn equilibrium_matches_boltzmann() {
     let critical = chi2_upper_quantile(df, ALPHA);
     println!("chi2={chi2:.6} df={df} critical={critical:.6} groups={groups} t_s={t_s:.6e}");
     assert!(chi2 <= critical, "chi2 = {chi2}, critical = {critical}");
+}
+
+#[test]
+fn equilibrium_boltzmann_smoke() {
+    equilibrium_chi2(81_000_000, 400);
+}
+
+#[test]
+#[ignore = "full tier: statistical"]
+fn equilibrium_matches_boltzmann() {
+    equilibrium_chi2(BASE, R);
 }

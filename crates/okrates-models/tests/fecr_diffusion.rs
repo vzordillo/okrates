@@ -93,21 +93,18 @@ fn gate(name: &str, values: &[f64]) {
     assert!(z.abs() <= Z_CRIT, "{name}: z = {z}, threshold = {Z_CRIT}");
 }
 
-#[test]
-fn equal_energy_limit_gates() {
+/// Runs `m` equal-energy replicas to `t_end` and applies gates G1, G2 and the sum rule.
+fn equal_energy_estimates(base_seed: u64, m: u64, t_end: f64) -> Vec<ReplicaEstimate> {
     let model = equal_energy_model();
-    let estimates: Vec<ReplicaEstimate> = run_replicas(20261118, M, |_, seed| {
+    let estimates: Vec<ReplicaEstimate> = run_replicas(base_seed, m, |_, seed| {
         let state = model.random_state(63, seed + STATE_SEED_OFFSET).unwrap();
-        let (times, samples, _) = sample_run(model.clone(), state, seed, 125.0, 10, 1.0);
+        let (times, samples, _) = sample_run(model.clone(), state, seed, t_end, 10, 1.0);
         estimate(&times, &samples, origin_slope)
     })
     .unwrap()
     .into_iter()
     .map(|r| r.value)
     .collect();
-
-    let (n_a, n_fe, n_cr) = (127.0, 64.0, 63.0);
-    let p = |e: &ReplicaEstimate| e.vacancy - e.s;
 
     let g1: Vec<f64> = estimates.iter().map(|e| e.vacancy - 1.0).collect();
     gate("G1 D_v - 1", &g1);
@@ -116,6 +113,30 @@ fn equal_energy_limit_gates() {
         .map(|e| e.tracer[0] - e.tracer[1])
         .collect();
     gate("G2 D*_Fe - D*_Cr", &g2);
+    for e in &estimates {
+        let sum = e.collective[0] + 2.0 * e.collective[1] + e.collective[2];
+        assert!(
+            (sum - e.vacancy).abs() <= 1e-9 * e.vacancy.max(1.0),
+            "sum rule violated: {sum} vs {}",
+            e.vacancy
+        );
+    }
+    estimates
+}
+
+#[test]
+fn equal_energy_limit_smoke() {
+    equal_energy_estimates(30_000_000, 100, 25.0);
+}
+
+#[test]
+#[ignore = "full tier: statistical"]
+fn equal_energy_limit_gates() {
+    let estimates = equal_energy_estimates(20261118, M, 125.0);
+
+    let (n_a, n_fe, n_cr) = (127.0, 64.0, 63.0);
+    let p = |e: &ReplicaEstimate| e.vacancy - e.s;
+
     let g3: Vec<f64> = estimates
         .iter()
         .map(|e| e.collective[1] - (n_fe * n_cr) / (n_a * (n_a - 1.0)) * p(e))
@@ -130,15 +151,6 @@ fn equal_energy_limit_gates() {
         })
         .collect();
     gate("G4 L_CrCr", &g4);
-
-    for e in &estimates {
-        let sum = e.collective[0] + 2.0 * e.collective[1] + e.collective[2];
-        assert!(
-            (sum - e.vacancy).abs() <= 1e-9 * e.vacancy.max(1.0),
-            "sum rule violated: {sum} vs {}",
-            e.vacancy
-        );
-    }
 
     let mean = |f: &dyn Fn(&ReplicaEstimate) -> f64| {
         estimates.iter().map(f).sum::<f64>() / estimates.len() as f64
@@ -155,8 +167,8 @@ fn equal_energy_limit_gates() {
     assert!(det >= -1e-9 * trace * trace, "det = {det}, trace = {trace}");
 }
 
-#[test]
-fn pure_fe_vacancy_gate() {
+/// Runs `m` pure-Fe replicas for about `hops` vacancy jumps each and applies gate G5.
+fn pure_fe_vacancy(base_seed: u64, m: u64, hops: f64) {
     let model = FeCrModel::new(
         BccLattice::new([4, 4, 4]).unwrap(),
         PairEnergetics::illustrative(),
@@ -173,8 +185,8 @@ fn pure_fe_vacancy_gate() {
             "rate {d} = {rd}, rate 0 = {r}"
         );
     }
-    let t_end = 1000.0 / (8.0 * r);
-    let estimates: Vec<ReplicaEstimate> = run_replicas(20261119, M, |_, seed| {
+    let t_end = hops / (8.0 * r);
+    let estimates: Vec<ReplicaEstimate> = run_replicas(base_seed, m, |_, seed| {
         let state = model.random_state(0, seed + STATE_SEED_OFFSET).unwrap();
         let (times, samples, _) = sample_run(model.clone(), state, seed, t_end, 10, 1.0);
         estimate(&times, &samples, origin_slope)
@@ -193,4 +205,15 @@ fn pure_fe_vacancy_gate() {
     }
     let values: Vec<f64> = estimates.iter().map(|e| e.vacancy - r).collect();
     gate("G5 D_v - r", &values);
+}
+
+#[test]
+fn pure_fe_vacancy_smoke() {
+    pure_fe_vacancy(31_000_000, 100, 200.0);
+}
+
+#[test]
+#[ignore = "full tier: statistical"]
+fn pure_fe_vacancy_gate() {
+    pure_fe_vacancy(20261119, M, 1000.0);
 }
