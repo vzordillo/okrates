@@ -1,0 +1,63 @@
+{
+  "source": "E. Martinez, O. Senninger, C.-C. Fu, F. Soisson, Phys. Rev. B 86, 224109 (2012), DOI 10.1103/PhysRevB.86.224109. Local PDF papers/PhysRevB.86.224109.pdf. Omega(x) from M. Levesque et al., arXiv:1307.7561v1 (29 Jul 2013; no journal reference printed in the PDF).",
+  "extraction": "Table I read from a 150-dpi render of p.4 (pdftotext garbles it); Table II from p.6. Second independent transcription (Sonnet pass, scratchpad check/second_extraction.json) matched every value; see fecr-dft-sources.md section 0.",
+  "units": "energies eV, entropies k_B, temperatures K, frequencies s^-1",
+  "coordination": {"z1": 8, "z2": 6, "loc": "p.3, after Eq. (7)"},
+  "shell_ratio": {"h2_over_h1": 0.5, "s2_over_s1": 0.5, "loc": "Table I caption (the text on p.2 garbles it as '12', i.e. 1/2)"},
+  "table_I": {
+    "loc": "Table I, p.4",
+    "h1_AA_formula_as_printed": "h(1)_AA = -2 H(A)/11, H(A) = H0(A) + int cP(A) dT",
+    "s1_AA_formula_as_printed": "s(1)_AA = -2 S(A)/11, S(A) = int cP(A)/T dT",
+    "H0_Fe_eV": -4.28, "H0_Fe_ref": "Ref. 34 (expt cohesive energy)",
+    "H0_Cr_eV": -4.10, "H0_Cr_ref": "Ref. 34",
+    "cP_Fe": "3 kB (310/T)^2 (310/T)/[exp(310/T)-1]^2 ... as printed: 3kB(310/T)^2 exp-form + 6.64e-4 kB T (Ref. 40). Printed numerator reads '310/T' inside the fraction; standard Einstein form is (theta/T)^2 e^(theta/T)/(e^(theta/T)-1)^2.",
+    "cP_Fe_theta_K": 310, "cP_Fe_linear_kB_per_K": 6.64e-4,
+    "cP_Cr_theta_K": 360, "cP_Cr_linear_kB_per_K": 5.0e-4, "cP_Cr_ref": "Ref. 39",
+    "h1_FeCr_formula": "(h1_FeFe + h1_CrCr)/2 - Omega(x)/11",
+    "s1_FeCr_formula_as_printed": "(s1_FeFe + s1_CrCr)/2 - Omega(x)/Theta",
+    "Omega_x_formula": "(x - 0.070)(-2.288 x^2 + 4.439 x - 2.480)  [eV], Hmix = -Omega(x) x (1-x), Ref. 18 (Levesque)",
+    "Theta_K": 1480, "Tc_target_K": 970, "Tc_ref": "Refs. 20, 21 (expt, ~970 K)",
+    "h1_AV_formula": "dHf_V(A)/11 + h1_AA/2",
+    "s1_AV_formula": "dSf_V(A)/11 + s1_AA/2",
+    "dHf_V_Fe_eV": 2.18, "dHf_V_Fe_ref": "DFT, Refs. 15, 41 (unit not printed in cell; eV per text p.5)",
+    "dHf_V_Cr_eV": 2.33, "dHf_V_Cr_ref": "DFT, this study, NM Cr",
+    "dSf_V_Fe_kB": 4.1, "dSf_V_Fe_ref": "Ref. 43",
+    "dSf_V_Cr_kB": 4.1, "dSf_V_Cr_note": "set equal to Fe (no data)",
+    "saddle_formulas": {
+      "6 ht1_FeFe": "dH0(Fe) + 10 h1_FeFe + 11 h1_FeV",
+      "6 ht1_CrFe": "dH2(Fe) + 10 h1_FeCr + 10 h1_FeV + h1_CrV",
+      "6 ht1_CrCr": "dH0(Cr) + 10 h1_CrCr + 11 h1_CrV",
+      "6 ht1_FeCr": "dH2(Cr) + 10 h1_FeCr + 10 h1_CrV + h1_FeV",
+      "index_convention": "first index = jumping atom, second = saddle neighbour; only 1NN of the saddle (6 sites)",
+      "entropy_rows": "6 st1_ij: same forms with dS_mig and s; dS0_mig(Fe)=dS2_mig(Fe)=dS0_mig(Cr)=dS2_mig(Cr)=2.1 kB (Refs. 42, 47)"
+    },
+    "dH0_Fe_eV": 0.69, "dH2_Fe_eV": 0.57, "dH0_Cr_eV": 0.78, "dH2_Cr_eV": 0.70,
+    "dH_ref": "DFT (SIESTA), this study; Cr values NM",
+    "dSmig_kB": 2.1
+  },
+  "attempt_frequency": {"nu_Fe_s-1": 1e13, "nu_Cr_s-1": 1e13, "loc": "p.6, Sec. II C 4b ('Debye frequency nu_Fe ~ nu_Cr ~ 1e13 s^-1')"},
+  "correlation_factor_f0": {"value": 0.727, "loc": "p.5, after Eq. (10)"},
+  "levesque_omega": {
+    "loc": "Levesque arXiv:1307.7561v1, Table I p.6, Eq. (9)",
+    "PWSCF-PAW": {"alpha": 0.070, "beta": -2.288, "gamma": 4.439, "delta": -2.480},
+    "SIESTA-NC": {"alpha": 0.160, "beta": -2.348, "gamma": 4.381, "delta": -2.480}
+  },
+  "local_concentration": {
+    "loc": "Levesque p.6 (Sec. III B, unnumbered eq.); Martinez p.5 ('measured within the same range')",
+    "definition": "c(Fe_i Cr_j) = [sum_{n=0..r} sum_k p_ik + sum_{n=0..r} sum_k p_jk] / (2 sum_{n=0..r} z(n)), z(0)=1, r=2 -> denominator 30; p=1 if site holds Cr; sites i and j themselves included"
+  },
+  "targets": {
+    "note": "Paper-reported values used only for comparison by replicate.py.",
+    "table_II": {
+      "loc": "Martinez Table II, p.6",
+      "Fe_SIESTA": {"H0": 0.69, "H2": 0.57, "H3": 0.64, "H3'": 0.69, "H3''": 0.67, "H4": 0.66, "H4'": 0.65, "H4''": 0.66, "H5": 0.74, "H6": 0.74},
+      "Fe_PIM":    {"H0": 0.69, "H2": 0.57, "H3": 0.77, "H3'": 0.66, "H3''": 0.66, "H4": 0.78, "H4'": 0.67, "H4''": 0.67, "H5": 0.67, "H6": 0.68},
+      "CrNM_SIESTA": {"H0": 0.78, "H2": 0.70, "H3": 0.71, "H3'": 0.80, "H3''": 0.77, "H4": 0.59, "H4'": 0.61, "H4''": 0.58, "H5": 0.80, "H6": 0.73},
+      "CrNM_PIM":  {"H0": 0.78, "H2": 0.70, "H3": 0.69, "H3'": 0.81, "H3''": 0.81, "H4": 0.67, "H4'": 0.77, "H4''": 0.77, "H5": 0.79, "H6": 0.77},
+      "CrAFM_SIESTA": {"H0": 1.25, "H2": 1.16, "H3": 1.14, "H3'": 1.31, "H3''": 1.27, "H4": 1.04, "H4'": 1.10, "H4''": 1.07, "H5": 1.32, "H6": 1.20},
+      "CrAFM_PIM": {"H0": 1.25, "H2": 1.16, "H3": 1.07, "H3'": 1.29, "H3''": 1.29, "H4": 1.04, "H4'": 1.24, "H4''": 1.24, "H5": 1.27, "H6": 1.25}
+    },
+    "binding_text": {"loc": "p.6", "CrV_in_Fe_PIM_or_DFT": "Eb = dH3' - dH4' = 0.04 eV (weak Cr-V attraction)", "FeV_in_Cr_DFT": "Eb = dH3' - dH4' = 0.19 eV; 'underestimated by the pair interaction model'"},
+    "levesque": {"Hmix_max_PAW_eV": 0.089, "x_max_PAW": 0.48, "Hmix_max_NC_eV": 0.071, "x_max_NC": 0.52, "Tc_BW_PAW_K": 4200, "Tc_BW_NC_K": 3800, "loc": "Levesque p.5-6 text"}
+  }
+}

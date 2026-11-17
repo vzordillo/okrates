@@ -8,6 +8,7 @@ use okrates_core::ensemble::run_replicas;
 use okrates_models::bcc::BccLattice;
 use okrates_models::fecr::{Energetics, FeCrModel, PairEnergetics, Species};
 use okrates_models::fecr_anneal::anneal;
+use okrates_models::fecr_martinez::Martinez2012;
 
 const ATTEMPT_FREQUENCY: f64 = 1e13;
 const TEMPERATURE_K: f64 = 800.0;
@@ -194,11 +195,14 @@ fn no_op_without_both_species() {
 /// Anneals from the highest-energy state and applies a chi-square test of the
 /// final state's energy group against the exact Boltzmann distribution over all
 /// states with the vacancy on site 0 and two Cr atoms.
-fn anneal_chi2(base_seed: u64, replicas: u64) {
-    let model = model([2, 2, 2]);
+fn anneal_chi2<E: Energetics + Sync>(
+    model: &FeCrModel<E>,
+    expected_states: usize,
+    base_seed: u64,
+    replicas: u64,
+) {
     let kt = model.kt();
     let n = model.lattice().site_count();
-    assert_eq!(n, 16);
 
     let mut states: Vec<Vec<Species>> = Vec::new();
     let mut index: HashMap<Vec<Species>, usize> = HashMap::new();
@@ -212,7 +216,7 @@ fn anneal_chi2(base_seed: u64, replicas: u64) {
             states.push(occupancy);
         }
     }
-    assert_eq!(states.len(), 105);
+    assert_eq!(states.len(), expected_states);
 
     let energies: Vec<f64> = states
         .iter()
@@ -278,7 +282,7 @@ fn anneal_chi2(base_seed: u64, replicas: u64) {
     let state_group: Vec<usize> = state_class.iter().map(|&c| class_group[c]).collect();
 
     let results = run_replicas(base_seed, replicas, |_, seed| {
-        let result = anneal(&model, states[start].clone(), 10, seed).unwrap();
+        let result = anneal(model, states[start].clone(), 10, seed).unwrap();
         state_group[index[&result.occupancy]]
     })
     .unwrap();
@@ -301,13 +305,42 @@ fn anneal_chi2(base_seed: u64, replicas: u64) {
 
 #[test]
 fn anneal_boltzmann_smoke() {
-    anneal_chi2(83_000_000, 2000);
+    let model = model([2, 2, 2]);
+    assert_eq!(model.lattice().site_count(), 16);
+    anneal_chi2(&model, 105, 83_000_000, 2000);
 }
 
 #[test]
 #[ignore = "full tier: statistical"]
 fn anneal_matches_boltzmann() {
-    anneal_chi2(82_000_000, 20000);
+    let model = model([2, 2, 2]);
+    assert_eq!(model.lattice().site_count(), 16);
+    anneal_chi2(&model, 105, 82_000_000, 20000);
+}
+
+fn martinez_model() -> FeCrModel<Martinez2012> {
+    FeCrModel::new(
+        BccLattice::new([3, 3, 3]).unwrap(),
+        Martinez2012::new(TEMPERATURE_K).unwrap(),
+        ATTEMPT_FREQUENCY,
+        TEMPERATURE_K,
+    )
+    .unwrap()
+}
+
+#[test]
+fn martinez_anneal_boltzmann_smoke() {
+    let model = martinez_model();
+    assert_eq!(model.lattice().site_count(), 54);
+    anneal_chi2(&model, 1378, 87_000_000, 300);
+}
+
+#[test]
+#[ignore = "full tier: statistical"]
+fn martinez_anneal_matches_boltzmann() {
+    let model = martinez_model();
+    assert_eq!(model.lattice().site_count(), 54);
+    anneal_chi2(&model, 1378, 86_000_000, 20000);
 }
 
 /// With all pair energies zero every swap is accepted and the chain must keep the

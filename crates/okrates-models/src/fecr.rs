@@ -1,9 +1,10 @@
 //! A single vacancy in a BCC Fe–Cr alloy with pluggable energetics and KRA barriers.
 //!
 //! The vacancy exchanges with one of its eight nearest neighbours. The activation
-//! energy of a jump is the kinetically resolved activation energy (KRA) of the
-//! migrating atom plus half the energy change of the exchange, so that forward and
-//! reverse rates satisfy detailed balance exactly.
+//! energy of a jump comes from [`Energetics::barrier`]. For [`PairEnergetics`] it is
+//! the kinetically resolved activation energy (KRA) of the migrating atom plus half
+//! the energy change of the exchange, so that forward and reverse rates satisfy
+//! detailed balance exactly.
 //!
 //! The energetics are supplied through the [`Energetics`] trait. [`PairEnergetics`]
 //! is a nearest-neighbour pair model. The values returned by
@@ -63,10 +64,24 @@ pub trait Energetics {
         after.swap(i, j);
         self.total_energy(lattice, &after) - before
     }
-    /// Kinetically resolved activation energy of `atom` (Fe or Cr) in eV.
-    fn kra(&self, atom: Species) -> f64;
-    /// A bound B with |exchange_delta| ≤ B for every single-vacancy configuration in which `atom` jumps.
-    fn delta_bound(&self, atom: Species) -> f64;
+    /// Activation energy in eV of the atom on `atom_site` jumping into the vacancy at `vacancy_site`.
+    fn barrier(
+        &self,
+        lattice: &BccLattice,
+        occupancy: &[Species],
+        vacancy_site: usize,
+        atom_site: usize,
+    ) -> f64;
+    /// A per-species attempt frequency (prefactor) in s⁻¹; `None` means the model's attempt frequency is used.
+    fn attempt_frequency(&self, atom: Species) -> Option<f64> {
+        let _ = atom;
+        None
+    }
+    /// Checks the energetics against the model's lattice and temperature; called by [`FeCrModel::new`].
+    fn validate(&self, lattice: &BccLattice, temperature_k: f64) -> Result<(), FeCrError> {
+        let _ = (lattice, temperature_k);
+        Ok(())
+    }
 }
 
 /// A nearest-neighbour pair model with per-species KRA values.
@@ -78,6 +93,22 @@ pub struct PairEnergetics {
 }
 
 impl PairEnergetics {
+    /// Kinetically resolved activation energy of `atom` (Fe or Cr) in eV.
+    pub fn kra(&self, atom: Species) -> f64 {
+        match atom {
+            Species::Fe => self.kra_fe,
+            _ => self.kra_cr,
+        }
+    }
+
+    /// A bound B with |exchange_delta| ≤ B for every single-vacancy configuration in which `atom` jumps.
+    pub fn delta_bound(&self, atom: Species) -> f64 {
+        let values = [self.d(atom, Species::Fe), self.d(atom, Species::Cr)];
+        let max = values[0].max(values[1]);
+        let min = values[0].min(values[1]);
+        7.0 * (max - min)
+    }
+
     /// Creates pair energetics from a symmetric pair-energy matrix (eV, indexed by
     /// [`Species::index`]) and the Fe and Cr KRA values (eV).
     pub fn new(pair: [[f64; 3]; 3], kra_fe: f64, kra_cr: f64) -> Result<Self, FeCrError> {
@@ -197,18 +228,26 @@ impl Energetics for PairEnergetics {
         around_i + around_j
     }
 
-    fn kra(&self, atom: Species) -> f64 {
-        match atom {
-            Species::Fe => self.kra_fe,
-            _ => self.kra_cr,
-        }
+    fn barrier(
+        &self,
+        lattice: &BccLattice,
+        occupancy: &[Species],
+        vacancy_site: usize,
+        atom_site: usize,
+    ) -> f64 {
+        self.kra(occupancy[atom_site])
+            + self.exchange_delta(lattice, occupancy, vacancy_site, atom_site) / 2.0
     }
 
-    fn delta_bound(&self, atom: Species) -> f64 {
-        let values = [self.d(atom, Species::Fe), self.d(atom, Species::Cr)];
-        let max = values[0].max(values[1]);
-        let min = values[0].min(values[1]);
-        7.0 * (max - min)
+    fn validate(&self, _lattice: &BccLattice, _temperature_k: f64) -> Result<(), FeCrError> {
+        for atom in [Species::Fe, Species::Cr] {
+            let kra = self.kra(atom);
+            let bound = self.delta_bound(atom);
+            if kra < bound / 2.0 {
+                return Err(FeCrError::NegativeBarrier { atom, kra, bound });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -304,7 +343,8 @@ pub struct FeCrModel<E: Energetics> {
 
 impl<E: Energetics> FeCrModel<E> {
     /// Creates a model; rejects non-positive attempt frequency or temperature and
-    /// KRA values too small to keep every barrier non-negative.
+    /// energetics that fail [`Energetics::validate`] (for [`PairEnergetics`], KRA
+    /// values too small to keep every barrier non-negative).
     pub fn new(
         lattice: BccLattice,
         energetics: E,
@@ -317,13 +357,7 @@ impl<E: Energetics> FeCrModel<E> {
         if !temperature_k.is_finite() || temperature_k <= 0.0 {
             return Err(FeCrError::Temperature(temperature_k));
         }
-        for atom in [Species::Fe, Species::Cr] {
-            let kra = energetics.kra(atom);
-            let bound = energetics.delta_bound(atom);
-            if kra < bound / 2.0 {
-                return Err(FeCrError::NegativeBarrier { atom, kra, bound });
-            }
-        }
+        energetics.validate(&lattice, temperature_k)?;
         Ok(Self {
             lattice,
             energetics,
@@ -397,17 +431,21 @@ impl<E: Energetics> FeCrModel<E> {
     /// Returns the activation energy in eV of the jump along `direction`.
     pub fn barrier(&self, state: &FeCrState, direction: usize) -> f64 {
         let target = self.lattice.neighbor(state.vacancy, direction);
-        let atom = state.occupancy[target];
-        self.energetics.kra(atom)
-            + self
-                .energetics
-                .exchange_delta(&self.lattice, &state.occupancy, state.vacancy, target)
-                / 2.0
+        self.energetics
+            .barrier(&self.lattice, &state.occupancy, state.vacancy, target)
     }
 
     /// Returns the jump rate in s⁻¹ along `direction`.
+    ///
+    /// The model's attempt frequency is ignored for species where the energetics supply one.
     pub fn rate(&self, state: &FeCrState, direction: usize) -> f64 {
-        self.attempt_frequency * (-self.barrier(state, direction) / self.kt()).exp()
+        let target = self.lattice.neighbor(state.vacancy, direction);
+        let atom = state.occupancy[target];
+        let nu = self
+            .energetics
+            .attempt_frequency(atom)
+            .unwrap_or(self.attempt_frequency);
+        nu * (-self.barrier(state, direction) / self.kt()).exp()
     }
 
     /// Checks occupancy length, vacancy count, the vacancy field, that displacements
@@ -532,6 +570,18 @@ pub enum FeCrError {
         /// The site holding the inconsistent entity.
         site: usize,
     },
+    /// The lattice has fewer than `min_cells` conventional cells along some axis.
+    LatticeTooSmall {
+        /// The smallest supported number of cells per axis.
+        min_cells: usize,
+    },
+    /// The model temperature differs from the temperature the energetics were built for.
+    TemperatureMismatch {
+        /// The model temperature in K.
+        model: f64,
+        /// The energetics temperature in K.
+        energetics: f64,
+    },
 }
 
 impl fmt::Display for FeCrError {
@@ -561,6 +611,16 @@ impl fmt::Display for FeCrError {
                 f,
                 "entity on site {site} has an unwrapped displacement inconsistent with its site"
             ),
+            Self::LatticeTooSmall { min_cells } => {
+                write!(
+                    f,
+                    "lattice needs at least {min_cells} cells along every axis"
+                )
+            }
+            Self::TemperatureMismatch { model, energetics } => write!(
+                f,
+                "model temperature {model} K differs from energetics temperature {energetics} K"
+            ),
         }
     }
 }
@@ -569,7 +629,7 @@ impl Error for FeCrError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Energetics, FeCrError, PairEnergetics, Species};
+    use super::{FeCrError, PairEnergetics, Species};
 
     #[test]
     fn illustrative_passes_new() {

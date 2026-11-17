@@ -15,7 +15,7 @@ def fecr_diffusion(
     cells: tuple[int, int, int],
     cr_count: int,
     temperature_k: float,
-    attempt_frequency: float,
+    attempt_frequency: float | None = None,
     t_end: float,
     k_count: int,
     lattice_parameter_m: float,
@@ -24,4 +24,5 @@ def fecr_diffusion(
     anneal_sweeps: int = 0,
     pair_energies_ev: list[list[float]] | None = None,
     kra_ev: tuple[float, float] | None = None,
-) -> tuple[list[float], list[float], list[float], float]: ...
+    energetics: str = "illustrative",
+) -> tuple[list[float], list[float], list[float], float, int]: ...

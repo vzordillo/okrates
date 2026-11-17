@@ -167,6 +167,27 @@ fn fecr_observables_bad_args() {
     );
 }
 
+/// About 3.5 s in debug.
+#[test]
+#[ignore = "full tier: e2e"]
+fn fecr_observables_martinez_small() {
+    let (code, stdout, stderr) =
+        run(example("fecr_observables_martinez").args(["22", "7", "2", "20"]));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout,
+        include_str!("data/fecr_observables_martinez_small.txt")
+    );
+}
+
+#[test]
+fn fecr_observables_martinez_bad_args() {
+    assert_usage_error(
+        example("fecr_observables_martinez").args(["22", "7", "1", "0"]),
+        "usage: fecr_observables_martinez <cr_count> <seed_base> <runs>=2 <anneal_sweeps>",
+    );
+}
+
 #[test]
 fn multi_vacancy_scaling_small() {
     let (code, stdout, stderr) = run(example("multi_vacancy_scaling")

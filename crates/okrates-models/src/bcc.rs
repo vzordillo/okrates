@@ -15,11 +15,22 @@ pub const DISPLACEMENTS: [[i64; 3]; 8] = [
     [1, 1, 1],
 ];
 
-/// A periodic BCC lattice with a precomputed neighbour table.
+/// Second-nearest-neighbour displacements in half-lattice units.
+pub const SECOND_DISPLACEMENTS: [[i64; 3]; 6] = [
+    [-2, 0, 0],
+    [2, 0, 0],
+    [0, -2, 0],
+    [0, 2, 0],
+    [0, 0, -2],
+    [0, 0, 2],
+];
+
+/// A periodic BCC lattice with precomputed first- and second-neighbour tables.
 #[derive(Clone, Debug)]
 pub struct BccLattice {
     cells: [usize; 3],
     neighbors: Vec<[usize; 8]>,
+    second_neighbors: Vec<[usize; 6]>,
 }
 
 impl BccLattice {
@@ -32,6 +43,7 @@ impl BccLattice {
         let mut lattice = Self {
             cells,
             neighbors: Vec::with_capacity(2 * cells[0] * cells[1] * cells[2]),
+            second_neighbors: Vec::with_capacity(2 * cells[0] * cells[1] * cells[2]),
         };
         for site in 0..lattice.site_count() {
             let position = lattice.position(site);
@@ -45,6 +57,15 @@ impl BccLattice {
                     .expect("BCC neighbour positions share a parity")
             });
             lattice.neighbors.push(neighbors);
+            let second = std::array::from_fn(|direction| {
+                let target = std::array::from_fn(|axis| {
+                    position[axis] + SECOND_DISPLACEMENTS[direction][axis]
+                });
+                lattice
+                    .site_at(target)
+                    .expect("second-neighbour positions share a parity")
+            });
+            lattice.second_neighbors.push(second);
         }
         Ok(lattice)
     }
@@ -67,6 +88,13 @@ impl BccLattice {
     /// Returns the eight nearest neighbours of `site` in displacement order.
     pub fn neighbors(&self, site: usize) -> &[usize; 8] {
         &self.neighbors[site]
+    }
+
+    /// Returns the six second-nearest neighbours of `site` in [`SECOND_DISPLACEMENTS`] order.
+    ///
+    /// With two cells along an axis the − and + entries on that axis coincide.
+    pub fn second_neighbors(&self, site: usize) -> &[usize; 6] {
+        &self.second_neighbors[site]
     }
 
     /// Returns a site's position in half-lattice units.

@@ -14,10 +14,11 @@ ROOT = Path(__file__).resolve().parents[2]
 CELLS, NU, T, K_COUNT, LATTICE_PARAMETER = (6, 6, 6), 1e13, 800.0, 10, 1.0
 
 
-def rust_observables(cr_count, seed, runs, anneal_sweeps):
+def rust_observables(cr_count, seed, runs, anneal_sweeps,
+                     example="fecr_observables"):
     out = subprocess.run(
         ["cargo", "run", "--locked", "-q", "-p", "okrates-models",
-         "--example", "fecr_observables", "--", str(cr_count), str(seed),
+         "--example", example, "--", str(cr_count), str(seed),
          str(runs), str(anneal_sweeps)],
         cwd=ROOT, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
@@ -28,17 +29,7 @@ def rust_observables(cr_count, seed, runs, anneal_sweeps):
     return rows
 
 
-@pytest.mark.parametrize(
-    "cr_count, seed, runs, anneal_sweeps", [(22, 7, 2, 20), (43, 11, 3, 0)]
-)
-def test_parity_with_rust_example(cr_count, seed, runs, anneal_sweeps):
-    rust = rust_observables(cr_count, seed, runs, anneal_sweeps)
-    result = okrates.fecr_diffusion(
-        cells=CELLS, cr_count=cr_count, temperature_k=T, attempt_frequency=NU,
-        t_end=rust["t_end"][0], k_count=K_COUNT,
-        lattice_parameter_m=LATTICE_PARAMETER, seed=seed, runs=runs,
-        anneal_sweeps=anneal_sweeps,
-    )
+def assert_matches_rust(rust, result):
     scalar_keys = {
         "vacancy": "D_v", "tracer_fe": "D_Fe", "tracer_cr": "D_Cr",
         "tracer_all": "D_all", "f": "f",
@@ -56,6 +47,37 @@ def test_parity_with_rust_example(cr_count, seed, runs, anneal_sweeps):
     assert result["Lambda"][1, 0] == rust["lambda_fecr"][0]
     assert result["Lambda_se"][1, 0] == rust["lambda_fecr"][1]
     assert result["mean_jumps"] == rust["mean_jumps"][0]
+
+
+PARITY_CASES = [(22, 7, 2, 20), (43, 11, 3, 0)]
+
+
+@pytest.mark.parametrize("cr_count, seed, runs, anneal_sweeps", PARITY_CASES)
+def test_parity_with_rust_example(cr_count, seed, runs, anneal_sweeps):
+    rust = rust_observables(cr_count, seed, runs, anneal_sweeps)
+    result = okrates.fecr_diffusion(
+        cells=CELLS, cr_count=cr_count, temperature_k=T, attempt_frequency=NU,
+        t_end=rust["t_end"][0], k_count=K_COUNT,
+        lattice_parameter_m=LATTICE_PARAMETER, seed=seed, runs=runs,
+        anneal_sweeps=anneal_sweeps,
+    )
+    assert_matches_rust(rust, result)
+
+
+@pytest.mark.parametrize("cr_count, seed, runs, anneal_sweeps", PARITY_CASES)
+def test_martinez_parity_with_rust_example(
+    cr_count, seed, runs, anneal_sweeps
+):
+    rust = rust_observables(
+        cr_count, seed, runs, anneal_sweeps, "fecr_observables_martinez"
+    )
+    result = okrates.fecr_diffusion(
+        cells=CELLS, cr_count=cr_count, temperature_k=T,
+        t_end=rust["t_end"][0], k_count=K_COUNT,
+        lattice_parameter_m=LATTICE_PARAMETER, seed=seed, runs=runs,
+        anneal_sweeps=anneal_sweeps, energetics="martinez2012",
+    )
+    assert_matches_rust(rust, result)
 
 
 SMALL = dict(
@@ -78,7 +100,9 @@ def test_explicit_illustrative_energetics_match_defaults():
     explicit = okrates.fecr_diffusion(
         **SMALL, pair_energies_ev=pair, kra_ev=energetics["kra_ev"]
     )
-    assert set(default) == set(FLOAT_KEYS) | {"Lambda", "Lambda_se"}
+    assert set(default) == set(FLOAT_KEYS) | {
+        "Lambda", "Lambda_se", "barrier_floor_activations"
+    }
     for key in FLOAT_KEYS:
         assert type(default[key]) is float
     for key in ("Lambda", "Lambda_se"):
@@ -108,6 +132,27 @@ def test_invalid_arguments_raise_value_error(kwargs):
         okrates.fecr_diffusion(**{**SMALL, **kwargs})
 
 
+MARTINEZ = {k: v for k, v in SMALL.items() if k != "attempt_frequency"}
+MARTINEZ["energetics"] = "martinez2012"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"attempt_frequency": 1e13},
+    {"pair_energies_ev": np.zeros((3, 3)), "kra_ev": (0.6, 0.55)},
+    {"cells": (2, 2, 2)},
+    {"energetics": "bogus"},
+])
+def test_invalid_martinez_arguments_raise_value_error(kwargs):
+    with pytest.raises(ValueError):
+        okrates.fecr_diffusion(**{**MARTINEZ, **kwargs})
+
+
+def test_illustrative_without_attempt_frequency_raises_value_error():
+    kwargs = {k: v for k, v in SMALL.items() if k != "attempt_frequency"}
+    with pytest.raises(ValueError):
+        okrates.fecr_diffusion(**kwargs)
+
+
 def test_negative_kra_and_negative_barrier_raise_value_error():
     pair = okrates.fecr_illustrative_energetics()["pair_energies_ev"]
     for kra in [(-1.0, 0.55), (0.0, 0.0)]:
@@ -120,3 +165,10 @@ def test_negative_kra_and_negative_barrier_raise_value_error():
 def test_negative_seed_raises_overflow_error():
     with pytest.raises(OverflowError):
         okrates.fecr_diffusion(**{**SMALL, "seed": -1})
+
+
+def test_barrier_floor_activations_is_an_int():
+    martinez = okrates.fecr_diffusion(**MARTINEZ)
+    assert isinstance(martinez["barrier_floor_activations"], int)
+    assert martinez["barrier_floor_activations"] >= 0
+    assert okrates.fecr_diffusion(**SMALL)["barrier_floor_activations"] == 0

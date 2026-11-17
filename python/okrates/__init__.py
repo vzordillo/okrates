@@ -51,7 +51,7 @@ def fecr_diffusion(
     cells: tuple[int, int, int],
     cr_count: int,
     temperature_k: float,
-    attempt_frequency: float,
+    attempt_frequency: float | None = None,
     t_end: float,
     k_count: int,
     lattice_parameter_m: float,
@@ -60,13 +60,23 @@ def fecr_diffusion(
     anneal_sweeps: int = 0,
     pair_energies_ev: npt.ArrayLike | None = None,
     kra_ev: tuple[float, float] | None = None,
-) -> dict[str, float | npt.NDArray[np.float64]]:
+    energetics: str = "illustrative",
+) -> dict[str, float | int | npt.NDArray[np.float64]]:
     """Estimate Fe-Cr single-vacancy diffusion observables for one composition.
 
     ``pair_energies_ev`` (symmetric 3x3, eV, indexed Fe, Cr, vacancy) and
     ``kra_ev`` (Fe, Cr; eV) must be given together or both omitted. When
     omitted, the default energetics are ILLUSTRATIVE: round numbers with no
-    source, not DFT or literature values.
+    source, not DFT or literature values. ``attempt_frequency`` (s^-1) is
+    required for them.
+
+    ``energetics="martinez2012"`` selects Martinez et al., PRB 86, 224109
+    (2012): Fe with non-magnetic Cr parameters. It needs every cell count >= 3,
+    and ``attempt_frequency``, ``pair_energies_ev`` and ``kra_ev`` must be
+    omitted (nu = 1e13 s^-1 per species, from the paper). okrates raises a
+    barrier that the pair model puts below max(0, E_final - E_initial) to that
+    value (a choice not stated in the paper; detailed balance is kept) and
+    counts these events in ``barrier_floor_activations``.
 
     Units: ``temperature_k`` in K, ``t_end`` in s, energies in eV. Lengths enter
     squared, so D and Lambda are in m^2/s when ``lattice_parameter_m`` is in m.
@@ -78,7 +88,10 @@ def fecr_diffusion(
     ``sqrt(runs)``. ``D_Cr`` is NaN when ``cr_count`` is 0.
 
     Returns a dict with float keys ``D_v, D_v_se, D_Fe, D_Fe_se, D_Cr, D_Cr_se,
-    D_all, D_all_se, f, f_se, mean_jumps`` and float64 2x2 arrays ``Lambda`` and
+    D_all, D_all_se, f, f_se, mean_jumps``, the int key
+    ``barrier_floor_activations`` (barrier evaluations, over all replicas, in
+    which the martinez2012 floor acted; always 0 for the illustrative
+    energetics), and float64 2x2 arrays ``Lambda`` and
     ``Lambda_se`` laid out ``[[FeFe, FeCr], [FeCr, CrCr]]``.
 
     Raises ``ValueError`` for invalid arguments and ``OverflowError`` for
@@ -89,7 +102,7 @@ def fecr_diffusion(
     pair = None
     if pair_energies_ev is not None:
         pair = np.asarray(pair_energies_ev, dtype=np.float64).tolist()
-    scalars, lam, lam_se, mean_jumps = _okrates.fecr_diffusion(
+    scalars, lam, lam_se, mean_jumps, floor_activations = _okrates.fecr_diffusion(
         cells=cells,
         cr_count=cr_count,
         temperature_k=temperature_k,
@@ -102,13 +115,15 @@ def fecr_diffusion(
         anneal_sweeps=anneal_sweeps,
         pair_energies_ev=pair,
         kra_ev=kra_ev,
+        energetics=energetics,
     )
     keys = ["D_v", "D_Fe", "D_Cr", "D_all", "f"]
-    result: dict[str, float | npt.NDArray[np.float64]] = {}
+    result: dict[str, float | int | npt.NDArray[np.float64]] = {}
     for i, key in enumerate(keys):
         result[key] = scalars[2 * i]
         result[key + "_se"] = scalars[2 * i + 1]
     result["mean_jumps"] = mean_jumps
+    result["barrier_floor_activations"] = floor_activations
 
     def matrix(v: list[float]) -> npt.NDArray[np.float64]:
         return np.array([[v[0], v[1]], [v[1], v[2]]], dtype=np.float64)
