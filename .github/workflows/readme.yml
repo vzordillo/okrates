@@ -1,0 +1,33 @@
+name: readme
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# Runs the README's Getting started commands verbatim, extracted from README.md.
+jobs:
+  commands:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+      # rustup reads rust-toolchain.toml and installs the pinned toolchain and components.
+      - run: rustup show
+      - name: Rust commands
+        run: |
+          python .github/scripts/readme_commands.py rust > "$RUNNER_TEMP/rust.sh"
+          bash -euxo pipefail "$RUNNER_TEMP/rust.sh"
+      # A fresh venv; activation must share one step with the commands.
+      - name: Python commands
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          source "$RUNNER_TEMP/venv/bin/activate"
+          python .github/scripts/readme_commands.py python > "$RUNNER_TEMP/python.sh"
+          bash -euxo pipefail "$RUNNER_TEMP/python.sh"

@@ -10,6 +10,20 @@ const COUNTS: [usize; 7] = [1, 4, 16, 64, 256, 1024, 4096];
 const REPS: u64 = 5;
 const WARMUP: u64 = 100;
 
+/// Reads an optional positive integer from the environment; exits 2 on a bad value.
+fn env_u64(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(v) if v >= 1 => v,
+            _ => {
+                eprintln!("{name} must be an integer >= 1");
+                std::process::exit(2);
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 fn stats(mut samples: Vec<f64>) -> (f64, f64, f64) {
     samples.sort_by(f64::total_cmp);
     (
@@ -20,13 +34,16 @@ fn stats(mut samples: Vec<f64>) -> (f64, f64, f64) {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Optional limits for quick runs; the defaults give the full benchmark.
+    let max_n = env_u64("MAX_N", u64::MAX);
+    let budget = env_u64("STEP_BUDGET", 20_000_000);
     println!(
         "N,M,steps,direct_median_ns,direct_min_ns,direct_max_ns,incremental_median_ns,incremental_min_ns,incremental_max_ns,speedup"
     );
     let model = MultiVacancyDiffusion::new(BccLattice::new(CELLS)?, 1.0);
-    for n in COUNTS {
+    for n in COUNTS.into_iter().filter(|&n| n as u64 <= max_n) {
         let m = 8 * n;
-        let steps = (20_000_000 / m as u64).max(2000);
+        let steps = (budget / m as u64).max(2000);
         let sites = model.random_sites(n, 1)?;
         let mut direct = Vec::new();
         let mut incremental = Vec::new();
