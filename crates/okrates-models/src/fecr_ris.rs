@@ -9,6 +9,7 @@
 //! detailed balance holds to rounding. The barrier is `max(raw, max(0, ΔE))`; the
 //! floor acts on the saddle level shared by the forward and the reverse jump.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -364,6 +365,8 @@ fn open01(rng: &mut ChaCha12Rng) -> f64 {
     ((rng.next_u64() >> 12) as f64 + 0.5) * f64::EPSILON
 }
 
+const N_CACHE_SIZE: usize = 1024;
+
 /// The dynamic state: site contents, defect records, counters and the creation stream.
 #[derive(Clone, Debug)]
 pub struct FeCrRisState {
@@ -383,6 +386,8 @@ pub struct FeCrRisState {
     peak_defects: u64,
     last_changed: Vec<usize>,
     last_records: Vec<usize>,
+    /// Memo of `n(site)` for the current cells; cleared whenever `apply` runs.
+    n_cache: RefCell<Vec<(usize, u32)>>,
 }
 
 impl FeCrRisState {
@@ -502,6 +507,49 @@ impl FeCrRisState {
                 _ => unreachable!("dumbbell cell without a dumbbell record"),
             },
         }
+    }
+
+    /// Cr weight of the content of `site`, without building a [`Content`].
+    fn cr_weight_at(&self, site: usize) -> u32 {
+        match self.cells[site] {
+            Cell::Cr => 1,
+            Cell::Dumbbell => match self.records[self.site_record[site] as usize] {
+                Record::Dumbbell { plus, minus, .. } => {
+                    u32::from(plus == Species::Cr) + u32::from(minus == Species::Cr)
+                }
+                _ => unreachable!("dumbbell cell without a dumbbell record"),
+            },
+            _ => 0,
+        }
+    }
+
+    /// Σ Cr weights over {site} ∪ 1NN ∪ 2NN.
+    fn n(&self, lattice: &BccLattice, site: usize) -> u32 {
+        let mut n = self.cr_weight_at(site);
+        for &t in lattice.neighbors(site) {
+            n += self.cr_weight_at(t);
+        }
+        for &t in lattice.second_neighbors(site) {
+            n += self.cr_weight_at(t);
+        }
+        n
+    }
+
+    /// [`Self::n`] memoised until the next `apply`.
+    fn n_cached(&self, lattice: &BccLattice, site: usize) -> u32 {
+        let mut cache = self.n_cache.borrow_mut();
+        if cache.is_empty() {
+            cache.resize(N_CACHE_SIZE, (usize::MAX, 0));
+        }
+        let entry = &mut cache[site % N_CACHE_SIZE];
+        if entry.0 != site {
+            *entry = (site, self.n(lattice, site));
+        }
+        entry.1
+    }
+
+    fn clear_n_cache(&mut self) {
+        self.n_cache.get_mut().fill((usize::MAX, 0));
     }
 
     fn open_records(&self) -> u64 {
@@ -770,6 +818,7 @@ impl FeCrRis {
             peak_defects: 0,
             last_changed: Vec::new(),
             last_records: Vec::new(),
+            n_cache: RefCell::new(Vec::new()),
         };
         state.peak_defects = state.open_records();
         state
@@ -1017,41 +1066,72 @@ impl FeCrRis {
             state: s,
             overrides,
         };
-        let mut region: Vec<usize> = Vec::with_capacity(15 * overrides.len());
-        for &(c, _) in overrides {
-            region.push(c);
-            region.extend_from_slice(lattice.neighbors(c));
-            region.extend_from_slice(lattice.second_neighbors(c));
+        // The sites whose bonds or n(x) can change, sorted, with the change of n(x) caused by
+        // the overrides: n(x) after the change differs from n(x) before it only by the Cr
+        // weights of the overridden sites in the neighbourhood of x (exact integers).
+        let mut tagged: Vec<(usize, i32)> = Vec::with_capacity(15 * overrides.len());
+        for &(c, new) in overrides {
+            let dw = new.cr_weight() as i32 - s.cr_weight_at(c) as i32;
+            tagged.push((c, dw));
+            tagged.extend(lattice.neighbors(c).iter().map(|&t| (t, dw)));
+            tagged.extend(lattice.second_neighbors(c).iter().map(|&t| (t, dw)));
         }
-        region.sort_unstable();
-        region.dedup();
+        tagged.sort_unstable_by_key(|&(site, _)| site);
+        let mut region: Vec<usize> = Vec::with_capacity(tagged.len());
+        let mut deltas: Vec<i32> = Vec::with_capacity(tagged.len());
+        for &(site, dw) in &tagged {
+            if region.last() == Some(&site) {
+                *deltas.last_mut().expect("deltas parallel region") += dw;
+            } else {
+                region.push(site);
+                deltas.push(dw);
+            }
+        }
         let changed = |site: usize| overrides.iter().any(|&(c, _)| c == site);
 
         let mut sum = 0.0;
-        for &site in &region {
+        for (site_index, &site) in region.iter().enumerate() {
             let (s_before, s_after) = (before.get(site), after.get(site));
             let s_changed = changed(site);
             let (mut n_before, mut n_after) = (None, None);
+            let site_delta = deltas[site_index];
             for (shell, weight) in [
                 (&lattice.neighbors(site)[..], 1.0),
                 (&lattice.second_neighbors(site)[..], 0.5),
             ] {
                 for &t in shell {
-                    if t < site && region.binary_search(&t).is_ok() {
+                    let t_changed = changed(t);
+                    if !s_changed
+                        && !t_changed
+                        && !matches!(
+                            (s.cells[site], s.cells[t]),
+                            (Cell::Fe, Cell::Cr) | (Cell::Cr, Cell::Fe)
+                        )
+                    {
+                        continue;
+                    }
+                    let t_position = region.binary_search(&t);
+                    if t < site && t_position.is_ok() {
+                        continue;
+                    }
+                    let t_delta = t_position.map_or(0, |i| deltas[i]);
+                    // An unchanged Fe–Cr bond whose local Cr count is unchanged has an
+                    // exactly zero difference.
+                    if !s_changed && !t_changed && site_delta + t_delta == 0 {
                         continue;
                     }
                     let (t_before, t_after) = (before.get(t), after.get(t));
-                    if !s_changed && !changed(t) && !is_mixed(s_before, t_before) {
-                        continue;
-                    }
                     let n_sum_before = if is_mixed(s_before, t_before) {
-                        *n_before.get_or_insert_with(|| before.n(lattice, site))
-                            + before.n(lattice, t)
+                        *n_before.get_or_insert_with(|| s.n_cached(lattice, site))
+                            + s.n_cached(lattice, t)
                     } else {
                         0
                     };
                     let n_sum_after = if is_mixed(s_after, t_after) {
-                        *n_after.get_or_insert_with(|| after.n(lattice, site)) + after.n(lattice, t)
+                        let ns = *n_after.get_or_insert_with(|| {
+                            (s.n_cached(lattice, site) as i32 + site_delta) as u32
+                        });
+                        ns + (s.n_cached(lattice, t) as i32 + t_delta) as u32
                     } else {
                         0
                     };
@@ -1544,15 +1624,17 @@ impl Model for FeCrRis {
     }
 
     fn apply(&self, state: &mut Self::State, event: &Self::Event) -> Result<(), Self::Error> {
-        match *event {
-            FeCrRisEvent::VacancyJump { rec, dir } => self.jump(state, rec, dir, true)?,
-            FeCrRisEvent::DumbbellJump { rec, jump } => self.jump(state, rec, jump, false)?,
+        let result = match *event {
+            FeCrRisEvent::VacancyJump { rec, dir } => self.jump(state, rec, dir, true),
+            FeCrRisEvent::DumbbellJump { rec, jump } => self.jump(state, rec, jump, false),
             FeCrRisEvent::Create => {
                 state.last_changed.clear();
                 state.last_records.clear();
-                self.create(state)?;
+                self.create(state)
             }
-        }
+        };
+        state.clear_n_cache();
+        result?;
         state.peak_defects = state.peak_defects.max(state.open_records());
         Ok(())
     }
@@ -1606,19 +1688,37 @@ impl IncrementalModel for FeCrRis {
     }
 
     fn affected_slots(&self, state: &Self::State, _event: &Self::Event, out: &mut Vec<usize>) {
+        let mut records: Vec<usize> = state.last_records.clone();
+        let [lx, ly, lz] = self.lattice.cells();
+        let m = [2 * lx as i64, 2 * ly as i64, 2 * lz as i64];
+        let wrap = |x: i64, axis: usize| {
+            if x < 0 {
+                x + m[axis]
+            } else if x >= m[axis] {
+                x - m[axis]
+            } else {
+                x
+            }
+        };
         for &c in &state.last_changed {
             let p = self.lattice.position(c);
             for o in INFLUENCE_OFFSETS.iter() {
-                let site = self
-                    .lattice
-                    .site_at([p[0] - o[0], p[1] - o[1], p[2] - o[2]])
-                    .expect("influence offsets keep the sublattice parity");
+                // Offsets are at most 7 in each component and cells are at least 6, so a
+                // single wrap suffices. The offsets keep the sublattice parity.
+                let w: [i64; 3] = std::array::from_fn(|axis| wrap(p[axis] - o[axis], axis));
+                let sub = w[0] & 1;
+                let site = ((((sub as usize) * lx + ((w[0] - sub) / 2) as usize) * ly
+                    + ((w[1] - sub) / 2) as usize)
+                    * lz)
+                    + ((w[2] - sub) / 2) as usize;
                 if let Some(r) = state.record_at(site) {
-                    out.extend(8 * r..8 * r + 8);
+                    records.push(r);
                 }
             }
         }
-        for &r in &state.last_records {
+        records.sort_unstable();
+        records.dedup();
+        for r in records {
             out.extend(8 * r..8 * r + 8);
         }
     }
@@ -1866,6 +1966,7 @@ impl FeCrRis {
             peak_defects,
             last_changed: Vec::new(),
             last_records: Vec::new(),
+            n_cache: RefCell::new(Vec::new()),
         };
         self.check_invariants(&state).map_err(|e| e.to_string())?;
         Ok(state)
