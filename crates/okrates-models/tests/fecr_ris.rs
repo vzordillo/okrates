@@ -1,5 +1,6 @@
 //! Integration tests for the Fe–Cr RIS model: energetics parity, detailed balance,
-//! jump and creation geometry, recombination, sink absorption, catalog equivalence, and checkpoints.
+//! jump and creation geometry, recombination, sink absorption, catalog equivalence,
+//! checkpoints, and the dumbbell saddle refit at T (T16).
 
 use std::collections::HashMap;
 use std::fs;
@@ -372,6 +373,53 @@ fn t15a_floor_geometry() {
     println!("T15a max relative error {max_err:.3e}, floored {floored}, with dE > 0: {floored_up}");
     assert!(floored > 0, "no floored jump");
     assert!(floored_up > 0, "no floored jump with positive dE");
+}
+
+/// Raw barriers of the four defining pure-Fe jumps of r2-spec §2.5 (FeFe / Fe, mixed / Cr,
+/// mixed / Fe, CrCr / Cr), from one dumbbell at site `site` with axis 3.
+fn defining_barriers(m: &FeCrRis, site: usize) -> [f64; 4] {
+    use Species::{Cr, Fe};
+    let mut out = [f64::NAN; 4];
+    for (i, (plus, minus, rest)) in [(Fe, Fe, Fe), (Cr, Fe, Fe), (Cr, Fe, Cr), (Cr, Cr, Cr)]
+        .into_iter()
+        .enumerate()
+    {
+        let d = Defect::Dumbbell {
+            site,
+            axis: 3,
+            plus,
+            minus,
+        };
+        let occ = vec![Fe; m.lattice().site_count()];
+        let s = m.state_with_defects(occ, &[d], 0).unwrap();
+        let jump = (0..8)
+            .find(|&j| m.jump_result(&s, 0, j).is_some_and(|(_, r)| r == rest))
+            .unwrap();
+        out[i] = m.raw_barrier(&s, 0, jump);
+    }
+    out
+}
+
+#[test]
+fn t16_defining_barriers_hold_at_t() {
+    let site = 137;
+    let cold = model([8, 8, 8], 0.0, 1);
+    assert_eq!(cold.dumbbell_saddle(), cold.params().dumbbell.saddle);
+    let target = defining_barriers(&cold, site);
+    for (got, want) in target.iter().zip([0.340, 0.230, 0.3030, 0.050]) {
+        assert!((got - want).abs() < 1e-4, "0 K barrier {got} vs {want}");
+    }
+    for t in [0.0, 300.0, 573.0, 773.0, 950.0] {
+        let m = model([8, 8, 8], t, 1);
+        let got = defining_barriers(&m, site);
+        println!(
+            "T16 {t} K: barriers {got:?}, saddle {:?}",
+            m.dumbbell_saddle()
+        );
+        for (g, w) in got.iter().zip(target) {
+            assert!((g - w).abs() <= 1e-12, "T = {t} K: barrier {g} vs 0 K {w}");
+        }
+    }
 }
 
 #[test]
@@ -1536,4 +1584,56 @@ fn t12_round_trip_and_corruption() {
     // Creation stream other than 1.
     let stream_at = bytes.len() - 32;
     assert!(corrupt(&|b| b[stream_at] = 0).contains("stream"));
+}
+
+/// The pilot example's placement code, compiled into this test crate.
+#[allow(dead_code)]
+#[path = "../examples/fecr_ris_pilot.rs"]
+mod pilot;
+
+/// The pilot places Cr on stream 2, not on the engine's stream 0, so its first draw is not
+/// the engine's first uniform, and the same seed still gives the same placement.
+#[test]
+fn pilot_placement_uses_its_own_stream() {
+    use okrates_core::KmcRng;
+    use rand_chacha::rand_core::Rng;
+
+    let seed = 7;
+    let engine_u = KmcRng::from_seed(seed).open01();
+    let placement_bits = pilot::placement_rng(seed).next_u64();
+    let placement_u = ((placement_bits >> 12) as f64 + 0.5) * f64::EPSILON;
+    assert_ne!(placement_u, engine_u);
+
+    let (sites, cr) = (432, 43);
+    let first = pilot::place_cr(sites, cr, &mut pilot::placement_rng(seed));
+    let again = pilot::place_cr(sites, cr, &mut pilot::placement_rng(seed));
+    assert_eq!(first, again);
+    assert_eq!(first.iter().filter(|&&s| s == Species::Cr).count(), cr);
+
+    // Placement on the engine's stream (what `random_state` does) gives another layout.
+    let m = model([6, 6, 6], 773.0, 64);
+    let on_engine_stream = occupancy(&m.random_state(cr, seed, seed).unwrap());
+    assert_ne!(first, on_engine_stream);
+}
+
+/// A saddle table so large that the refit overflows is rejected instead of building a
+/// model with non-finite saddle interactions (PR #9).
+#[test]
+fn non_finite_saddle_refit_is_rejected() {
+    let mut dumbbell = DumbbellParams::senninger2016_r1();
+    dumbbell.saddle = [[f64::MAX; 2]; 2];
+    let result = FeCrRis::new(FeCrRisParams {
+        cells: [6, 6, 6],
+        sink_planes: vec![],
+        temperature_k: 773.0,
+        k0_dpa_per_s: 0.0,
+        capacity: 4,
+        dumbbell,
+    });
+    assert_eq!(
+        result.err(),
+        Some(FeCrRisError::Parameter(
+            "the refitted dumbbell saddle interactions are not finite"
+        ))
+    );
 }

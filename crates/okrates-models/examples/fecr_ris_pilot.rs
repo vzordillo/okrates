@@ -4,7 +4,9 @@
 //! Usage: `fecr_ris_pilot --temperature K --k0 dpa_per_s --dpa-end x --capacity P --seed s
 //! [--cells nx ny nz] [--report-every-steps n]`.
 //!
-//! The seed drives the Cr shuffle, the creation stream and the scheduler. Output lines are
+//! The seed drives three independent ChaCha12 streams of one key: stream 0 engine (the
+//! scheduler), 1 creation (Frenkel-pair creation inside the model), 2 placement (the Cr
+//! shuffle), so placement draws never repeat event draws. Output lines are
 //! `key=value` pairs: steps, time (s), dose (dpa), current and peak vacancies V and
 //! interstitials I, their time-weighted means, the event counters, `borrowed_fe`,
 //! creation attempts, the floored-jump counters and the wall time per step. Exit status 1
@@ -15,9 +17,17 @@ use std::process::exit;
 use std::time::Instant;
 
 use okrates_core::{IncrementalSimulation, SimError, Step};
+use okrates_models::fecr::Species;
 use okrates_models::fecr_ris::{
     DumbbellParams, FeCrRis, FeCrRisError, FeCrRisParams, FeCrRisState,
 };
+
+#[path = "support/tally.rs"]
+mod tally;
+use tally::Tally;
+
+use rand_chacha::ChaCha12Rng;
+use rand_chacha::rand_core::{Rng, SeedableRng};
 
 const USAGE: &str = "usage: fecr_ris_pilot --temperature K --k0 dpa_per_s --dpa-end x --capacity P --seed s [--cells nx ny nz] [--report-every-steps n]";
 
@@ -89,19 +99,29 @@ fn parse() -> Args {
     }
 }
 
-/// Running peak and time-weighted mean of a count.
-#[derive(Default)]
-struct Tally {
-    peak: u64,
-    weighted: f64,
+/// The placement stream: ChaCha12 keyed like the engine (`seed` LE, zero padded) but on
+/// stream 2. Stream 0 is the engine and stream 1 the model's creation stream.
+pub fn placement_rng(seed: u64) -> ChaCha12Rng {
+    let mut bytes = [0_u8; 32];
+    bytes[..8].copy_from_slice(&seed.to_le_bytes());
+    let mut rng = ChaCha12Rng::from_seed(bytes);
+    rng.set_stream(2);
+    rng
 }
 
-impl Tally {
-    /// `before` held for `dt`; `after` is the count once the event has been applied.
-    fn update(&mut self, before: u64, after: u64, dt: f64) {
-        self.weighted += before as f64 * dt;
-        self.peak = self.peak.max(after);
+/// Fe with `cr_count` Cr atoms on sites drawn by a partial Fisher-Yates shuffle.
+pub fn place_cr(sites: usize, cr_count: usize, rng: &mut ChaCha12Rng) -> Vec<Species> {
+    let mut order: Vec<usize> = (0..sites).collect();
+    for i in 0..cr_count {
+        let u = ((rng.next_u64() >> 12) as f64 + 0.5) * f64::EPSILON;
+        let j = i + ((u * (sites - i) as f64) as usize).min(sites - i - 1);
+        order.swap(i, j);
     }
+    let mut occ = vec![Species::Fe; sites];
+    for &site in &order[..cr_count] {
+        occ[site] = Species::Cr;
+    }
+    occ
 }
 
 /// Vacancies and dumbbells in use, from the counters (`created − recombined − absorbed`).
@@ -125,8 +145,9 @@ fn main() {
     .unwrap_or_else(|e| fail(e));
     let sites = model.lattice().site_count();
     let cr_count = (0.1 * sites as f64).round() as usize;
+    let occ = place_cr(sites, cr_count, &mut placement_rng(a.seed));
     let state = model
-        .random_state(cr_count, a.seed, a.seed)
+        .state_with_defects(occ, &[], a.seed)
         .unwrap_or_else(|e| fail(e));
     let mut sim = IncrementalSimulation::new(model, state, a.seed).unwrap_or_else(|e| fail(e));
     println!(
@@ -139,7 +160,6 @@ fn main() {
     let report = |sim: &IncrementalSimulation<FeCrRis>, vac: &Tally, int: &Tally, label: &str| {
         let (s, t) = (sim.state(), sim.time());
         let (v_now, i_now) = counts(s);
-        let mean = |w: f64| if t > 0.0 { w / t } else { 0.0 };
         let us = clock.elapsed().as_secs_f64() * 1e6 / sim.steps().max(1) as f64;
         println!(
             "{label} steps={} t={:.6e} dose={:.6e} V={} I={} V_peak={} I_peak={} V_mean={:.4} I_mean={:.4} \
@@ -152,8 +172,8 @@ fn main() {
             i_now,
             vac.peak,
             int.peak,
-            mean(vac.weighted),
-            mean(int.weighted),
+            vac.mean(),
+            int.mean(),
             s.created(),
             s.recombined(),
             s.absorbed_v(),
@@ -166,9 +186,9 @@ fn main() {
     };
     while a.k0 * sim.time() < a.dpa_end {
         let (v_before, i_before) = counts(sim.state());
-        let before = sim.time();
-        match sim.step() {
-            Ok(Step::Fired { .. }) => {}
+        let dt = match sim.step() {
+            // The counts before the step held for the sampled waiting time.
+            Ok(Step::Fired { dt, .. }) => dt,
             Ok(Step::Absorbed) => fail("the model has no event left"),
             Err(SimError::Model(FeCrRisError::PoolExhausted { capacity, defects })) => {
                 report(&sim, &vac, &int, "failed");
@@ -178,9 +198,7 @@ fn main() {
                 ))
             }
             Err(e) => fail(e),
-        }
-        // The counts before the step held for the whole waiting time.
-        let dt = sim.time() - before;
+        };
         let (v_after, i_after) = counts(sim.state());
         vac.update(v_before, v_after, dt);
         int.update(i_before, i_after, dt);

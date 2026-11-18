@@ -99,7 +99,9 @@ fn fnv1a(hash: u64, word: u64) -> u64 {
 }
 
 /// Fe-Cr RIS model, 6x6x6 cells with a sink plane at x = 0, T = 773 K, K0 = 1e-3 dpa/s,
-/// 2000 incremental steps. Pins a digest of (event, dt bits) and the final counters.
+/// 2000 incremental steps. Pins two digests, one over the events (kind, record, index) and
+/// one over the bits of every dt, plus the final counters and time bits. Everything but
+/// the dt digest is shared by all targets; see `FECR_RIS_DTS`.
 #[test]
 fn fecr_ris_trajectory() {
     let model = FeCrRis::new(FeCrRisParams {
@@ -113,10 +115,10 @@ fn fecr_ris_trajectory() {
     .unwrap();
     let state = model.random_state(43, SEED, SEED).unwrap();
     let mut sim = IncrementalSimulation::new(model, state, SEED).unwrap();
-    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    let mut events = 0xcbf2_9ce4_8422_2325_u64;
+    let mut dts = 0xcbf2_9ce4_8422_2325_u64;
     for _ in 0..2000 {
-        let before = sim.time();
-        let Step::Fired { event, .. } = sim.step().unwrap() else {
+        let Step::Fired { event, dt } = sim.step().unwrap() else {
             panic!("unexpected absorption");
         };
         let (kind, rec, index) = match event {
@@ -124,26 +126,37 @@ fn fecr_ris_trajectory() {
             FeCrRisEvent::DumbbellJump { rec, jump } => (2, rec, jump),
             FeCrRisEvent::Create => (0, 0, 0),
         };
-        for word in [
-            kind,
-            rec as u64,
-            index as u64,
-            (sim.time() - before).to_bits(),
-        ] {
-            digest = fnv1a(digest, word);
+        for word in [kind, rec as u64, index as u64] {
+            events = fnv1a(events, word);
         }
+        dts = fnv1a(dts, dt.to_bits());
     }
     let s = sim.state();
-    let got = [
-        digest,
-        s.created(),
-        s.recombined(),
-        s.absorbed_v(),
-        s.absorbed_i(),
-        sim.time().to_bits(),
-    ];
-    println!("fecr_ris_trajectory {got:?}");
-    assert_eq!(got.as_slice(), FECR_RIS_TRAJECTORY);
+    let counters = [s.created(), s.recombined(), s.absorbed_v(), s.absorbed_i()];
+    let time_bits = sim.time().to_bits();
+    println!("fecr_ris_trajectory events {events}");
+    println!("fecr_ris_trajectory counters {counters:?}");
+    println!("fecr_ris_trajectory time_bits {time_bits}");
+    println!("fecr_ris_trajectory dts {dts}");
+    assert_eq!(events, FECR_RIS_EVENTS, "event digest differs");
+    assert_eq!(
+        counters.as_slice(),
+        FECR_RIS_COUNTERS,
+        "counters (created, recombined, absorbed_v, absorbed_i) differ"
+    );
+    assert_eq!(time_bits, FECR_RIS_TIME_BITS, "final time bits differ");
+    #[cfg(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
+    assert_eq!(dts, FECR_RIS_DTS, "dt digest differs");
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "macos")
+    )))]
+    println!(
+        "fecr_ris_trajectory: no dt digest pinned for this target (arch + OS); dt check skipped"
+    );
 }
 
 #[test]
@@ -359,4 +372,15 @@ const FECR_ESTIMATORS_REDUCED: &[u64] = &[
     4714297785282910612,
     4698817579328050235,
 ];
-const FECR_RIS_TRAJECTORY: &[u64] = &[377093269483915073, 941, 938, 3, 2, 4656869773506930758];
+const FECR_RIS_EVENTS: u64 = 12945959152933995592;
+const FECR_RIS_COUNTERS: &[u64] = &[333, 313, 19, 19];
+const FECR_RIS_TIME_BITS: u64 = 4649587576939108234;
+// The dt digest is per target (ADR-0006 rule 4, PR #9): the event sequence, counters and
+// final time bits agree on x86_64 Linux and aarch64 macOS, but the last bits of single
+// dt values differ with the platform ln/exp, so the digest over their bits does too.
+// A target is architecture plus OS (the maths library comes with the OS); other targets skip only the dt check.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const FECR_RIS_DTS: u64 = 12745560918834596932;
+// aarch64 value printed by macOS CI (PR #9, run 44330880606); events, counters and time bits match x86_64.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const FECR_RIS_DTS: u64 = 9886202463999487029;
