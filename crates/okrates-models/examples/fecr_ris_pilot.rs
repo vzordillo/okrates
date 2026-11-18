@@ -22,6 +22,10 @@ use okrates_models::fecr_ris::{
     DumbbellParams, FeCrRis, FeCrRisError, FeCrRisParams, FeCrRisState,
 };
 
+#[path = "support/tally.rs"]
+mod tally;
+use tally::Tally;
+
 use rand_chacha::ChaCha12Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 
@@ -120,24 +124,6 @@ pub fn place_cr(sites: usize, cr_count: usize, rng: &mut ChaCha12Rng) -> Vec<Spe
     occ
 }
 
-/// Running peak and time-weighted mean of a count.
-#[derive(Default)]
-struct Tally {
-    peak: u64,
-    weighted: f64,
-    /// The sum of the sampled waiting times seen so far.
-    elapsed: f64,
-}
-
-impl Tally {
-    /// `before` held for `dt`; `after` is the count once the event has been applied.
-    fn update(&mut self, before: u64, after: u64, dt: f64) {
-        self.weighted += before as f64 * dt;
-        self.elapsed += dt;
-        self.peak = self.peak.max(after);
-    }
-}
-
 /// Vacancies and dumbbells in use, from the counters (`created − recombined − absorbed`).
 fn counts(s: &FeCrRisState) -> (u64, u64) {
     (
@@ -174,13 +160,6 @@ fn main() {
     let report = |sim: &IncrementalSimulation<FeCrRis>, vac: &Tally, int: &Tally, label: &str| {
         let (s, t) = (sim.state(), sim.time());
         let (v_now, i_now) = counts(s);
-        let mean = |tally: &Tally| {
-            if tally.elapsed > 0.0 {
-                tally.weighted / tally.elapsed
-            } else {
-                0.0
-            }
-        };
         let us = clock.elapsed().as_secs_f64() * 1e6 / sim.steps().max(1) as f64;
         println!(
             "{label} steps={} t={:.6e} dose={:.6e} V={} I={} V_peak={} I_peak={} V_mean={:.4} I_mean={:.4} \
@@ -193,8 +172,8 @@ fn main() {
             i_now,
             vac.peak,
             int.peak,
-            mean(vac),
-            mean(int),
+            vac.mean(),
+            int.mean(),
             s.created(),
             s.recombined(),
             s.absorbed_v(),
