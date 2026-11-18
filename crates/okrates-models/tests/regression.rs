@@ -380,6 +380,6 @@ const FECR_RIS_TIME_BITS: u64 = 4649587576939108156;
 // dt values differ with the platform ln/exp, so the digest over their bits does too.
 #[cfg(target_arch = "x86_64")]
 const FECR_RIS_DTS: u64 = 12745560918834596932;
-// TODO(PR #9): replace with the aarch64 value from CI
+// aarch64 value printed by macOS CI (PR #9, run 44330880606); events, counters and time bits match x86_64.
 #[cfg(target_arch = "aarch64")]
-const FECR_RIS_DTS: u64 = 12745560918834596932;
+const FECR_RIS_DTS: u64 = 9886202463999487029;
