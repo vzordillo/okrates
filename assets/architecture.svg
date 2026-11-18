@@ -2,80 +2,80 @@
   <title>okrates architecture: Python package, PyO3 bindings, models and schema, core engine</title>
   <defs>
     <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" fill="#8a8f98"/>
+      <path d="M0,0 L10,5 L0,10 z" fill="#787880"/>
     </marker>
   </defs>
 
   <!-- Python package -->
   <rect fill="#2a78d6" fill-opacity="0.10" stroke="#2a78d6" stroke-width="1.5" x="20" y="16" width="760" height="62" rx="8"/>
   <text fill="#2a78d6" font-weight="700" font-size="15" x="36" y="40">Python package okrates</text>
-  <text fill="#8a8f98" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="250" y="40">python/okrates/__init__.py</text>
-  <text fill="#8a8f98" x="36" y="64">frozen configs (LatticeConfig, Martinez2012Config, SamplingConfig), DiffusionResult, RunManifest, numpy out</text>
+  <text fill="#787880" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="250" y="40">python/okrates/__init__.py</text>
+  <text fill="#787880" x="36" y="64">frozen configs (LatticeConfig, Martinez2012Config, SamplingConfig), DiffusionResult, RunManifest, numpy out</text>
 
-  <path stroke="#8a8f98" stroke-width="1.5" fill="none" marker-end="url(#arr)" d="M400,78 L400,100"/>
+  <path stroke="#787880" stroke-width="1.5" fill="none" marker-end="url(#arr)" d="M400,78 L400,100"/>
 
   <!-- PyO3 -->
   <rect fill="#2a78d6" fill-opacity="0.10" stroke="#2a78d6" stroke-width="1.5" x="20" y="102" width="760" height="54" rx="8"/>
   <text fill="#2a78d6" font-weight="700" font-size="15" x="36" y="126">okrates-python</text>
-  <text fill="#8a8f98" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="160" y="126">crates/okrates-python</text>
-  <text fill="#8a8f98" x="36" y="146">PyO3 extension _okrates: jump_rate, vacancy_trajectory, run_fecr_transport, run_kawasaki_anneal, barrier import</text>
+  <text fill="#787880" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="160" y="126">crates/okrates-python</text>
+  <text fill="#787880" x="36" y="146">PyO3 extension _okrates: jump_rate, vacancy_trajectory, run_fecr_transport, run_kawasaki_anneal, barrier import</text>
 
-  <path stroke="#8a8f98" stroke-width="1.5" fill="none" marker-end="url(#arr)" d="M260,156 L260,180"/>
-  <path stroke="#8a8f98" stroke-width="1.5" fill="none" marker-end="url(#arr)" d="M640,156 L640,180"/>
+  <path stroke="#787880" stroke-width="1.5" fill="none" marker-end="url(#arr)" d="M260,156 L260,180"/>
+  <path stroke="#787880" stroke-width="1.5" fill="none" marker-end="url(#arr)" d="M640,156 L640,180"/>
 
   <!-- models -->
   <rect fill="#2a78d6" fill-opacity="0.10" stroke="#2a78d6" stroke-width="1.5" x="20" y="182" width="480" height="104" rx="8"/>
   <text fill="#2a78d6" font-weight="700" font-size="15" x="36" y="206">okrates-models</text>
-  <text fill="#8a8f98" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="160" y="206">crates/okrates-models</text>
-  <text fill="#8a8f98" x="36" y="228">VacancyDiffusion, MultiVacancyDiffusion (BccLattice)</text>
-  <text fill="#8a8f98" x="36" y="248">FeCrModel&lt;E: Energetics&gt;: PairEnergetics, Martinez2012,</text>
-  <text fill="#8a8f98" x="36" y="266">TabulatedEnergetics; Kawasaki anneal; FeCrRis</text>
+  <text fill="#787880" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="160" y="206">crates/okrates-models</text>
+  <text fill="#787880" x="36" y="228">VacancyDiffusion, MultiVacancyDiffusion (BccLattice)</text>
+  <text fill="#787880" x="36" y="248">FeCrModel&lt;E: Energetics&gt;: PairEnergetics, Martinez2012,</text>
+  <text fill="#787880" x="36" y="266">TabulatedEnergetics; Kawasaki anneal; FeCrRis</text>
 
   <!-- schema -->
   <rect fill="#d95926" fill-opacity="0.10" stroke="#d95926" stroke-width="1.5" x="530" y="182" width="250" height="104" rx="8"/>
   <text fill="#d95926" font-weight="700" font-size="15" x="546" y="206">okrates-schema</text>
-  <text fill="#8a8f98" x="546" y="228">RunManifest, BarrierSet</text>
-  <text fill="#8a8f98" x="546" y="248">validation, SHA-256 digests,</text>
-  <text fill="#8a8f98" x="546" y="266">pymatgen / AiiDA adapters</text>
-  <path stroke="#8a8f98" stroke-width="1.5" fill="none" marker-end="url(#arr)" d="M500,234 L528,234"/>
+  <text fill="#787880" x="546" y="228">RunManifest, BarrierSet</text>
+  <text fill="#787880" x="546" y="248">validation, SHA-256 digests,</text>
+  <text fill="#787880" x="546" y="266">pymatgen / AiiDA adapters</text>
+  <path stroke="#787880" stroke-width="1.5" fill="none" marker-end="url(#arr)" d="M500,234 L528,234"/>
 
-  <path stroke="#8a8f98" stroke-width="1.5" fill="none" marker-end="url(#arr)" d="M260,286 L260,310"/>
-  <path stroke="#8a8f98" stroke-width="1.5" fill="none" marker-end="url(#arr)" d="M720,156 L720,170 L790,170 L790,330 L782,330"/>
+  <path stroke="#787880" stroke-width="1.5" fill="none" marker-end="url(#arr)" d="M260,286 L260,310"/>
+  <path stroke="#787880" stroke-width="1.5" fill="none" marker-end="url(#arr)" d="M720,156 L720,170 L790,170 L790,330 L782,330"/>
 
   <!-- core -->
   <rect fill="#2a78d6" fill-opacity="0.10" stroke="#2a78d6" stroke-width="1.5" x="20" y="312" width="760" height="232" rx="8"/>
   <text fill="#2a78d6" font-weight="700" font-size="15" x="36" y="336">okrates-core</text>
-  <text fill="#8a8f98" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="146" y="336">crates/okrates-core</text>
+  <text fill="#787880" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="146" y="336">crates/okrates-core</text>
 
-  <rect fill="#8a8f98" fill-opacity="0.12" stroke="#8a8f98" stroke-width="1" x="36" y="350" width="356" height="84" rx="6"/>
-  <text fill="#8a8f98" x="48" y="370" font-weight="700">model contract</text>
-  <text fill="#8a8f98" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="48" y="390">Model → ReversibleModel → IncrementalModel</text>
-  <text fill="#8a8f98" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="48" y="408">or TransitionTopology + RateModel</text>
-  <text fill="#8a8f98" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="48" y="425">  → CoupledModel</text>
+  <rect fill="#787880" fill-opacity="0.12" stroke="#787880" stroke-width="1" x="36" y="350" width="356" height="84" rx="6"/>
+  <text fill="#787880" x="48" y="370" font-weight="700">model contract</text>
+  <text fill="#787880" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="48" y="390">Model → ReversibleModel → IncrementalModel</text>
+  <text fill="#787880" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="48" y="408">or TransitionTopology + RateModel</text>
+  <text fill="#787880" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="48" y="425">  → CoupledModel</text>
 
-  <rect fill="#8a8f98" fill-opacity="0.12" stroke="#8a8f98" stroke-width="1" x="408" y="350" width="356" height="84" rx="6"/>
-  <text fill="#8a8f98" x="420" y="370" font-weight="700">CatalogBackend</text>
-  <text fill="#8a8f98" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="420" y="390">DirectCatalog: linear scan, O(M)</text>
-  <text fill="#8a8f98" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="420" y="408">SumTreeCatalog: SumTree, O(k log M)</text>
-  <text fill="#8a8f98" x="420" y="425">Engine&lt;M, C&gt;: step, time, rollback</text>
+  <rect fill="#787880" fill-opacity="0.12" stroke="#787880" stroke-width="1" x="408" y="350" width="356" height="84" rx="6"/>
+  <text fill="#787880" x="420" y="370" font-weight="700">CatalogBackend</text>
+  <text fill="#787880" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="420" y="390">DirectCatalog: linear scan, O(M)</text>
+  <text fill="#787880" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" x="420" y="408">SumTreeCatalog: SumTree, O(k log M)</text>
+  <text fill="#787880" x="420" y="425">Engine&lt;M, C&gt;: step, time, rollback</text>
 
-  <rect fill="#8a8f98" fill-opacity="0.12" stroke="#8a8f98" stroke-width="1" x="36" y="446" width="172" height="84" rx="6"/>
-  <text fill="#8a8f98" x="48" y="466" font-weight="700">Clock</text>
-  <text fill="#8a8f98" x="48" y="486">TwoSum compensated</text>
-  <text fill="#8a8f98" x="48" y="504">time</text>
+  <rect fill="#787880" fill-opacity="0.12" stroke="#787880" stroke-width="1" x="36" y="446" width="172" height="84" rx="6"/>
+  <text fill="#787880" x="48" y="466" font-weight="700">Clock</text>
+  <text fill="#787880" x="48" y="486">TwoSum compensated</text>
+  <text fill="#787880" x="48" y="504">time</text>
 
-  <rect fill="#8a8f98" fill-opacity="0.12" stroke="#8a8f98" stroke-width="1" x="220" y="446" width="172" height="84" rx="6"/>
-  <text fill="#8a8f98" x="232" y="466" font-weight="700">KmcRng</text>
-  <text fill="#8a8f98" x="232" y="486">ChaCha12, StreamRole</text>
-  <text fill="#8a8f98" x="232" y="504">run_ensemble</text>
+  <rect fill="#787880" fill-opacity="0.12" stroke="#787880" stroke-width="1" x="220" y="446" width="172" height="84" rx="6"/>
+  <text fill="#787880" x="232" y="466" font-weight="700">KmcRng</text>
+  <text fill="#787880" x="232" y="486">ChaCha12, StreamRole</text>
+  <text fill="#787880" x="232" y="504">run_ensemble</text>
 
-  <rect fill="#8a8f98" fill-opacity="0.12" stroke="#8a8f98" stroke-width="1" x="408" y="446" width="172" height="84" rx="6"/>
-  <text fill="#8a8f98" x="420" y="466" font-weight="700">Checkpointable</text>
-  <text fill="#8a8f98" x="420" y="486">binary schema v2,</text>
-  <text fill="#8a8f98" x="420" y="504">bitwise resume</text>
+  <rect fill="#787880" fill-opacity="0.12" stroke="#787880" stroke-width="1" x="408" y="446" width="172" height="84" rx="6"/>
+  <text fill="#787880" x="420" y="466" font-weight="700">Checkpointable</text>
+  <text fill="#787880" x="420" y="486">binary schema v2,</text>
+  <text fill="#787880" x="420" y="504">bitwise resume</text>
 
-  <rect fill="#8a8f98" fill-opacity="0.12" stroke="#8a8f98" stroke-width="1" x="592" y="446" width="172" height="84" rx="6"/>
-  <text fill="#8a8f98" x="604" y="466" font-weight="700">sample_trajectory</text>
-  <text fill="#8a8f98" x="604" y="486">SampleGrid, right-</text>
-  <text fill="#8a8f98" x="604" y="504">continuous sampling</text>
+  <rect fill="#787880" fill-opacity="0.12" stroke="#787880" stroke-width="1" x="592" y="446" width="172" height="84" rx="6"/>
+  <text fill="#787880" x="604" y="466" font-weight="700">sample_trajectory</text>
+  <text fill="#787880" x="604" y="486">SampleGrid, right-</text>
+  <text fill="#787880" x="604" y="504">continuous sampling</text>
 </svg>

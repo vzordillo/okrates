@@ -162,7 +162,7 @@ params_sha256 = c3210d970d59ac86b574d3eb4d83dde9021ab55d1b9c0b401f815a9c9d7c9264
 
 This is a 128-site box with 25 Cr atoms (about 20 % Cr) and one vacancy, annealed for 50 sweeps and then followed for 5×10⁻⁸ s in 16 runs. The result also carries the vacancy diffusivity, the correlation factor `f` and a `RunManifest` whose SHA-256 hash identifies the parameters.
 
-**What it shows:** Cr diffuses faster than Fe in this model. The figure repeats the calculation in a dilute alloy (6×6×6 cells, 432 sites, 4 Cr atoms, one vacancy, no anneal, 128 runs, seed 2026) at 700–1100 K, with `t_end` scaled with temperature so that each run makes about 14,000–18,000 jumps. Error bars are ±2 standard errors. D*_Cr / D*_Fe falls from 2.33 at 700 K to 1.97 at 1100 K. Both diffusivities are for one vacancy in 432 sites, so their absolute values scale with that vacancy concentration.
+**What it shows:** Cr diffuses faster than Fe in this model. The figure repeats the calculation in a dilute alloy (6×6×6 cells, 432 sites, 4 Cr atoms, one vacancy, no anneal, 128 runs, seed 2026) at 700–1100 K, with `t_end` scaled with temperature so that each run makes about 14,000–18,000 jumps. Error bars are ±2 standard errors. D*_Cr / D*_Fe lies between 1.84 and 2.33 over this range (2.33, 2.32, 1.97, 1.84 and 1.97 at 700, 800, 900, 1000 and 1100 K). Both diffusivities are for one vacancy in 432 sites, so their absolute values scale with that vacancy concentration.
 
 <p align="center"><img src="assets/fecr-arrhenius.svg" width="640" alt="Tracer diffusivities of Cr and Fe against 1000/T on a log axis; Cr is about twice Fe at every temperature"></p>
 
@@ -194,6 +194,7 @@ sum_tree,131072,0.000061,7.0,16.00,1000,5,416.71,413.80,434.31
 **What it shows:** the direct cost grows in proportion to M; the sum-tree cost stays between about 200 and 450 ns. The direct catalog is faster only for the smallest catalog (M = 8); from M = 32 on the sum tree wins, by 620× at M = 32,768. Single-threaded run on a Linux x86_64 workstation.
 
 <p align="center"><img src="assets/catalog-scaling.svg" width="640" alt="Median time per step against catalog size on log axes: the direct catalog grows linearly, the sum tree stays nearly flat"></p>
+<p align="center"><em>Median time per step of the catalog_scaling example, single-threaded, Linux x86_64 workstation.</em></p>
 
 ### 4. Where the RIS model fits
 
@@ -213,7 +214,7 @@ progress steps=100000 t=7.042351e0 dose=7.042351e-3 V=1 I=0 V_peak=1 I_peak=1 V_
 final steps=122893 t=1.020147e1 dose=1.020147e-2 V=1 I=1 V_peak=1 I_peak=1 V_mean=0.0000 I_mean=0.0000 created=38 recombined=21 absorbed_V=16 absorbed_I=16 borrowed_fe=0 creation_attempts=43 floored_dumbbell=6631 floored_vacancy=0 us_per_step=66.51
 ```
 
-**What it shows:** the defect bookkeeping balances. Of 38 Frenkel pairs created, 21 recombined and 16 vacancies and 16 interstitials were absorbed at the sink, leaving 38 − 21 − 16 = 1 vacancy and 1 interstitial (`V=1 I=1`). In a box this small at this damage rate, defects are absorbed or recombine long before the next pair is created, so at most one of each exists at a time. Measuring Cr enrichment or depletion at the sink needs larger boxes and doses; this run checks only that the model and its event accounting work.
+**What it shows:** the defect bookkeeping balances. Of 38 Frenkel pairs created, 21 recombined and 16 vacancies and 16 interstitials were absorbed at the sink, leaving 38 − 21 − 16 = 1 vacancy and 1 interstitial (`V=1 I=1`). In a box this small at this damage rate, defects are absorbed or recombine before the next pair is created, so at most one of each exists at a time. Measuring Cr enrichment or depletion at the sink needs larger boxes and doses; this run checks only that the model and its event accounting work.
 
 ## Testing
 
