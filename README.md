@@ -157,11 +157,19 @@ runs = 2000
 3. We added one rule the paper does not state. In annealed alloys at high Cr content a few configurations give a slightly negative barrier. We floor the saddle energy at the higher of the initial and final energies, which keeps detailed balance exact, and we count every activation. It never triggers in the dilute runs below.
 4. The diffusion runs use a box of 432 sites with one vacancy, a Kawasaki (Fe↔Cr swap) anneal of the Cr arrangement before the dynamics, 64 replicas of about 10⁶ jumps each, and tracer diffusivities from the slope of the mean squared displacement.
 
-**How to run it.** The barrier comparison is a test, and the diffusion calculation runs from Python after `maturin develop --release`:
+**How to run it.** The barrier comparison is a test, and the diffusion calculations run from Python after `maturin develop --release`:
 
 ```text
 cargo test --locked -p okrates-models --test fecr_martinez
 ```
+
+The comparison with the paper's Fig. 4 is a script. It takes about 6 minutes for the four dilute points on our 18-core Linux x86_64 workstation (measured), and it prints one row per point with the diffusivities, their ratio, the correlation factor and their standard errors. These rows are the numbers in the result below:
+
+```text
+python examples/python/fecr_martinez_comparison.py 1e6 64 4
+```
+
+The short example below is a quick, smaller calculation. It illustrates the interface and is not the run behind those numbers:
 
 ```python
 import okrates
@@ -234,6 +242,7 @@ The fast tier runs in a few seconds; the full tier adds statistical, equivalence
 ```text
 cargo test --locked                          # fast tier
 cargo test --locked -- --include-ignored     # full tier
+pip install pytest==9.2.0
 pytest -q python/tests                       # Python, after maturin develop
 ```
 
