@@ -5,8 +5,7 @@ use okrates_core::{SampleGrid, Simulation, StreamRole};
 use okrates_models::bcc::BccLattice;
 use okrates_models::fecr::{FeCrModel, PairEnergetics};
 use okrates_models::fecr_diffusion::{
-    ReplicaEstimate, estimate, jackknife_ratio_mean_se, mean_se, ols_slope, origin_slope,
-    run_composition, sample_fecr_run,
+    ReplicaEstimate, estimate, mean_se, ols_slope, origin_slope, run_composition, sample_fecr_run,
 };
 use okrates_models::vacancy::BOLTZMANN_EV_PER_K;
 
@@ -68,20 +67,24 @@ fn correlation_factor() {
     });
     let mut d_v = Vec::with_capacity(runs);
     let mut d_all = Vec::with_capacity(runs);
+    let mut f_n = Vec::with_capacity(runs);
     let mut total_fired = 0_u64;
     for (v, t, fired) in replicas {
         d_v.push(v);
         d_all.push(t);
+        f_n.push(n_atoms * t);
         total_fired += fired;
     }
-    let (f_mean, f_se) = jackknife_ratio_mean_se(&d_all, &d_v, n_atoms);
     println!(
         "# correlation factor, equal-energy limit (all rates 1), N = {n_sites}, N_Cr = {n_cr}"
     );
     report("D_v", &d_v);
     report("D_tracer_all", &d_all);
-    println!("f_N = {f_mean:.12e}");
-    println!("f_N_se = {f_se:.12e}");
+    // In this equal-energy limit the single-vacancy D_v is exactly 1 (all rates 1, unit lattice
+    // parameter), so f_N = N * D*_all / D_v_exact is a per-replica mean with a plain SE. The
+    // sampled D_v above is a diagnostic only: dividing by it (ratio of means,
+    // `jackknife_ratio_mean_se`) would add its ~3 % sampling noise and inflate the SE about tenfold.
+    report("f_N", &f_n);
     println!("runs = {runs}");
     println!("seed_base = {seed_base}");
     println!("total_fired_steps = {total_fired}");
