@@ -7,6 +7,14 @@
 
 `okrates` is a modular residence-time kinetic Monte Carlo (kMC) framework in Rust with typed Python bindings (`abi3-py310`). It separates discrete state topology, rate/barrier models, and catalog backends from statistical trajectory estimators and provenance manifests.
 
+## About this repository
+
+`okrates` is an experiment in fully agentic scientific software development. The code, tests and reviews are produced by AI coding agents working under the maintainer's direction:
+- [Google Antigravity](https://antigravity.google/use-cases/science/) with Google's frontier Gemini models, through Google's free access offer for scientists;
+- Anthropic Claude models through [Claude Code](https://claude.com/claude-code).
+
+Treat the code as experimental: results are research-grade and not qualified for nuclear safety or licensing use.
+
 <p align="center"><img src="assets/fecr-snapshot.gif" width="560" alt="Fe-20%Cr box: Cr atoms cluster during a Monte Carlo anneal, then a vacancy diffuses through the alloy"></p>
 
 ## Workspace Crates
