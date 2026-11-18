@@ -16,11 +16,11 @@
 <table>
   <tr>
     <td width="50%"><img src="assets/fecr-snapshot.gif" width="100%" alt="Fe-20% Cr box: Cr atoms (orange) cluster during a Monte Carlo anneal, then a single vacancy (red ring) diffuses through the alloy"></td>
-    <td width="50%"><img src="assets/fecr-ris.gif" width="100%" alt="Fe-10% Cr box under irradiation: vacancies (red rings) and self-interstitial dumbbells (green) appear in pairs, migrate, recombine or are absorbed at a sink plane (violet)"></td>
+    <td width="50%"><img src="assets/fecr-ris.gif" width="100%" alt="Fe-10% Cr box under irradiation: vacancies (red rings) and self-interstitial dumbbells (green) appear in pairs, migrate, recombine or are absorbed at a sink plane (pink)"></td>
   </tr>
   <tr>
     <td>Thermal ageing of Fe–20 % Cr (Martínez 2012 energetics, 432 BCC sites, 769 K): Cr atoms cluster during 400 Kawasaki Monte Carlo sweeps, then a single vacancy makes 4,000 kinetic Monte Carlo jumps through the alloy.</td>
-    <td>Irradiation of Fe–10 % Cr (864 BCC sites, 573 K, accelerated rate of 3×10⁵ dpa/s): Frenkel pairs of vacancies and self-interstitial dumbbells are created, the dumbbells migrate quickly, and the defects recombine or are absorbed at the sink plane (6,000 events, 0.03 dpa).</td>
+    <td>Irradiation of Fe–10 % Cr (432 BCC sites, 573 K, accelerated damage rate of 3×10⁴ dpa/s): Frenkel pairs of vacancies and self-interstitial dumbbells are created, the dumbbells migrate quickly, and the defects recombine or are absorbed at the sink plane (pink). Over 6,000 events (1.5 dpa), 560 of 588 pairs recombine and the rest reach the sink.</td>
   </tr>
 </table>
 
