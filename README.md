@@ -193,7 +193,7 @@ D*_Cr = 1.118e-11 +/- 6.0e-13 m^2/s
 D*_Fe = 2.364e-12 +/- 7.6e-14 m^2/s
 ```
 
-**Result.** Nineteen of the twenty Table II barriers agree within half the last printed digit (0.005 eV); the twentieth, H5 in Cr, is off by 0.0052 eV. In dilute alloys (2 Cr in 431 atoms, 769–1000 K) the ratio D*_Cr/D*_Fe is 1.86–2.39, against 2.03–2.31 from the paper's figure, with every point within 2.1 standard errors. The self-diffusion correlation factor in Fe comes out at 0.729–0.738, consistent with the value 0.7314 ± 0.0025 that okrates gives for the same 432-site box. The figure repeats the calculation in a smaller dilute run (4 Cr in 432 sites, 128 runs) from 700 to 1100 K and shows Cr diffusing about twice as fast as Fe throughout.
+**Result.** Nineteen of the twenty Table II barriers agree within half the last printed digit (0.005 eV); the twentieth, H5 in Cr, is off by 0.0052 eV. In dilute alloys (2 Cr in 431 atoms, 769–1000 K) the ratio D*_Cr/D*_Fe is 1.97, 2.08, 2.08 and 2.35 (standard errors 0.11–0.15) at 1000/T = 1.0, 1.1, 1.2 and 1.3, against 2.03, 2.12, 2.21 and 2.31 from the paper's figure; every point lies within 1.2 standard errors. The self-diffusion correlation factor in Fe comes out at 0.728–0.736, consistent with the value 0.7286 ± 0.0026 that okrates gives for the same 432-site box. The figure repeats the calculation in a smaller dilute run (4 Cr in 432 sites, 128 runs) from 700 to 1100 K and shows Cr diffusing about twice as fast as Fe throughout.
 
 <p align="center"><img src="assets/fecr-arrhenius.svg" width="640" alt="Tracer diffusivities of Cr and Fe against 1000/T on a log axis; Cr is about twice Fe at every temperature"></p>
 
