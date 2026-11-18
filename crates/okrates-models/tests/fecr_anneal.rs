@@ -203,6 +203,30 @@ fn tabulated_energetics_rejects_annealing_malformed_keys_and_inconsistent_prefac
         TabulatedEnergetics::new(sym_bar_set),
         Err(FeCrError::BarrierTable(msg)) if msg.contains("symmetric environment key")
     ));
+
+    // Complementary records that each match the other's reverse barrier but whose forward barriers
+    // contradict their delta energies (resolve uses forward barriers) are rejected.
+    let tol = 0.0078125;
+    let comp_set = BarrierSet::new(
+        "comp",
+        tol,
+        vec![
+            rec("a", "Fe", "cr_atom=1,cr_vac=0", 0.5, 0.5, -0.0078125),
+            rec(
+                "b",
+                "Fe",
+                "cr_atom=0,cr_vac=1",
+                0.4921875,
+                0.4921875,
+                0.0078125,
+            ),
+        ],
+    )
+    .unwrap();
+    assert!(matches!(
+        TabulatedEnergetics::new(comp_set),
+        Err(FeCrError::BarrierTable(msg)) if msg.contains("complementary records")
+    ));
 }
 
 #[test]

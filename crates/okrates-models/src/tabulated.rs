@@ -193,6 +193,12 @@ impl TabulatedEnergetics {
                 if (rec.forward_barrier_ev - other.reverse_barrier_ev).abs() > tol
                     || (rec.reverse_barrier_ev - other.forward_barrier_ev).abs() > tol
                     || (rec.delta_energy_ev + other.delta_energy_ev).abs() > tol
+                    || ((rec.forward_barrier_ev - other.forward_barrier_ev) - rec.delta_energy_ev)
+                        .abs()
+                        > tol
+                    || ((other.forward_barrier_ev - rec.forward_barrier_ev) - other.delta_energy_ev)
+                        .abs()
+                        > tol
                 {
                     return Err(FeCrError::BarrierTable(format!(
                         "complementary records {:?} and {:?} disagree beyond tolerance {tol} eV",
