@@ -9,3 +9,4 @@ license.workspace = true
 [dependencies]
 okrates-core = { path = "../okrates-core" }
 okrates-schema = { path = "../okrates-schema" }
+rand_chacha.workspace = true

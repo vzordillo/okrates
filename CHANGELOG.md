@@ -12,7 +12,7 @@ All notable changes to `okrates` are documented in this file.
 - **`okrates-schema` crate**: `RunManifest` v1 (SHA-256 parameter, barrier-table, and checkpoint lineage + build-time git SHA), `BarrierRecord` / `BarrierSet` forward-reverse detailed-balance validator, and JSON adapters for `pymatgen`/`atomate2` (VASP NEB) and `AiiDA-QuantumESPRESSO`.
 - **`okrates-models` physics & estimators**:
   - `TabulatedEnergetics` for DFT/NEB Fe–Cr barrier sets with automatic reverse-environment detailed balance.
-  - `Checkpointable` and `ReversibleModel` across single-vacancy, multi-vacancy, and all three `FeCrModel<E>` energetics (`PairEnergetics`, `Martinez2012`, `TabulatedEnergetics`), plus `IncrementalModel` (`SumTreeCatalog`) for `FeCrModel<PairEnergetics>`.
+  - `Checkpointable` and `ReversibleModel` across single-vacancy, multi-vacancy, `FeCrRis`, and all three `FeCrModel<E>` energetics (`PairEnergetics`, `Martinez2012`, `TabulatedEnergetics`), plus `IncrementalModel` (`SumTreeCatalog`) for `FeCrModel<PairEnergetics>`.
   - `BarrierFloorPolicy` (`SymmetricFloor`, `Unfloored`, `Strict`) on `Martinez2012`.
   - Stateful `KawasakiAnnealer`, Warren–Cowley 1NN short-range order `warren_cowley_alpha1`, and tail energy-drift diagnostics.
   - `TransportConfig` (`WindowedOls` burn-in window `[t_equil, t_end]` and `OriginSlope`), split-window drift diagnostic `window_drift_ratio`, and unbiased ratio-of-means + delete-1 jackknife standard error (`jackknife_ratio_mean_se`) for the correlation factor $f$.

@@ -125,6 +125,7 @@ version = "0.1.0"
 dependencies = [
  "okrates-core",
  "okrates-schema",
+ "rand_chacha",
 ]
 
 [[package]]

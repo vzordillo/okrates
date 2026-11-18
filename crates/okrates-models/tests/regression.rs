@@ -6,6 +6,7 @@ use okrates_core::{IncrementalSimulation, Simulation, Step};
 use okrates_models::bcc::BccLattice;
 use okrates_models::fecr::{FeCrModel, PairEnergetics};
 use okrates_models::fecr_diffusion::{estimate, mean_se, ols_slope, origin_slope, sample_run};
+use okrates_models::fecr_ris::{DumbbellParams, FeCrRis, FeCrRisEvent, FeCrRisParams};
 use okrates_models::multi_vacancy::MultiVacancyDiffusion;
 use okrates_models::vacancy::{VacancyDiffusion, jump_rate};
 
@@ -91,6 +92,58 @@ fn fecr_trajectory() {
     let got = record(|| (sim.step().unwrap(), sim.time()), |e| e.direction);
     println!("fecr_trajectory {got:?}");
     assert_eq!(got, FECR_TRAJECTORY);
+}
+
+fn fnv1a(hash: u64, word: u64) -> u64 {
+    (hash ^ word).wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+/// Fe-Cr RIS model, 6x6x6 cells with a sink plane at x = 0, T = 773 K, K0 = 1e-3 dpa/s,
+/// 2000 incremental steps. Pins a digest of (event, dt bits) and the final counters.
+#[test]
+fn fecr_ris_trajectory() {
+    let model = FeCrRis::new(FeCrRisParams {
+        cells: [6, 6, 6],
+        sink_planes: vec![0],
+        temperature_k: 773.0,
+        k0_dpa_per_s: 1e-3,
+        capacity: 64,
+        dumbbell: DumbbellParams::senninger2016_r1(),
+    })
+    .unwrap();
+    let state = model.random_state(43, SEED, SEED).unwrap();
+    let mut sim = IncrementalSimulation::new(model, state, SEED).unwrap();
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    for _ in 0..2000 {
+        let before = sim.time();
+        let Step::Fired { event, .. } = sim.step().unwrap() else {
+            panic!("unexpected absorption");
+        };
+        let (kind, rec, index) = match event {
+            FeCrRisEvent::VacancyJump { rec, dir } => (1, rec, dir),
+            FeCrRisEvent::DumbbellJump { rec, jump } => (2, rec, jump),
+            FeCrRisEvent::Create => (0, 0, 0),
+        };
+        for word in [
+            kind,
+            rec as u64,
+            index as u64,
+            (sim.time() - before).to_bits(),
+        ] {
+            digest = fnv1a(digest, word);
+        }
+    }
+    let s = sim.state();
+    let got = [
+        digest,
+        s.created(),
+        s.recombined(),
+        s.absorbed_v(),
+        s.absorbed_i(),
+        sim.time().to_bits(),
+    ];
+    println!("fecr_ris_trajectory {got:?}");
+    assert_eq!(got.as_slice(), FECR_RIS_TRAJECTORY);
 }
 
 #[test]
@@ -306,3 +359,4 @@ const FECR_ESTIMATORS_REDUCED: &[u64] = &[
     4714297785282910612,
     4698817579328050235,
 ];
+const FECR_RIS_TRAJECTORY: &[u64] = &[377093269483915073, 941, 938, 3, 2, 4656869773506930758];

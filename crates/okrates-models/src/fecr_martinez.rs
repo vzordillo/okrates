@@ -460,6 +460,16 @@ impl Martinez2012 {
         self.region_difference(lattice, &before, &after, &region, sites)
     }
 
+    /// Bond free energy between two site contents; `None` is an empty site (no bonds).
+    pub(crate) fn bond_energy(&self, a: Option<Species>, b: Option<Species>, n_sum: u32) -> f64 {
+        self.bond(
+            a.map_or(Cell::Empty, Cell::from),
+            b.map_or(Cell::Empty, Cell::from),
+            n_sum,
+        )
+    }
+
+    /// Barrier without the sign check; `atom_site` jumps into the vacancy at `vacancy_site`.
     fn barrier_raw(
         &self,
         lattice: &BccLattice,
