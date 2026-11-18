@@ -26,48 +26,41 @@
 
 ## What it does
 
-okrates runs continuous-time Markov chains in the residence-time (BKL) form. A model says which events can happen from a state and how fast; the engine picks one in proportion to its rate, advances the clock and applies it. Two event catalogs give identical physics at different cost. The direct catalog re-enumerates all M events every step, and the sum-tree catalog updates only the k rates an event changes, at O(k log M) per step. At 32,768 events the sum tree is about 620 times faster on our Linux x86_64 workstation.
+okrates simulates continuous-time Markov chains in the residence-time form of Bortz, Kalos and Lebowitz. You describe a system by its states, the transitions that can leave each state, and their rates. The engine draws each event with probability proportional to its rate, advances a continuous clock by an exponentially distributed waiting time, and applies the event. Nothing in the engine assumes a lattice, a material or a particular kind of event.
 
-Random numbers come from seeded ChaCha12 streams, one per replica and purpose, and time is accumulated with a compensated (TwoSum) sum. A checkpoint stores the full generator and clock state, so a resumed run continues bit for bit on the same platform.
+Two event catalogs give identical statistics at different cost. The direct catalog recomputes every rate each step. The sum-tree catalog updates only the rates an event actually changes, which keeps a step cheap even when millions of events are possible.
 
-The models so far are vacancy diffusion in BCC lattices, Fe–Cr transport with the Martínez et al. (2012) energetics or with tabulated DFT barriers, and an Fe–Cr radiation-induced segregation (RIS) model with ⟨110⟩ self-interstitial dumbbells, Frenkel-pair creation, recombination and a planar sink. On top of these we compute tracer diffusivities and correlation factors with jackknife errors, anneal alloys with Kawasaki swaps, measure Warren–Cowley short-range order, and write extended-XYZ frames that OVITO can read. Run manifests record SHA-256 hashes of parameters, barrier tables and checkpoints, and DFT barrier sets are checked for detailed balance before use. The Python package returns numpy arrays and raises Python exceptions instead of crashing.
+Runs are reproducible in a strict sense. Every replica and every purpose (dynamics, initial state, defect creation) draws from its own seeded random stream, so an ensemble gives the same numbers on any number of threads. A checkpoint stores the full generator and clock state, and a resumed run continues bit for bit. Run manifests record hashes of the parameters, barrier tables and checkpoints behind each result.
 
 ## Design
 
-A kMC code has two parts that change for different reasons. The physics (which states exist, which transitions leave a state, and at what rate) changes with every material and mechanism. The algorithm (pick an event in proportion to its rate, advance time, keep the event list current, and do it reproducibly) is the same for all of them. okrates keeps the two apart.
-
-A model describes physics only. It implements the `Model` trait in `crates/okrates-core/src/model.rs`: `enumerate_events` emits `(event, rate)` pairs for a state, and `apply` performs one event. `ReversibleModel` adds `apply_reversible` and `undo`, so a failed step can restore the state. `IncrementalModel` (`crates/okrates-core/src/incremental.rs`) gives every possible event a fixed integer slot and reports, through `affected_slots`, which slots an event changes. A model can also be split into a `TransitionTopology` (what can happen) and a `RateModel` (how fast), joined by `CoupledModel` in `topology.rs`; the `catalog_scaling` example is built that way.
-
-The engine owns everything else. `Engine<M, C>` in `crates/okrates-core/src/catalog.rs` holds the model, the state, a `Clock`, a `KmcRng` and a step counter, and is generic over a `CatalogBackend` `C`. `DirectCatalog` re-enumerates all events every step; `SumTreeCatalog` keeps rates in a binary `SumTree` and updates only the affected slots. `Simulation` is `Engine<M, DirectCatalog>` and `IncrementalSimulation` is `Engine<M, SumTreeCatalog>`.
-
-Reproducibility is handled in the engine as well. `KmcRng` (`rng.rs`) wraps ChaCha12, and `KmcRng::for_replica` and `run_ensemble` (`ensemble.rs`) derive separate streams per replica and per purpose (`StreamRole::Dynamics`, `InitialState`, `Equilibration`), so a parallel ensemble gives the same numbers on any thread count. `Clock` (`clock.rs`) accumulates time with TwoSum compensation. `Checkpointable` (`checkpoint.rs`) serialises steps, clock, RNG and state, and `Engine::resume` rebuilds the catalog from them. `sample_trajectory` (`sampler.rs`) records observables on a fixed time grid (`SampleGrid`).
-
-`okrates-models` turns trajectories into diffusivities and correlation factors, `okrates-schema` writes `RunManifest` records and validates `BarrierSet` data, and the Python package wraps both. `okrates-schema` does not depend on `okrates-core`; `okrates-models` uses both, and `okrates-python` uses all three.
+A kinetic Monte Carlo code has two parts that change for different reasons. The physics, meaning which states exist, which transitions are possible and how fast they happen, changes with every material and mechanism. The algorithm, meaning how an event is chosen, how time advances and how the event list stays current, is the same for all of them. okrates keeps the two apart: a model describes physics only, and the engine owns selection, time, randomness and checkpoints. A new mechanism means writing a new model, and the engine's guarantees come with it.
 
 ```mermaid
-flowchart LR
+%%{init: {"flowchart": {"nodeSpacing": 60, "rankSpacing": 70, "padding": 20}}}%%
+flowchart TB
     subgraph you["🧪 Your model"]
-        direction TB
-        states(["States<br>atoms, defects, species"])
-        moves(["Transitions<br>what can happen next"])
-        rates(["Rates<br>how fast it happens"])
+        direction LR
+        states(["States"])
+        moves(["Transitions"])
+        rates(["Rates"])
     end
     subgraph core["⚙️ okrates engine"]
-        direction TB
+        direction LR
         pick{{"Event selection"}}
-        clock{{"Continuous-time clock"}}
-        rng{{"Independent random streams"}}
+        clock{{"Continuous clock"}}
+        rng{{"Random streams"}}
         ckpt{{"Exact checkpoints"}}
     end
     subgraph out["📈 Results"]
-        direction TB
+        direction LR
         traj[/"Trajectories"/]
-        transport[/"Diffusivities and<br>correlation factors"/]
+        transport[/"Transport coefficients"/]
         prov[/"Provenance records"/]
     end
-    you ==> core ==> out
     py["🐍 Python"] -.-> you
     rs["🦀 Rust"] -.-> you
+    you ==> core ==> out
     classDef model fill:#2a78d6,stroke:#1b4f8f,color:#ffffff
     classDef engine fill:#7a52c7,stroke:#4d3285,color:#ffffff
     classDef result fill:#1f9e78,stroke:#13664d,color:#ffffff
@@ -78,23 +71,20 @@ flowchart LR
     class py,rs lang
 ```
 
-Because of this split, the single-vacancy, multi-vacancy, Fe–Cr and RIS models all run on the same `Engine`. Within Fe–Cr the energy model is a further seam: `FeCrModel<E: Energetics>` accepts `PairEnergetics`, `Martinez2012` or `TabulatedEnergetics`. Any `IncrementalModel` runs on both `Simulation` and `IncrementalSimulation`, and the tests compare the two backends on the same model. Seeding, time accumulation, atomic steps and checkpoints are written once in `okrates-core`, and every model inherits them.
-
 ## How a step works
 
-Every step is `Engine::step_observing` in `crates/okrates-core/src/catalog.rs`. With event rates r₁ … r_M, the catalog first returns the total rate R = Σ rᵢ. If R = 0 the state is absorbing, and the step returns `Step::Absorbed` without drawing random numbers. Otherwise the engine draws u₁ in (0, 1) on a copy of the generator and selects the smallest i with u₁·R < r₁ + … + rᵢ; `DirectCatalog` scans the rate list and `SumTreeCatalog` descends its tree from the root. It then draws u₂ and sets the waiting time Δt = −ln(u₂)/R. `KmcRng::open01` never returns 0 or 1, so Δt is finite and positive.
-
-The catalog then applies the event and updates itself; `SumTreeCatalog` recomputes only the slots in `affected_slots` and checks that the slot count has not changed. The generator, clock and step counter are replaced by their advanced copies only if all of this succeeds. On any error the state is undone and the engine is exactly as it was before the call.
+With rates r₁ … r_M of the possible events and total rate R = Σ rᵢ, one step draws two uniform random numbers u₁ and u₂ in (0, 1). The first selects event i as the smallest index with u₁·R < r₁ + … + rᵢ. The second gives the waiting time Δt = −ln(u₂)/R. The event is applied and only the rates it changed are updated. If R = 0, nothing can happen and the run stops without drawing. A step either completes fully or leaves the simulation exactly as it was.
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 60, "rankSpacing": 70, "padding": 20}}}%%
 flowchart LR
-    total(["Add up the rates<br>of every possible event"])
-    choose{{"Choose one event<br>in proportion to its rate"}}
-    time(["Advance the clock<br>by a random waiting time"])
+    total(["Sum the rates"])
+    choose{{"Choose an event<br>by its rate"}}
+    time(["Advance the clock"])
     apply(["Apply the event"])
-    refresh(["Update only the rates<br>that changed"])
-    stop[["Nothing can happen:<br>the system is at rest"]]
-    total -->|"events available"| choose --> time --> apply --> refresh
+    refresh(["Update changed rates"])
+    stop[["System at rest"]]
+    total -->|"events possible"| choose --> time --> apply --> refresh
     refresh -->|"next step"| total
     total -.->|"total rate is zero"| stop
     classDef step fill:#2a78d6,stroke:#1b4f8f,color:#ffffff
@@ -122,62 +112,58 @@ maturin develop
 python examples/python/vacancy_diffusivity.py
 ```
 
-The walkthrough below uses release builds (`cargo run --release`, `maturin develop --release`) because the runs are longer. The outputs shown were produced on a Linux x86_64 workstation. Random numbers are reproducible, but timings and the last digits of some floating-point results can differ on other platforms.
+The test cases below use release builds (`cargo run --release`, `maturin develop --release`) because the runs are longer. The outputs shown were produced on a Linux x86_64 workstation. Random numbers are reproducible, but timings and the last digits of some floating-point results can differ on other platforms.
 
-## Walkthrough
+## Test cases
 
-### 1. One vacancy in BCC
+Each case starts from a published or exact reference, rebuilds it in okrates, and compares. The steps say what we implemented, which parameters came from the source, and which choices we had to make where the source is silent.
 
-We start with the simplest model, because its answer is known exactly. `VacancyDiffusion` in `crates/okrates-models/src/vacancy.rs` holds a `BccLattice` and one jump rate r. Its `enumerate_events` emits the eight nearest-neighbour jumps, each with rate r, and `apply` swaps the vacancy with that neighbour and adds the jump vector to the vacancy's unwrapped displacement. The rate is `jump_rate(ν, E_m, T) = ν exp(−E_m / k_B T)`.
+### 1. Random walk of a single vacancy in BCC
 
-Each jump has length √3·a/2, so ⟨R²⟩ grows by 8r · 3a²/4 per unit time and D = ⟨R²⟩/(6t) = r·a². The `vacancy_msd` example estimates D from 2,000 independent runs, run in parallel through `run_replicas`:
+**Reference.** A vacancy on a BCC lattice that jumps to each of its eight nearest neighbours with the same rate r performs an uncorrelated random walk. Each jump has length √3·a/2, so the exact diffusivity is D = ⟨R²⟩/6t = r·a².
+
+**How we built it.**
+
+1. A BCC lattice with periodic boundaries, and one vacancy that can jump to its eight neighbours (`crates/okrates-models/src/vacancy.rs`).
+2. An Arrhenius rate r = ν exp(−E_m/k_BT) with illustrative values ν = 10¹³ s⁻¹, E_m = 0.65 eV, T = 800 K and a = 2.8665 Å. These are not a fitted Fe parameter set; the test only needs a known r.
+3. 2,000 independent runs of 1,000 expected jumps each, with D estimated from the mean squared displacement against time.
+
+**How to run it.**
 
 ```text
 cargo run --release -p okrates-models --example vacancy_msd
 ```
 
 ```text
-parameterization = illustrative parameters, not a validated Fe parameterization
-cells = [4, 4, 4]
-nu = 1e13 s^-1
-Em = 0.65 eV
-T = 800 K
-a = 2.8665e-10 m
-r = 8.038596403012e8 s^-1
-T_end = 1.554997834612e-7 s
 D_theory = 6.605171778304e-11 m^2/s
 d_hat = 6.683048898106e-11 m^2/s
 se = 1.067433630227e-12 m^2/s
-CI_95 = [6.473835750993e-11, 6.892262045220e-11] m^2/s
 z_score_vs_theory = 0.729573414189
-relative_error = 1.179032467533e-2
 runs = 2000
-seed_base = 20261117
-total_fired_steps = 2002643
 ```
 
-The estimate is 0.73 standard errors from r·a². The same check runs from Python, where `okrates.vacancy_trajectory` returns the jump times and squared displacements of one run:
-
-```text
-python examples/python/vacancy_diffusivity.py
-```
-
-```text
-jump rate r = 8.038596e+08 s^-1
-D_hat    = 6.559499e-11 m^2/s (200 runs x 1000 jumps)
-D_theory = 6.605172e-11 m^2/s
-D_hat / D_theory = 0.9931
-```
-
-The figure averages the squared displacement of 200 Python runs (seeds 0–199, 1,000 jumps each) on a common time grid. The dashed line is the exact 6·r·a²·t.
+**Result.** The estimate lies 0.73 standard errors from r·a². The figure shows the mean squared displacement of 200 runs on a common time grid against the exact line 6·r·a²·t.
 
 <p align="center"><img src="assets/vacancy-msd.svg" width="640" alt="Mean squared displacement of one vacancy against time, 200 runs, following the exact line 6 r a squared t"></p>
 
-### 2. Making it an alloy: Fe–Cr
+### 2. Vacancy diffusion in Fe–Cr alloys
 
-Next we put the vacancy in an alloy, where the jump rate depends on the local chemistry. `FeCrModel<E: Energetics>` in `crates/okrates-models/src/fecr.rs` holds one vacancy in a BCC lattice of Fe and Cr atoms, and the `Energetics` implementation supplies the energy change of each vacancy–atom exchange. `Martinez2012` in `crates/okrates-models/src/fecr_martinez.rs` implements the pair and saddle-point energetics of E. Martínez, O. Senninger, C.-C. Fu and F. Soisson, Phys. Rev. B 86, 224109 (2012), [doi:10.1103/PhysRevB.86.224109](https://doi.org/10.1103/PhysRevB.86.224109).
+**Reference.** E. Martínez, O. Senninger, C.-C. Fu and F. Soisson, "Decomposition kinetics of Fe–Cr solid solutions during thermal aging", Phys. Rev. B 86, 224109 (2012), [doi:10.1103/PhysRevB.86.224109](https://doi.org/10.1103/PhysRevB.86.224109). The paper builds an atomistic kMC model of vacancy diffusion in Fe–Cr from DFT: pair interactions that depend on the local composition (their Table I), saddle-point interactions, and migration barriers for vacancy–solute configurations (their Table II).
 
-Before the dynamics, `crates/okrates-models/src/fecr_anneal.rs` can equilibrate the Fe/Cr arrangement with Kawasaki (Fe↔Cr swap) Metropolis sweeps. The left animation at the top shows Cr clustering during such an anneal, followed by a vacancy moving through the alloy. `crates/okrates-models/src/fecr_diffusion.rs` turns the trajectories into tracer diffusivities D*ᵢ = slope(Σ|Δr|²/Nᵢ)/6, with jackknife standard errors over runs. From Python, after `maturin develop --release`:
+**What the source reports.** Twenty migration barriers in Table II, given to 0.01 eV, and in Fig. 4 the model tracer diffusivities of Fe and Cr in dilute alloys against 1000/T. Read from the figure, the ratio D*_Cr/D*_Fe is 2.03, 2.12, 2.21 and 2.31 at 1000/T = 1.0, 1.1, 1.2 and 1.3.
+
+**How we built it.**
+
+1. We transcribed Tables I and II and wrote the energy model (`crates/okrates-models/src/fecr_martinez.rs`): composition-dependent first- and second-neighbour pair energies, local composition measured around each bond, and saddle-point energies refitted at the run temperature.
+2. Where the paper is ambiguous we chose the reading that reproduces Table II. Table I prints the sign of one pair term in a way that contradicts the paper's own equation; with the equation's sign, Table II is reproduced to 0.005 eV, and with the printed sign it is off by about 0.06 eV.
+3. We added one rule the paper does not state. In annealed alloys at high Cr content a few configurations give a slightly negative barrier. We floor the saddle energy at the higher of the initial and final energies, which keeps detailed balance exact, and we count every activation. It never triggers in the dilute runs below.
+4. The diffusion runs use a box of 432 sites with one vacancy, a Kawasaki (Fe↔Cr swap) anneal of the Cr arrangement before the dynamics, 64 replicas of about 10⁶ jumps each, and tracer diffusivities from the slope of the mean squared displacement.
+
+**How to run it.** The barrier comparison is a test, and the diffusion calculation runs from Python after `maturin develop --release`:
+
+```text
+cargo test --locked -p okrates-models --test fecr_martinez
+```
 
 ```python
 import okrates
@@ -194,54 +180,31 @@ result = okrates.run_fecr_diffusion(
 )
 print(f"D*_Cr = {result.D_Cr:.3e} +/- {result.D_Cr_se:.1e} m^2/s")
 print(f"D*_Fe = {result.D_Fe:.3e} +/- {result.D_Fe_se:.1e} m^2/s")
-print(f"mean jumps per run = {result.mean_jumps:.0f}")
-print(f"params_sha256 = {result.manifest.params_sha256}")
 ```
 
 ```text
 D*_Cr = 1.118e-11 +/- 6.0e-13 m^2/s
 D*_Fe = 2.364e-12 +/- 7.6e-14 m^2/s
-mean jumps per run = 13673
-params_sha256 = c3210d970d59ac86b574d3eb4d83dde9021ab55d1b9c0b401f815a9c9d7c9264
 ```
 
-This is a 128-site box with 25 Cr atoms (about 20 % Cr) and one vacancy, annealed for 50 sweeps and then followed for 5×10⁻⁸ s in 16 runs. The result also carries the vacancy diffusivity, the correlation factor `f` and a `RunManifest` whose SHA-256 hash identifies the parameters.
-
-Cr diffuses faster than Fe in this model. The figure repeats the calculation in a dilute alloy (6×6×6 cells, 432 sites, 4 Cr atoms, one vacancy, no anneal, 128 runs, seed 2026) between 700 and 1100 K, with `t_end` scaled so that each run makes about 14,000–18,000 jumps. Error bars are ±2 standard errors. The ratio D*_Cr / D*_Fe is 2.33, 2.32, 1.97, 1.84 and 1.97 at 700, 800, 900, 1000 and 1100 K. Both diffusivities are for one vacancy in 432 sites, so their absolute values scale with that vacancy concentration.
+**Result.** Nineteen of the twenty Table II barriers agree within half the last printed digit (0.005 eV); the twentieth, H5 in Cr, is off by 0.0052 eV. In dilute alloys (2 Cr in 431 atoms, 769–1000 K) the ratio D*_Cr/D*_Fe is 1.86–2.39, against 2.03–2.31 from the paper's figure, with every point within 2.1 standard errors. The self-diffusion correlation factor in Fe comes out at 0.729–0.738, consistent with the value 0.7314 ± 0.0025 that okrates gives for the same 432-site box. The figure repeats the calculation in a smaller dilute run (4 Cr in 432 sites, 128 runs) from 700 to 1100 K and shows Cr diffusing about twice as fast as Fe throughout.
 
 <p align="center"><img src="assets/fecr-arrhenius.svg" width="640" alt="Tracer diffusivities of Cr and Fe against 1000/T on a log axis; Cr is about twice Fe at every temperature"></p>
 
-### 3. Scaling: why the sum-tree catalog matters
+### 3. Self-interstitials and radiation damage in Fe–Cr
 
-The two catalog backends are `DirectCatalog` and `SumTreeCatalog` in `crates/okrates-core/src/catalog.rs`, with `SumTree` in `crates/okrates-core/src/incremental.rs`. The direct catalog re-enumerates all M events and scans them every step. The sum tree stores partial rate sums in a complete binary tree, so selection is one root-to-leaf descent and an event that changes k rates costs k leaf-to-root updates. The `catalog_scaling` example measures both:
+**Reference.** O. Senninger et al., "Modeling radiation induced segregation in iron–chromium alloys", Acta Mater. 103, 1–11 (2016), [doi:10.1016/j.actamat.2015.09.058](https://doi.org/10.1016/j.actamat.2015.09.058). The paper adds ⟨110⟩ self-interstitial dumbbells to the Martínez vacancy model, creates Frenkel pairs at a damage rate, and studies Cr segregation at a grain boundary treated as a perfect sink.
 
-```text
-cargo run --release -p okrates-core --example catalog_scaling
-```
+**What the source reports.** Binding energies of dumbbell–solute configurations from their own kMC model (their Table 2, 14 configurations), dumbbell migration barriers of 0.34 eV (Fe–Fe), 0.23 eV (mixed Fe–Cr) and about 0.05 eV (Cr–Cr), a distribution of barriers near one Cr atom (their Fig. 2), and the RIS results of their Sec. 4.
 
-It builds a synthetic `CoupledModel`, a ring of sites with four channels each in which every event changes k = 8 rates, runs it on `Simulation` and on `IncrementalSimulation` with M from 8 to 131,072, and prints CSV with the median of 5 repetitions:
+**How we built it.**
 
-```text
-backend,M,rho_update,rate_skew,bytes_per_slot,steps,reps,median_ns_per_step,min_ns_per_step,max_ns_per_step
-direct,8,1.000000,7.0,24.00,250000,5,132.70,132.57,329.03
-sum_tree,8,1.000000,7.0,16.00,250000,5,201.98,201.77,207.03
-...
-direct,32768,0.000244,7.0,24.00,1000,5,275299.91,275006.83,275891.16
-sum_tree,32768,0.000244,7.0,16.00,1000,5,442.81,439.91,450.55
-direct,131072,0.000061,7.0,24.00,1000,5,947177.82,932889.48,1109127.43
-sum_tree,131072,0.000061,7.0,16.00,1000,5,416.71,413.80,434.31
-```
+1. The fitted dumbbell interaction values are not published, so we reconstructed them. We fitted the model of their Eq. 3 to Table 2 and to the three barriers, minimising the largest residual. Twelve of the fourteen configurations are dumbbells in an Fe matrix, and these are reproduced within 0.0086 eV. That is the best any fit of this model can do, because the published values themselves violate one of the model's linear relations by 0.069 eV. The two configurations in a Cr matrix are not reproduced.
+2. The 0.34 and 0.23 eV barriers are reproduced exactly. The saddle term for an Fe atom jumping next to Cr was fitted to the largest single-Cr barrier in Fig. 2 (0.440 eV); the median of our 22 single-Cr barriers is then 0.336 eV, against 0.337–0.340 eV read from the figure.
+3. The lattice energies depend on temperature as in Martínez et al., so the dumbbell saddle terms are refitted at the run temperature. This keeps the pure-Fe barriers at their fitted values at every temperature.
+4. The model (`crates/okrates-models/src/fecr_ris.rs`) creates a Frenkel pair at a random site with the interstitial placed at the end of a straight 10-step ⟨111⟩ replacement chain, recombines a vacancy and an interstitial within the fourth neighbour shell, and absorbs defects that reach a sink plane. The pool of defect records has a fixed size, so the fast sum-tree catalog applies.
 
-The direct cost grows in proportion to M, while the sum-tree cost stays between about 200 and 450 ns per step. The direct catalog is faster only at M = 8; from M = 32 on the sum tree wins, by a factor of 620 at M = 32,768.
-
-<p align="center"><img src="assets/catalog-scaling.svg" width="640" alt="Median time per step against catalog size on log axes: the direct catalog grows linearly, the sum tree stays nearly flat"></p>
-<p align="center"><em>Median time per step of the catalog_scaling example, single-threaded, Linux x86_64 workstation.</em></p>
-
-### 4. Where the RIS model fits
-
-The last model creates and removes defects during the run, and it uses the same engine. `FeCrRis` in `crates/okrates-models/src/fecr_ris.rs` is the Fe–Cr radiation-induced segregation model. Its state holds lattice atoms, vacancies and ⟨110⟩ self-interstitial dumbbells (Fe–Fe, Fe–Cr or Cr–Cr). The events (`FeCrRisEvent`) are vacancy jumps, dumbbell jumps and Frenkel-pair creation at a rate set by the damage rate in dpa/s. A vacancy and an interstitial within the fourth neighbour shell recombine, and defects that reach a sink plane are absorbed.
-
-The lattice and vacancy energetics come from `Martinez2012`. The dumbbell parameters (`DumbbellParams::senninger2016_r1`) are refitted to the binding energies and barriers of O. Senninger et al., Acta Mater. 103, 1–11 (2016), [doi:10.1016/j.actamat.2015.09.058](https://doi.org/10.1016/j.actamat.2015.09.058), because the fitted values are not published. `FeCrRis` is an `IncrementalModel` with a fixed defect record capacity `P`, so it runs on `IncrementalSimulation`. A 32×8×8-cell box with 10 % Cr and a sink plane at x = 0, at 600 K and 10⁻³ dpa/s to 0.01 dpa, takes about 8 s:
+**How to run it.**
 
 ```text
 cargo run --release -p okrates-models --example fecr_ris_pilot -- --temperature 600 --k0 1e-3 --dpa-end 1e-2 --capacity 4096 --seed 1 --cells 32 8 8
@@ -249,11 +212,22 @@ cargo run --release -p okrates-models --example fecr_ris_pilot -- --temperature 
 
 ```text
 box=[32, 8, 8] sites=4096 cr=410 T=600 K0=1e-3 dpa_end=1e-2 P=4096 seed=1
-progress steps=100000 t=7.042351e0 dose=7.042351e-3 V=1 I=0 V_peak=1 I_peak=1 V_mean=0.0000 I_mean=0.0000 created=27 recombined=15 absorbed_V=11 absorbed_I=12 borrowed_fe=0 creation_attempts=32 floored_dumbbell=5581 floored_vacancy=0 us_per_step=68.03
 final steps=122893 t=1.020147e1 dose=1.020147e-2 V=1 I=1 V_peak=1 I_peak=1 V_mean=0.0000 I_mean=0.0000 created=38 recombined=21 absorbed_V=16 absorbed_I=16 borrowed_fe=0 creation_attempts=43 floored_dumbbell=6631 floored_vacancy=0 us_per_step=66.51
 ```
 
-The defect bookkeeping balances. Of 38 Frenkel pairs, 21 recombined and 16 vacancies and 16 interstitials were absorbed at the sink, which leaves 38 − 21 − 16 = 1 vacancy and 1 interstitial (`V=1 I=1`). In a box this small at this damage rate, defects are absorbed or recombine before the next pair is created, so at most one of each exists at a time. Measuring Cr enrichment or depletion at the sink needs larger boxes and higher doses; this run only checks that the model and its event accounting work.
+**Result so far.** The parameters reproduce the paper's tables as described above, and the model passes its consistency tests: detailed balance for every jump, exact defect bookkeeping (38 pairs created, 21 recombined, 16 vacancies and 16 interstitials absorbed, one of each left), and bit-for-bit restarts. The comparison with the paper's interstitial diffusivities and segregation profiles is in progress.
+
+## Performance
+
+The two catalogs produce the same statistics; they differ in cost. The `catalog_scaling` example runs a synthetic model in which every event changes eight rates, with up to 131,072 possible events:
+
+```text
+cargo run --release -p okrates-core --example catalog_scaling
+```
+
+The direct catalog's cost grows in proportion to the number of events, while the sum tree stays between about 200 and 450 ns per step. At 32,768 events the sum tree is about 620 times faster on our Linux x86_64 workstation.
+
+<p align="center"><img src="assets/catalog-scaling.svg" width="640" alt="Median time per step against catalog size on log axes: the direct catalog grows linearly, the sum tree stays nearly flat"></p>
 
 ## Testing
 
