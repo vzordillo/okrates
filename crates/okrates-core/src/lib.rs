@@ -25,8 +25,8 @@ pub use model::{CloneRollback, IndependentSnapshot, Model, ReversibleModel};
 pub use rate::{Rate, RateError};
 pub use rng::{KmcRng, StreamRole};
 pub use sampler::{
-    AbsorptionPolicy, GridError, SampleGrid, SampledTrajectory, SamplingError, TrajectorySource,
-    sample_trajectory,
+    AbsorptionPolicy, GridError, Observe, SampleGrid, SampledTrajectory, SamplingError,
+    TrajectorySource, sample_trajectory, sample_trajectory_with,
 };
 pub use simulation::{RunSummary, SimError, Simulation, Step};
 pub use topology::{

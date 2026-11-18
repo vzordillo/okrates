@@ -11,8 +11,8 @@ use std::error::Error;
 use std::fmt;
 
 use okrates_core::{
-    AbsorptionPolicy, Checkpointable, GridError, SampleGrid, SampledTrajectory, SamplingError,
-    Simulation, StreamRole, run_ensemble, sample_trajectory,
+    AbsorptionPolicy, Checkpointable, GridError, Observe, SampleGrid, SampledTrajectory,
+    SamplingError, Simulation, StreamRole, run_ensemble, sample_trajectory_with,
 };
 use okrates_schema::{Conditions, EstimatorSpec, RngPolicy, RunManifest};
 
@@ -181,6 +181,20 @@ pub fn observables(state: &FeCrState, lattice_parameter: f64) -> Observables {
     }
 }
 
+/// Records [`observables`] at a fixed lattice parameter.
+///
+/// A named type rather than a closure: `|_, state| observables(state, a)` in a function generic over
+/// `E` hits a rustc 1.100.0 release-codegen ICE (see `okrates_core::sample_trajectory_with`).
+struct ObservablesAt {
+    lattice_parameter: f64,
+}
+
+impl<E: Energetics> Observe<FeCrModel<E>, Observables> for ObservablesAt {
+    fn observe(&mut self, _model: &FeCrModel<E>, state: &FeCrState) -> Observables {
+        observables(state, self.lattice_parameter)
+    }
+}
+
 /// Lazily samples [`observables`] on `grid` without evaluating displacements on intermediate jumps
 /// (mid-trajectory errors such as `MaxStepsExceeded` leave `sim` at the last completed jump).
 pub fn sample_fecr_run<E: Energetics>(
@@ -192,12 +206,12 @@ pub fn sample_fecr_run<E: Energetics>(
     if !lattice_parameter.is_finite() || lattice_parameter <= 0.0 {
         return Err(TransportError::InvalidLatticeParameter(lattice_parameter));
     }
-    Ok(sample_trajectory(
+    Ok(sample_trajectory_with(
         sim,
         grid,
         max_steps,
         AbsorptionPolicy::Error,
-        |_model, state| observables(state, lattice_parameter),
+        ObservablesAt { lattice_parameter },
     )?)
 }
 

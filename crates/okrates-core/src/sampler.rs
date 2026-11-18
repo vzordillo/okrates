@@ -357,12 +357,46 @@ pub fn sample_trajectory<S, T, F>(
     grid: &SampleGrid,
     max_steps: Option<u64>,
     absorption: AbsorptionPolicy,
-    mut observe: F,
+    observe: F,
 ) -> Result<SampledTrajectory<T>, SamplingError<<S::Model as Model>::Error>>
 where
     S: TrajectorySource,
     T: Clone,
     F: FnMut(&S::Model, &<S::Model as Model>::State) -> T,
+{
+    sample_trajectory_with(sim, grid, max_steps, absorption, FnObserver(observe))
+}
+
+/// Maps a model state to the recorded value `T`; the named-type alternative to the closure taken by [`sample_trajectory`].
+pub trait Observe<M: Model, T> {
+    fn observe(&mut self, model: &M, state: &M::State) -> T;
+}
+
+/// Adapter that lets a closure act as an [`Observe`].
+struct FnObserver<F>(F);
+
+impl<M: Model, T, F: FnMut(&M, &M::State) -> T> Observe<M, T> for FnObserver<F> {
+    fn observe(&mut self, model: &M, state: &M::State) -> T {
+        (self.0)(model, state)
+    }
+}
+
+/// [`sample_trajectory`] with a named [`Observe`] implementation in place of a closure.
+///
+/// Callers that are generic over the model and would otherwise pass a closure whose argument type is
+/// a projection (`<M as Model>::State`) use this to avoid a rustc 1.100.0 codegen ICE
+/// (`SignatureMismatch` on the closure's `FnMut` impl) in release builds.
+pub fn sample_trajectory_with<S, T, O>(
+    sim: &mut S,
+    grid: &SampleGrid,
+    max_steps: Option<u64>,
+    absorption: AbsorptionPolicy,
+    mut observer: O,
+) -> Result<SampledTrajectory<T>, SamplingError<<S::Model as Model>::Error>>
+where
+    S: TrajectorySource,
+    T: Clone,
+    O: Observe<S::Model, T>,
 {
     let times = grid.times();
     if sim.clock().cmp_f64(times[0]).is_gt() {
@@ -377,7 +411,7 @@ where
 
     while values.len() < times.len() {
         if sim.clock().cmp_f64(times[values.len()]).is_eq() {
-            let current = observe(sim.model(), sim.state());
+            let current = observer.observe(sim.model(), sim.state());
             while values.len() < times.len() && sim.clock().cmp_f64(times[values.len()]).is_eq() {
                 values.push(current.clone());
             }
@@ -402,7 +436,7 @@ where
                         });
                     }
                     AbsorptionPolicy::HoldFinal => {
-                        let held = observe(sim.model(), sim.state());
+                        let held = observer.observe(sim.model(), sim.state());
                         values.resize(times.len(), held);
                         break;
                     }
@@ -419,7 +453,7 @@ where
         let step = sim
             .step_observing(|model, state_before, next_clock| {
                 if next_clock.cmp_f64(next_target).is_gt() {
-                    crossed = Some((observe(model, state_before), next_clock));
+                    crossed = Some((observer.observe(model, state_before), next_clock));
                 }
             })
             .map_err(|source| SamplingError::Sim {
@@ -447,7 +481,7 @@ where
                     });
                 }
                 AbsorptionPolicy::HoldFinal => {
-                    let held = observe(sim.model(), sim.state());
+                    let held = observer.observe(sim.model(), sim.state());
                     values.resize(times.len(), held);
                 }
             },
