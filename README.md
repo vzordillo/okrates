@@ -1,6 +1,6 @@
 # okrates — Kinetic Monte Carlo Simulation in Rust and Python
 
-[![status](https://img.shields.io/badge/status-v0.1.0-blue)](https://github.com/vzordillo/okrates)
+[![status](https://img.shields.io/badge/status-experimental-orange)](https://github.com/vzordillo/okrates)
 [![rust](https://github.com/vzordillo/okrates/actions/workflows/rust.yml/badge.svg?branch=main)](https://github.com/vzordillo/okrates/actions/workflows/rust.yml)
 [![python](https://github.com/vzordillo/okrates/actions/workflows/python.yml/badge.svg?branch=main)](https://github.com/vzordillo/okrates/actions/workflows/python.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
@@ -12,8 +12,6 @@
 `okrates` is an experiment in fully agentic scientific software development. The code, tests and reviews are produced by AI coding agents working under the maintainer's direction:
 - [Google Antigravity](https://antigravity.google/use-cases/science/) with Google's frontier Gemini models, through Google's free access offer for scientists;
 - Anthropic Claude models through [Claude Code](https://claude.com/claude-code).
-
-Treat the code as experimental: results are research-grade and not qualified for nuclear safety or licensing use.
 
 <p align="center"><img src="assets/fecr-snapshot.gif" width="560" alt="Fe-20%Cr box: Cr atoms cluster during a Monte Carlo anneal, then a vacancy diffuses through the alloy"></p>
 
