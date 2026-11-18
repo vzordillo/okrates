@@ -6,4 +6,5 @@ __pycache__/
 python/okrates/*.so
 # Local development notes, not published
 /OKRATES_REPO_PLAN.md
+/CHANGELOG.md
 /docs/

@@ -16,8 +16,6 @@
 - **`okrates-models`** — BCC single- and multi-vacancy diffusion, Fe–Cr vacancy-mediated transport (`PairEnergetics`, Martínez et al. 2012 `Martinez2012` with `BarrierFloorPolicy`, and DFT `TabulatedEnergetics`), stateful `KawasakiAnnealer` with Warren–Cowley 1NN SRO $\alpha_1$, windowed OLS transport estimators, and delete-1 jackknife correlation factor $f$.
 - **`okrates-python`** — PyO3 extension backing `okrates` (`LatticeConfig`, `Martinez2012Config`, `BarrierTableConfig`, `SamplingConfig`, `DiffusionResult`, `AnnealResult`, `RunManifest`).
 
-See [REPRODUCIBILITY.md](REPRODUCIBILITY.md) for the bitwise, algorithmic, and statistical reproducibility guarantees.
-
 ## Getting started
 
 ```console
