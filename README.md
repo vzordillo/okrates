@@ -45,30 +45,37 @@ Reproducibility is handled in the engine as well. `KmcRng` (`rng.rs`) wraps ChaC
 `okrates-models` turns trajectories into diffusivities and correlation factors, `okrates-schema` writes `RunManifest` records and validates `BarrierSet` data, and the Python package wraps both. `okrates-schema` does not depend on `okrates-core`; `okrates-models` uses both, and `okrates-python` uses all three.
 
 ```mermaid
-flowchart TB
-    py["Python package okrates<br>configs, results, numpy arrays"]
-    ext["okrates-python<br>PyO3 extension _okrates"]
-    py --> ext
-    subgraph models_crate["okrates-models"]
-        vac["VacancyDiffusion<br>MultiVacancyDiffusion"]
-        fecr["FeCrModel#lt;E: Energetics#gt;<br>PairEnergetics, Martinez2012, TabulatedEnergetics"]
-        ris["FeCrRis<br>Kawasaki anneal, estimators"]
+flowchart LR
+    subgraph you["🧪 Your model"]
+        direction TB
+        states(["States<br>atoms, defects, species"])
+        moves(["Transitions<br>what can happen next"])
+        rates(["Rates<br>how fast it happens"])
     end
-    subgraph schema_crate["okrates-schema"]
-        schema["RunManifest, BarrierSet<br>SHA-256 digests, barrier adapters"]
+    subgraph core["⚙️ okrates engine"]
+        direction TB
+        pick{{"Event selection"}}
+        clock{{"Continuous-time clock"}}
+        rng{{"Independent random streams"}}
+        ckpt{{"Exact checkpoints"}}
     end
-    subgraph core_crate["okrates-core"]
-        traits["Model, ReversibleModel, IncrementalModel<br>TransitionTopology + RateModel = CoupledModel"]
-        engine["Engine#lt;M, C#gt;<br>step, time, rollback"]
-        catalogs["CatalogBackend<br>DirectCatalog O(M), SumTreeCatalog O(k log M)"]
-        support["Clock (TwoSum), KmcRng (ChaCha12, StreamRole)<br>Checkpointable (schema v2), sample_trajectory"]
-        engine --> catalogs
-        engine --> support
-        engine --> traits
+    subgraph out["📈 Results"]
+        direction TB
+        traj[/"Trajectories"/]
+        transport[/"Diffusivities and<br>correlation factors"/]
+        prov[/"Provenance records"/]
     end
-    ext --> models_crate
-    ext --> schema_crate
-    models_crate --> core_crate
+    you ==> core ==> out
+    py["🐍 Python"] -.-> you
+    rs["🦀 Rust"] -.-> you
+    classDef model fill:#2a78d6,stroke:#1b4f8f,color:#ffffff
+    classDef engine fill:#7a52c7,stroke:#4d3285,color:#ffffff
+    classDef result fill:#1f9e78,stroke:#13664d,color:#ffffff
+    classDef lang fill:#d95926,stroke:#8f3a18,color:#ffffff
+    class states,moves,rates model
+    class pick,clock,rng,ckpt engine
+    class traj,transport,prov result
+    class py,rs lang
 ```
 
 Because of this split, the single-vacancy, multi-vacancy, Fe–Cr and RIS models all run on the same `Engine`. Within Fe–Cr the energy model is a further seam: `FeCrModel<E: Energetics>` accepts `PairEnergetics`, `Martinez2012` or `TabulatedEnergetics`. Any `IncrementalModel` runs on both `Simulation` and `IncrementalSimulation`, and the tests compare the two backends on the same model. Seeding, time accumulation, atomic steps and checkpoints are written once in `okrates-core`, and every model inherits them.
@@ -80,18 +87,22 @@ Every step is `Engine::step_observing` in `crates/okrates-core/src/catalog.rs`. 
 The catalog then applies the event and updates itself; `SumTreeCatalog` recomputes only the slots in `affected_slots` and checks that the slot count has not changed. The generator, clock and step counter are replaced by their advanced copies only if all of this succeeds. On any error the state is undone and the engine is exactly as it was before the call.
 
 ```mermaid
-flowchart TB
-    total["Total rate R = sum of rates<br>catalog.prepare_total()"]
-    absorbed["Step::Absorbed<br>no random numbers drawn"]
-    select["Select event i with u1 on a copy of the RNG<br>smallest i with u1 R #lt; r1 + ... + ri"]
-    wait["Waiting time dt = -ln(u2) / R<br>advance a copy of the TwoSum clock"]
-    apply["Apply the event and update the catalog<br>catalog.apply_and_update()"]
-    commit["Commit RNG, clock and step count<br>Step::Fired with event and dt"]
-    fail["Err(SimError)<br>state undone; RNG, clock, steps unchanged"]
-    total -->|"R = 0"| absorbed
-    total -->|"R #gt; 0"| select
-    select --> wait --> apply --> commit
-    apply -->|error| fail
+flowchart LR
+    total(["Add up the rates<br>of every possible event"])
+    choose{{"Choose one event<br>in proportion to its rate"}}
+    time(["Advance the clock<br>by a random waiting time"])
+    apply(["Apply the event"])
+    refresh(["Update only the rates<br>that changed"])
+    stop[["Nothing can happen:<br>the system is at rest"]]
+    total -->|"events available"| choose --> time --> apply --> refresh
+    refresh -->|"next step"| total
+    total -.->|"total rate is zero"| stop
+    classDef step fill:#2a78d6,stroke:#1b4f8f,color:#ffffff
+    classDef key fill:#7a52c7,stroke:#4d3285,color:#ffffff
+    classDef rest fill:#787880,stroke:#4a4a50,color:#ffffff
+    class total,time,apply,refresh step
+    class choose key
+    class stop rest
 ```
 
 ## Getting started
