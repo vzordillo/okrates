@@ -5,12 +5,13 @@
 use std::collections::HashMap;
 use std::fs;
 
-use okrates_models::bcc::BccLattice;
+use okrates_core::Model;
+use okrates_models::bcc::{BccLattice, DISPLACEMENTS};
 use okrates_models::fecr::{Energetics, Species};
 use okrates_models::fecr_martinez::Martinez2012;
 use okrates_models::fecr_ris::{
-    AXES, Cell, Defect, DumbbellParams, FeCrRis, FeCrRisError, FeCrRisParams, FeCrRisState,
-    RC_OFFSETS, Record,
+    AXES, Cell, Defect, DumbbellParams, FeCrRis, FeCrRisError, FeCrRisEvent, FeCrRisParams,
+    FeCrRisState, RC_OFFSETS, Record,
 };
 use okrates_models::vacancy::BOLTZMANN_EV_PER_K;
 
@@ -723,4 +724,515 @@ fn constructor_validation() {
     assert!(bad(&|p| p.sink_planes = vec![12]));
     assert!(bad(&|p| p.dumbbell.e[0][2][0] = 0.1));
     assert!(bad(&|p| p.dumbbell.e[2][2][1] = 0.1));
+}
+
+// ------------------------------------------------------------------ part 2: events
+
+fn ris_model(
+    cells: [usize; 3],
+    temperature_k: f64,
+    k0: f64,
+    capacity: usize,
+    sinks: &[i64],
+) -> FeCrRis {
+    FeCrRis::new(FeCrRisParams {
+        cells,
+        sink_planes: sinks.to_vec(),
+        temperature_k,
+        k0_dpa_per_s: k0,
+        capacity,
+        dumbbell: DumbbellParams::senninger2016_r1(),
+    })
+    .unwrap()
+}
+
+fn free_records(s: &FeCrRisState) -> usize {
+    s.records()
+        .iter()
+        .filter(|r| matches!(r, Record::Empty))
+        .count()
+}
+
+/// Picks an event with probability proportional to its rate; creation is skipped when the pool is short.
+fn choose(m: &FeCrRis, s: &FeCrRisState, rng: &mut Xorshift) -> Option<FeCrRisEvent> {
+    let mut events = Vec::new();
+    m.enumerate_events(s, &mut |e, r| {
+        assert!(r > 0.0 && r.is_finite());
+        if !(e == FeCrRisEvent::Create && free_records(s) < 2) {
+            events.push((e, r));
+        }
+    });
+    let total: f64 = events.iter().map(|&(_, r)| r).sum();
+    let mut target = (rng.next() >> 11) as f64 / (1_u64 << 53) as f64 * total;
+    for &(e, r) in &events {
+        if target < r {
+            return Some(e);
+        }
+        target -= r;
+    }
+    events.last().map(|&(e, _)| e)
+}
+
+fn pos_site(m: &FeCrRis, p: [i64; 3]) -> usize {
+    m.lattice().site_at(p).unwrap()
+}
+
+fn species_totals(s: &FeCrRisState) -> [i64; 2] {
+    let c = s.atom_counts();
+    [
+        (c[0] + c[2] + c[4]) as i64 - s.borrowed_fe() as i64,
+        (c[1] + c[3] + c[5]) as i64,
+    ]
+}
+
+// ------------------------------------------------------------------ T5
+
+#[test]
+fn t5a_atom_conservation_without_creation() {
+    let m = ris_model([8, 8, 8], 650.0, 0.0, 6, &[0]);
+    let base = m.random_state(102, 3, 1).unwrap();
+    let p = |x, y, z| pos_site(&m, [x, y, z]);
+    let mixed = |site, axis| Defect::Dumbbell {
+        site,
+        axis,
+        plus: Species::Cr,
+        minus: Species::Fe,
+    };
+    // Two vacancy-dumbbell pairs just outside the recombination radius (r² = 12) and one far pair.
+    let defects = [
+        Defect::Vacancy { site: p(4, 4, 4) },
+        mixed(p(6, 6, 6), 0),
+        Defect::Vacancy { site: p(12, 12, 4) },
+        mixed(p(10, 10, 6), 1),
+        Defect::Vacancy { site: p(4, 12, 12) },
+        mixed(p(11, 5, 11), 2),
+    ];
+    let mut s = m.state_with_defects(occupancy(&base), &defects, 1).unwrap();
+    let before = species_totals(&s);
+    let mut rng = Xorshift(0x5eed_0001);
+    for step in 0..2000 {
+        let Some(e) = choose(&m, &s, &mut rng) else {
+            break;
+        };
+        m.apply(&mut s, &e).unwrap();
+        assert_eq!(species_totals(&s), before, "step {step}, event {e:?}");
+        m.check_invariants(&s).unwrap();
+    }
+    println!(
+        "T5a recombined {} absorbed I {} V {} borrowed {}",
+        s.recombined(),
+        s.absorbed_i(),
+        s.absorbed_v(),
+        s.borrowed_fe()
+    );
+    assert!(s.recombined() > 0, "no recombination happened");
+}
+
+#[test]
+fn t5b_defect_bookkeeping_with_creation() {
+    let m = ris_model([8, 8, 8], 650.0, 1.0e8, 6, &[0]);
+    let mut s = m.random_state(102, 3, 1).unwrap();
+    let mut rng = Xorshift(0x5eed_0002);
+    for step in 0..1000 {
+        let e = choose(&m, &s, &mut rng).expect("creation is always possible");
+        m.apply(&mut s, &e).unwrap();
+        let (v, i) = s.defect_counts();
+        assert_eq!(
+            s.created(),
+            s.recombined() + s.absorbed_i() + i as u64,
+            "interstitials, step {step}, event {e:?}"
+        );
+        assert_eq!(
+            s.created(),
+            s.recombined() + s.absorbed_v() + v as u64,
+            "vacancies, step {step}, event {e:?}"
+        );
+        m.check_invariants(&s).unwrap();
+    }
+    println!(
+        "T5b created {} recombined {} absorbed I {} V {} peak {} attempts {}",
+        s.created(),
+        s.recombined(),
+        s.absorbed_i(),
+        s.absorbed_v(),
+        s.peak_defects(),
+        s.creation_attempts()
+    );
+    assert!(s.created() > 0 && s.recombined() > 0);
+    assert!(s.absorbed_i() + s.absorbed_v() > 0);
+    assert!(s.peak_defects() >= 2);
+}
+
+// ------------------------------------------------------------------ T6
+
+#[test]
+fn t6_pool_exhaustion() {
+    let m = ris_model([8, 8, 8], 650.0, 1.0e5, 3, &[]);
+    let mut s = m.random_state(0, 1, 1).unwrap();
+    m.apply(&mut s, &FeCrRisEvent::Create).unwrap();
+    assert_eq!(s.created(), 1);
+    assert_eq!(free_records(&s), 1);
+    assert_eq!(s.defect_counts(), (1, 1));
+    let snapshot = (
+        s.cells().to_vec(),
+        s.records().to_vec(),
+        s.created(),
+        s.recombined(),
+        s.creation_attempts(),
+        s.creation_word_pos(),
+        s.peak_defects(),
+    );
+    let err = m.apply(&mut s, &FeCrRisEvent::Create).unwrap_err();
+    assert_eq!(
+        err,
+        FeCrRisError::PoolExhausted {
+            capacity: 3,
+            defects: 2
+        }
+    );
+    let after = (
+        s.cells().to_vec(),
+        s.records().to_vec(),
+        s.created(),
+        s.recombined(),
+        s.creation_attempts(),
+        s.creation_word_pos(),
+        s.peak_defects(),
+    );
+    assert_eq!(snapshot, after);
+}
+
+// ------------------------------------------------------------------ T8
+
+#[test]
+fn t8_run_seed_changes_creation_site() {
+    let m = ris_model([8, 8, 8], 650.0, 1.0e5, 4, &[]);
+    let vacancy_site = |run_seed| {
+        let mut s = m.random_state(0, 1, run_seed).unwrap();
+        m.apply(&mut s, &FeCrRisEvent::Create).unwrap();
+        match s.records()[0] {
+            Record::Vacancy { site } => site,
+            r => panic!("record 0 is {r:?}"),
+        }
+    };
+    assert_ne!(vacancy_site(1), vacancy_site(2));
+    assert_eq!(vacancy_site(1), vacancy_site(1));
+}
+
+// ------------------------------------------------------------------ T9
+
+/// The chain of a creation on `s` (vacancy record 0 or the first new vacancy `v_rec`, dumbbell `d_rec`),
+/// re-derived from the result: (s_0..s_10, t).
+fn derived_chain(m: &FeCrRis, v_site: usize, d_site: usize) -> (Vec<usize>, [i64; 3]) {
+    let lattice = m.lattice();
+    let p0 = lattice.position(v_site);
+    let t = DISPLACEMENTS
+        .iter()
+        .copied()
+        .find(|t| {
+            lattice.site_at([p0[0] + 10 * t[0], p0[1] + 10 * t[1], p0[2] + 10 * t[2]])
+                == Some(d_site)
+        })
+        .expect("the dumbbell is not 10 steps from the vacancy");
+    let chain = (0..=10)
+        .map(|i| pos_site(m, [p0[0] + i * t[0], p0[1] + i * t[1], p0[2] + i * t[2]]))
+        .collect();
+    (chain, t)
+}
+
+fn new_sites(s: &FeCrRisState) -> (usize, usize) {
+    let mut v = None;
+    let mut d = None;
+    for r in s.records() {
+        match *r {
+            Record::Vacancy { site } => v = Some(site),
+            Record::Dumbbell { site, .. } => d = Some(site),
+            Record::Empty => {}
+        }
+    }
+    (v.unwrap(), d.unwrap())
+}
+
+fn dumbbell_ends(s: &FeCrRisState) -> (Species, Species) {
+    s.records()
+        .iter()
+        .find_map(|r| match *r {
+            Record::Dumbbell { plus, minus, .. } => Some((plus, minus)),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn t9_creation_chain_geometry() {
+    let m = ris_model([8, 8, 8], 650.0, 1.0e5, 4, &[]);
+    let n = m.lattice().site_count();
+    let run = |markers: &[usize]| {
+        let mut occ = vec![Species::Fe; n];
+        for &c in markers {
+            occ[c] = Species::Cr;
+        }
+        let mut s = m.state_with_defects(occ, &[], 9).unwrap();
+        m.apply(&mut s, &FeCrRisEvent::Create).unwrap();
+        s
+    };
+    let probe = run(&[]);
+    assert_eq!(probe.creation_attempts(), 1);
+    let (v, d) = new_sites(&probe);
+    let (chain, _) = derived_chain(&m, v, d);
+    assert_eq!(chain.len(), 11);
+
+    // Cr markers on s_5 and s_9: the chain shifts by one site along t.
+    let s = run(&[chain[5], chain[9]]);
+    assert_eq!(s.creation_attempts(), 1);
+    assert_eq!((v, d), new_sites(&s));
+    assert_eq!(s.cells()[chain[0]], Cell::Vacancy);
+    assert_eq!(s.cells()[chain[10]], Cell::Dumbbell);
+    for (i, &c) in chain.iter().enumerate().take(10).skip(1) {
+        let expected = if i == 6 { Cell::Cr } else { Cell::Fe };
+        assert_eq!(s.cells()[c], expected, "chain site {i}");
+    }
+    let (plus, minus) = dumbbell_ends(&s);
+    assert_eq!(
+        {
+            let mut ends = [plus, minus];
+            ends.sort_by_key(|sp| sp.index());
+            ends
+        },
+        [Species::Fe, Species::Cr]
+    );
+    assert_eq!(species_totals(&s), [1022, 2]);
+    m.check_invariants(&s).unwrap();
+
+    // The end draw is deterministic: moving the marker from a_9 to a_10 swaps the ends.
+    let a = dumbbell_ends(&run(&[chain[9]]));
+    let b = dumbbell_ends(&run(&[chain[10]]));
+    assert_eq!(a, (b.1, b.0));
+    assert_ne!(a.0, a.1);
+
+    // A vacancy on the chain rejects the first draw; the accepted chain avoids it.
+    let blocker = Defect::Vacancy { site: chain[5] };
+    let mut s = m
+        .state_with_defects(vec![Species::Fe; n], &[blocker], 9)
+        .unwrap();
+    m.apply(&mut s, &FeCrRisEvent::Create).unwrap();
+    assert!(
+        s.creation_attempts() > 1,
+        "attempts {}",
+        s.creation_attempts()
+    );
+    assert_eq!(s.records()[0], Record::from(blocker));
+    let (Record::Vacancy { site: v2 }, Record::Dumbbell { site: d2, .. }) =
+        (s.records()[1], s.records()[2])
+    else {
+        panic!("new records are {:?}", &s.records()[1..3]);
+    };
+    let (chain2, _) = derived_chain(&m, v2, d2);
+    assert!(!chain2.contains(&chain[5]));
+    assert!(
+        chain2
+            .iter()
+            .all(|&c| c == v2 || c == d2 || s.cells()[c] != Cell::Vacancy)
+    );
+    m.check_invariants(&s).unwrap();
+
+    // A sink plane through s_3 rejects the first draw; the accepted chain stays off the plane.
+    let plane = m.lattice().position(chain[3])[0];
+    let ms = ris_model([8, 8, 8], 650.0, 1.0e5, 4, &[plane]);
+    let mut s = ms.state_with_defects(vec![Species::Fe; n], &[], 9).unwrap();
+    ms.apply(&mut s, &FeCrRisEvent::Create).unwrap();
+    assert!(
+        s.creation_attempts() > 1,
+        "attempts {}",
+        s.creation_attempts()
+    );
+    let (v3, d3) = new_sites(&s);
+    let (chain3, _) = derived_chain(&ms, v3, d3);
+    assert!(chain3.iter().all(|&c| ms.lattice().position(c)[0] != plane));
+    ms.check_invariants(&s).unwrap();
+}
+
+// ------------------------------------------------------------------ T10
+
+/// Fe matrix with a mixed dumbbell (plus Cr, minus Fe, axis 0) at [8,8,8] and a vacancy at
+/// `[8,8,8] + offset - d`; the vacancy then jumps by `d` to `[8,8,8] + offset`.
+fn recombination_fixture(offset: [i64; 3], d: [i64; 3]) -> (FeCrRis, FeCrRisState, usize, usize) {
+    let m = ris_model([8, 8, 8], 650.0, 0.0, 2, &[]);
+    let i_site = pos_site(&m, [8, 8, 8]);
+    let v_site = pos_site(
+        &m,
+        [
+            8 + offset[0] - d[0],
+            8 + offset[1] - d[1],
+            8 + offset[2] - d[2],
+        ],
+    );
+    let n = m.lattice().site_count();
+    let s = m
+        .state_with_defects(
+            vec![Species::Fe; n],
+            &[
+                Defect::Dumbbell {
+                    site: i_site,
+                    axis: 0,
+                    plus: Species::Cr,
+                    minus: Species::Fe,
+                },
+                Defect::Vacancy { site: v_site },
+            ],
+            1,
+        )
+        .unwrap();
+    (m, s, i_site, v_site)
+}
+
+fn fire_vacancy_jump(m: &FeCrRis, s: &mut FeCrRisState, d: [i64; 3]) {
+    let dir = DISPLACEMENTS.iter().position(|&x| x == d).unwrap();
+    m.apply(s, &FeCrRisEvent::VacancyJump { rec: 1, dir })
+        .unwrap();
+}
+
+#[test]
+fn t10_recombination_shells_and_fill_rule() {
+    // r² = 11 (4th shell): recombines. u = (1,1,0), offset (3,1,1): u·δ > 0, so the plus atom (Cr)
+    // fills the vacancy and the minus atom (Fe) stays.
+    let d = [-1, -1, -1];
+    let (m, mut s, i_site, _) = recombination_fixture([3, 1, 1], d);
+    fire_vacancy_jump(&m, &mut s, d);
+    assert_eq!(s.recombined(), 1);
+    assert_eq!(free_records(&s), 2);
+    let v_new = pos_site(&m, [11, 9, 9]);
+    assert_eq!(s.cells()[v_new], Cell::Cr);
+    assert_eq!(s.cells()[i_site], Cell::Fe);
+    assert_eq!(species_totals(&s), [1023, 1]);
+    m.check_invariants(&s).unwrap();
+
+    // Offset (-3,-1,1): u·δ < 0, so the minus atom (Fe) fills the vacancy and the plus atom stays.
+    let d = [1, 1, -1];
+    let (m, mut s, i_site, _) = recombination_fixture([-3, -1, 1], d);
+    fire_vacancy_jump(&m, &mut s, d);
+    assert_eq!(s.recombined(), 1);
+    assert_eq!(s.cells()[pos_site(&m, [5, 7, 9])], Cell::Fe);
+    assert_eq!(s.cells()[i_site], Cell::Cr);
+    assert_eq!(species_totals(&s), [1023, 1]);
+    m.check_invariants(&s).unwrap();
+
+    // r² = 12 (5th shell): no recombination.
+    let d = [-1, -1, -1];
+    let (m, mut s, _, _) = recombination_fixture([2, 2, 2], d);
+    fire_vacancy_jump(&m, &mut s, d);
+    assert_eq!(s.recombined(), 0);
+    assert_eq!(free_records(&s), 0);
+    m.check_invariants(&s).unwrap();
+}
+
+// ------------------------------------------------------------------ T11
+
+#[test]
+fn t11_sink_absorption() {
+    let m = ris_model([8, 8, 8], 650.0, 0.0, 6, &[0]);
+    let n = m.lattice().site_count();
+    let p = |x, y, z| pos_site(&m, [x, y, z]);
+    let mut occ = vec![Species::Fe; n];
+    occ[p(0, 0, 0)] = Species::Cr;
+    let dumbbell = |site| Defect::Dumbbell {
+        site,
+        axis: 0,
+        plus: Species::Cr,
+        minus: Species::Fe,
+    };
+    let defects = [
+        dumbbell(p(1, 1, 1)),
+        dumbbell(p(1, 5, 5)),
+        Defect::Vacancy { site: p(1, 9, 9) },
+        Defect::Vacancy { site: p(1, 13, 13) },
+        Defect::Vacancy { site: p(1, 3, 11) },
+    ];
+    let mut s = m.state_with_defects(occ, &defects, 1).unwrap();
+    let totals = species_totals(&s);
+
+    // Dumbbell 0 jumps from [1,1,1] to the sink site [0,0,0] (Cr). The jumper (Fe) stays there;
+    // the sink atom goes to the reservoir; Cr remains on [1,1,1].
+    let jump_to = |s: &FeCrRisState, rec: usize, k: usize| {
+        (0..8)
+            .find(|&j| matches!(m.jump_result(s, rec, j), Some((Defect::Dumbbell { site, .. }, _)) if site == k))
+            .unwrap()
+    };
+    let j = jump_to(&s, 0, p(0, 0, 0));
+    m.apply(&mut s, &FeCrRisEvent::DumbbellJump { rec: 0, jump: j })
+        .unwrap();
+    assert_eq!(s.absorbed_i(), 1);
+    assert_eq!(s.records()[0], Record::Empty);
+    assert_eq!(s.cells()[p(0, 0, 0)], Cell::Fe);
+    assert_eq!(s.cells()[p(1, 1, 1)], Cell::Cr);
+    assert_eq!(
+        s.reservoir().iter().copied().collect::<Vec<_>>(),
+        [Species::Cr]
+    );
+    assert_eq!(s.last_records(), [0]);
+    assert!(s.last_changed().contains(&p(0, 0, 0)));
+
+    // Dumbbell 1 queues an Fe behind the Cr.
+    let j = jump_to(&s, 1, p(0, 4, 4));
+    m.apply(&mut s, &FeCrRisEvent::DumbbellJump { rec: 1, jump: j })
+        .unwrap();
+    assert_eq!(s.absorbed_i(), 2);
+    assert_eq!(
+        s.reservoir().iter().copied().collect::<Vec<_>>(),
+        [Species::Cr, Species::Fe]
+    );
+    assert_eq!(species_totals(&s), totals);
+
+    // Vacancies reach the sink: filled first-in first-out, then with borrowed Fe.
+    let expected = [
+        (2, p(0, 8, 8), Cell::Cr, 0),
+        (3, p(0, 12, 12), Cell::Fe, 0),
+        (4, p(0, 2, 10), Cell::Fe, 1),
+    ];
+    for (rec, sink_site, fill, borrowed) in expected {
+        let dir = (0..8)
+            .find(|&dir| {
+                m.lattice().neighbor(
+                    match s.records()[rec] {
+                        Record::Vacancy { site } => site,
+                        r => panic!("{r:?}"),
+                    },
+                    dir,
+                ) == sink_site
+            })
+            .unwrap();
+        m.apply(&mut s, &FeCrRisEvent::VacancyJump { rec, dir })
+            .unwrap();
+        assert_eq!(s.records()[rec], Record::Empty);
+        assert_eq!(s.cells()[sink_site], fill, "record {rec}");
+        assert_eq!(s.borrowed_fe(), borrowed, "record {rec}");
+        m.check_invariants(&s).unwrap();
+    }
+    assert_eq!(s.absorbed_v(), 3);
+    assert!(s.reservoir().is_empty());
+    assert_eq!(species_totals(&s), totals);
+}
+
+// ------------------------------------------------------------------ T15b
+
+#[test]
+fn t15b_floored_dumbbell_jumps_are_counted() {
+    let m = ris_model([8, 8, 8], 650.0, 0.0, 1, &[]).with_dumbbell_saddle_shift(-1.0);
+    let base = m.random_state(102, 5, 1).unwrap();
+    let d = Defect::Dumbbell {
+        site: 100,
+        axis: 3,
+        plus: Species::Fe,
+        minus: Species::Cr,
+    };
+    let mut s = m.state_with_defects(occupancy(&base), &[d], 1).unwrap();
+    let mut rng = Xorshift(0x5eed_0015);
+    for _ in 0..20 {
+        let e = choose(&m, &s, &mut rng).unwrap();
+        assert!(matches!(e, FeCrRisEvent::DumbbellJump { .. }));
+        m.apply(&mut s, &e).unwrap();
+    }
+    println!("T15b floored {}", s.floored_dumbbell_jumps());
+    assert!(s.floored_dumbbell_jumps() > 0);
+    assert_eq!(s.floored_vacancy_jumps(), 0);
 }

@@ -14,7 +14,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::LazyLock;
 
-use okrates_core::KmcRng;
+use okrates_core::{KmcRng, Model};
 use rand_chacha::ChaCha12Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 
@@ -298,6 +298,13 @@ pub enum FeCrRisError {
     },
     /// No acceptable Frenkel chain was found.
     CreationFailed,
+    /// The event names no possible jump: bad index, wrong record kind, empty record or blocked target.
+    NoSuchJump {
+        /// Record index.
+        rec: usize,
+        /// Jump or direction index.
+        jump: usize,
+    },
 }
 
 impl fmt::Display for FeCrRisError {
@@ -334,6 +341,9 @@ impl fmt::Display for FeCrRisError {
                 "defect pool exhausted: capacity {capacity}, {defects} in use"
             ),
             Self::CreationFailed => write!(f, "no acceptable Frenkel chain after 1000 attempts"),
+            Self::NoSuchJump { rec, jump } => {
+                write!(f, "record {rec} has no possible jump {jump}")
+            }
         }
     }
 }
@@ -350,8 +360,6 @@ fn creation_rng(run_seed: u64, stream: u64) -> ChaCha12Rng {
 }
 
 /// A uniform value strictly inside (0, 1), as in `okrates_core::KmcRng::open01`.
-// Used by Frenkel-pair creation in a later part.
-#[cfg_attr(not(test), allow(dead_code))]
 fn open01(rng: &mut ChaCha12Rng) -> f64 {
     ((rng.next_u64() >> 12) as f64 + 0.5) * f64::EPSILON
 }
@@ -923,6 +931,11 @@ impl FeCrRis {
                 return Err(FeCrRisError::DefectOnSink { site });
             }
         }
+        if s.site_record.iter().filter(|&&r| r != NO_RECORD).count() as u64 != s.open_records() {
+            return Err(FeCrRisError::Inconsistent(
+                "site map and records differ in number",
+            ));
+        }
         if let Some((vacancy, dumbbell)) = self.recombination_pair(s) {
             return Err(FeCrRisError::WithinRecombinationRadius { vacancy, dumbbell });
         }
@@ -1257,6 +1270,294 @@ impl FeCrRis {
                 nu * boltzmann
             }
         }
+    }
+}
+
+/// An event of the [`FeCrRis`] model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeCrRisEvent {
+    /// Vacancy record `rec` jumps in `DISPLACEMENTS` direction `dir`.
+    VacancyJump {
+        /// Record index.
+        rec: usize,
+        /// Direction index 0..8.
+        dir: usize,
+    },
+    /// Dumbbell record `rec` makes jump `jump` (0..8).
+    DumbbellJump {
+        /// Record index.
+        rec: usize,
+        /// Jump index 0..8.
+        jump: usize,
+    },
+    /// A Frenkel pair is created.
+    Create,
+}
+
+fn cell_of(species: Species) -> Cell {
+    match species {
+        Species::Cr => Cell::Cr,
+        _ => Cell::Fe,
+    }
+}
+
+impl FeCrRis {
+    fn site_species(s: &FeCrRisState, site: usize) -> Species {
+        match s.cells[site] {
+            Cell::Cr => Species::Cr,
+            _ => Species::Fe,
+        }
+    }
+
+    fn free_record(s: &mut FeCrRisState, rec: usize) {
+        if let Record::Vacancy { site } | Record::Dumbbell { site, .. } = s.records[rec] {
+            s.site_record[site] = NO_RECORD;
+        }
+        s.records[rec] = Record::Empty;
+        if !s.last_records.contains(&rec) {
+            s.last_records.push(rec);
+        }
+    }
+
+    /// Recombines record `rec` with its nearest opposite defect within [`RC_OFFSETS`], if any.
+    fn recombine(&self, s: &mut FeCrRisState, rec: usize) -> bool {
+        let (site, is_dumbbell) = match s.records[rec] {
+            Record::Empty => return false,
+            Record::Vacancy { site } => (site, false),
+            Record::Dumbbell { site, .. } => (site, true),
+        };
+        let pos = self.lattice.position(site);
+        let mut best: Option<(i64, usize, [i64; 3])> = None;
+        for o in RC_OFFSETS.iter() {
+            let other = self
+                .lattice
+                .site_at([pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]])
+                .expect("same-parity offsets stay on the lattice");
+            let Some(r) = s.record_at(other) else {
+                continue;
+            };
+            let opposite = matches!(
+                (s.records[r], is_dumbbell),
+                (Record::Vacancy { .. }, true) | (Record::Dumbbell { .. }, false)
+            );
+            if !opposite {
+                continue;
+            }
+            let key = (dot(*o, *o), r);
+            if best.is_none_or(|(r2, br, _)| key < (r2, br)) {
+                best = Some((key.0, r, *o));
+            }
+        }
+        let Some((_, partner, o)) = best else {
+            return false;
+        };
+        let (i_rec, v_rec, delta) = if is_dumbbell {
+            (rec, partner, o)
+        } else {
+            (partner, rec, [-o[0], -o[1], -o[2]])
+        };
+        let Record::Dumbbell {
+            site: i_site,
+            axis,
+            plus,
+            minus,
+        } = s.records[i_rec]
+        else {
+            unreachable!("recombination partner kinds were checked")
+        };
+        let Record::Vacancy { site: v_site } = s.records[v_rec] else {
+            unreachable!("recombination partner kinds were checked")
+        };
+        let (fills, stays) = if dot(AXES[axis], delta) >= 0 {
+            (plus, minus)
+        } else {
+            (minus, plus)
+        };
+        s.cells[v_site] = cell_of(fills);
+        s.cells[i_site] = cell_of(stays);
+        s.last_changed.extend([v_site, i_site]);
+        Self::free_record(s, i_rec);
+        Self::free_record(s, v_rec);
+        s.recombined += 1;
+        true
+    }
+
+    fn create(&self, s: &mut FeCrRisState) -> Result<(), FeCrRisError> {
+        let empty: Vec<usize> = (0..s.records.len())
+            .filter(|&r| matches!(s.records[r], Record::Empty))
+            .collect();
+        if empty.len() < 2 {
+            return Err(FeCrRisError::PoolExhausted {
+                capacity: self.params.capacity,
+                defects: s.records.len() - empty.len(),
+            });
+        }
+        let n = self.lattice.site_count();
+        let draw = |rng: &mut ChaCha12Rng, m: usize| ((open01(rng) * m as f64) as usize).min(m - 1);
+        let mut found = None;
+        for _ in 0..1000 {
+            let site = draw(&mut s.creation_rng, n);
+            let dir = draw(&mut s.creation_rng, 8);
+            let orient = draw(&mut s.creation_rng, 12);
+            s.creation_attempts += 1;
+            let (p0, t) = (self.lattice.position(site), DISPLACEMENTS[dir]);
+            let chain: Vec<usize> = (0..=10_i64)
+                .map(|i| {
+                    self.lattice
+                        .site_at([p0[0] + i * t[0], p0[1] + i * t[1], p0[2] + i * t[2]])
+                        .expect("a chain along a 111 direction stays on the lattice")
+                })
+                .collect();
+            if chain
+                .iter()
+                .all(|&c| matches!(s.cells[c], Cell::Fe | Cell::Cr) && !self.on_sink(c))
+            {
+                found = Some((chain, orient));
+                break;
+            }
+        }
+        let Some((chain, orient)) = found else {
+            return Err(FeCrRisError::CreationFailed);
+        };
+        let atoms: Vec<Species> = chain.iter().map(|&c| Self::site_species(s, c)).collect();
+        s.cells[chain[0]] = Cell::Vacancy;
+        for i in 1..=9 {
+            s.cells[chain[i]] = cell_of(atoms[i - 1]);
+        }
+        s.cells[chain[10]] = Cell::Dumbbell;
+        let (plus, minus) = if orient % 2 == 0 {
+            (atoms[9], atoms[10])
+        } else {
+            (atoms[10], atoms[9])
+        };
+        let (v_rec, d_rec) = (empty[0], empty[1]);
+        s.records[v_rec] = Record::Vacancy { site: chain[0] };
+        s.records[d_rec] = Record::Dumbbell {
+            site: chain[10],
+            axis: orient / 2,
+            plus,
+            minus,
+        };
+        s.site_record[chain[0]] = v_rec as u32;
+        s.site_record[chain[10]] = d_rec as u32;
+        s.created += 1;
+        s.last_changed.extend(chain);
+        s.last_records.extend([v_rec, d_rec]);
+        self.recombine(s, v_rec);
+        self.recombine(s, d_rec);
+        Ok(())
+    }
+
+    fn jump(
+        &self,
+        s: &mut FeCrRisState,
+        rec: usize,
+        jump: usize,
+        vacancy: bool,
+    ) -> Result<(), FeCrRisError> {
+        let bad = FeCrRisError::NoSuchJump { rec, jump };
+        if rec >= s.records.len() || jump >= 8 {
+            return Err(bad);
+        }
+        if matches!(s.records[rec], Record::Vacancy { .. }) != vacancy {
+            return Err(bad);
+        }
+        let Some(mv) = self.jump_move(s, rec, jump) else {
+            return Err(bad);
+        };
+        let floored = self.raw_of(s, &mv) < self.change_of(s, &mv).max(0.0);
+        s.last_changed.clear();
+        s.last_records.clear();
+        s.last_records.push(rec);
+        let (a, b) = mv.ends();
+        s.last_changed.extend([a, b]);
+        s.site_record[a] = NO_RECORD;
+        s.site_record[b] = rec as u32;
+        match mv {
+            Move::Vacancy { q, p, atom } => {
+                s.floored_vacancy_jumps += u64::from(floored);
+                s.cells[q] = cell_of(atom);
+                s.cells[p] = Cell::Vacancy;
+                s.records[rec] = Record::Vacancy { site: p };
+                if !self.recombine(s, rec) && self.on_sink(p) {
+                    s.cells[p] = cell_of(s.reservoir.pop_front().unwrap_or_else(|| {
+                        s.borrowed_fe += 1;
+                        Species::Fe
+                    }));
+                    Self::free_record(s, rec);
+                    s.absorbed_v += 1;
+                }
+            }
+            Move::Dumbbell {
+                o,
+                k,
+                axis,
+                plus,
+                minus,
+                jumper,
+                rest,
+                atom,
+            } => {
+                s.floored_dumbbell_jumps += u64::from(floored);
+                s.cells[o] = cell_of(rest);
+                s.cells[k] = Cell::Dumbbell;
+                s.records[rec] = Record::Dumbbell {
+                    site: k,
+                    axis,
+                    plus,
+                    minus,
+                };
+                if !self.recombine(s, rec) && self.on_sink(k) {
+                    s.cells[k] = cell_of(jumper);
+                    s.reservoir.push_back(atom);
+                    Self::free_record(s, rec);
+                    s.absorbed_i += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Model for FeCrRis {
+    type State = FeCrRisState;
+    type Event = FeCrRisEvent;
+    type Error = FeCrRisError;
+
+    fn enumerate_events(&self, state: &Self::State, emit: &mut dyn FnMut(Self::Event, f64)) {
+        for (rec, r) in state.records.iter().enumerate() {
+            for jump in 0..8 {
+                let event = match r {
+                    Record::Empty => break,
+                    Record::Vacancy { .. } => FeCrRisEvent::VacancyJump { rec, dir: jump },
+                    Record::Dumbbell { .. } => FeCrRisEvent::DumbbellJump { rec, jump },
+                };
+                let rate = self.rate(state, rec, jump);
+                if rate > 0.0 {
+                    emit(event, rate);
+                }
+            }
+        }
+        if self.params.k0_dpa_per_s > 0.0 {
+            emit(
+                FeCrRisEvent::Create,
+                self.params.k0_dpa_per_s * self.lattice.site_count() as f64,
+            );
+        }
+    }
+
+    fn apply(&self, state: &mut Self::State, event: &Self::Event) -> Result<(), Self::Error> {
+        match *event {
+            FeCrRisEvent::VacancyJump { rec, dir } => self.jump(state, rec, dir, true)?,
+            FeCrRisEvent::DumbbellJump { rec, jump } => self.jump(state, rec, jump, false)?,
+            FeCrRisEvent::Create => {
+                state.last_changed.clear();
+                state.last_records.clear();
+                self.create(state)?;
+            }
+        }
+        state.peak_defects = state.peak_defects.max(state.open_records());
+        Ok(())
     }
 }
 
