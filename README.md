@@ -28,7 +28,7 @@
 
 okrates simulates continuous-time Markov chains in the residence-time form of Bortz, Kalos and Lebowitz. You describe a system by its states, the transitions that can leave each state, and their rates. The engine draws each event with probability proportional to its rate, advances a continuous clock by an exponentially distributed waiting time, and applies the event. Nothing in the engine assumes a lattice, a material or a particular kind of event.
 
-Two event catalogs give identical statistics at different cost. The direct catalog recomputes every rate each step. The sum-tree catalog updates only the rates an event actually changes, which keeps a step cheap even when millions of events are possible.
+Two event catalogs give identical statistics at different cost. The direct catalog recomputes every rate each step. The sum-tree catalog updates only the rates an event actually changes, which keeps a step cheap even with hundreds of thousands of possible events.
 
 Runs are reproducible in a strict sense. Every replica and every purpose (dynamics, initial state, defect creation) draws from its own seeded random stream, so an ensemble gives the same numbers on any number of threads. A checkpoint stores the full generator and clock state, and a resumed run continues bit for bit. Run manifests record hashes of the parameters, barrier tables and checkpoints behind each result.
 
