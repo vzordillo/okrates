@@ -17,7 +17,7 @@ All notable changes to `okrates` are documented in this file.
   - Stateful `KawasakiAnnealer`, Warren–Cowley 1NN short-range order `warren_cowley_alpha1`, and tail energy-drift diagnostics.
   - `TransportConfig` (`WindowedOls` burn-in window `[t_equil, t_end]` and `OriginSlope`), split-window drift diagnostic `window_drift_ratio`, and unbiased ratio-of-means + delete-1 jackknife standard error (`jackknife_ratio_mean_se`) for the correlation factor $f$.
 - **Typed Python API (`okrates`)**: Frozen configuration and result dataclasses (`LatticeConfig`, `PairEnergeticsConfig`, `Martinez2012Config`, `BarrierTableConfig`, `AnnealConfig`, `SamplingConfig`, `DiffusionResult`, `AnnealResult`, `RunManifest`), `run_fecr_diffusion`, `run_anneal`, `validate_barrier_set`, `import_pymatgen_vasp_barriers`, `import_aiida_qe_barriers`, and PEP 561 `.pyi` stubs.
-- **Repository standards**: `REPRODUCIBILITY.md`, `AGENTS.md`, and `.coderabbit.yaml`.
+- **Repository standards**: `REPRODUCIBILITY.md` and `.coderabbit.yaml`.
 
 ### Changed (Breaking)
 - **Checkpoint schema bumped to v2 (`SCHEMA_VERSION = 2`)**: Persists TwoSum clock compensation bits alongside `time`. v1 checkpoints fail cleanly with `CheckpointError::UnsupportedSchema(1)`.
