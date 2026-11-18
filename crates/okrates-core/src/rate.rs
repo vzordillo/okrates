@@ -1,20 +1,16 @@
-//! Validated non-negative event rates.
+//! Validated non-negative finite event rates.
 
 use std::error::Error;
 use std::fmt;
 
-/// A non-negative finite event rate, measured in inverse time units.
-///
-/// The core is unit-agnostic; time is measured in the reciprocal of whatever
-/// rate unit the model uses.
+/// Non-negative finite event rate in inverse time units (core is unit-agnostic).
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct Rate(f64);
 
 impl Rate {
-    /// The zero rate.
     pub const ZERO: Self = Self(0.0);
 
-    /// Creates a finite, non-negative rate.
+    /// Validates `value >= 0` and finite, normalizing `-0.0` to `+0.0`.
     pub fn new(value: f64) -> Result<Self, RateError> {
         if value.is_finite() && value >= 0.0 {
             Ok(Self(if value == 0.0 { 0.0 } else { value }))
@@ -27,25 +23,19 @@ impl Rate {
         }
     }
 
-    /// Returns this rate's numeric value.
     pub fn get(self) -> f64 {
         self.0
     }
 
-    /// Returns whether this rate is zero.
     pub fn is_zero(self) -> bool {
         self.0 == 0.0
     }
 }
 
-/// An invalid rate value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RateError {
-    /// The value was NaN.
     NaN,
-    /// The value was positive or negative infinity.
     Infinite(f64),
-    /// The value was finite and negative.
     Negative(f64),
 }
 

@@ -4,11 +4,10 @@ build-backend = "maturin"
 
 [project]
 name = "okrates"
-version = "0.0.1"
+version = "0.1.0"
 requires-python = ">=3.10"
 license = "MIT"
 description = "Python bindings for the okrates kinetic Monte Carlo framework."
-# numpy 2.2 is the newest series supporting Python 3.10; see docs/adr/0005.
 dependencies = ["numpy>=2.2"]
 
 [tool.maturin]

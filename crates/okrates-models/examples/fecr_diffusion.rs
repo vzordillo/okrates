@@ -1,11 +1,12 @@
 use std::env;
 
-use okrates_core::ensemble::{run_replicas, thread_count};
+use okrates_core::ensemble::{run_ensemble, thread_count};
+use okrates_core::{SampleGrid, Simulation, StreamRole};
 use okrates_models::bcc::BccLattice;
 use okrates_models::fecr::{FeCrModel, PairEnergetics};
 use okrates_models::fecr_diffusion::{
-    ANNEAL_SEED_OFFSET, ReplicaEstimate, STATE_SEED_OFFSET, estimate, mean_se, ols_slope,
-    origin_slope, run_composition, sample_run,
+    ReplicaEstimate, estimate, jackknife_ratio_mean_se, mean_se, ols_slope, origin_slope,
+    run_composition, sample_fecr_run,
 };
 use okrates_models::vacancy::BOLTZMANN_EV_PER_K;
 
@@ -22,7 +23,6 @@ fn env_usize(name: &str, default: usize) -> usize {
     }
 }
 
-/// Reads `ANNEAL_SWEEPS`: unset means no anneal, otherwise an integer >= 1.
 fn env_anneal_sweeps() -> u64 {
     match env::var("ANNEAL_SWEEPS") {
         Ok(value) => match value.parse::<u64>() {
@@ -54,33 +54,34 @@ fn correlation_factor() {
         1000.0,
     )
     .expect("valid model");
-    let replicas = run_replicas(seed_base, runs as u64, |_, seed| {
+    let grid = SampleGrid::from_origin(t_end, k_count).expect("valid grid");
+    let replicas = run_ensemble(seed_base, runs as u64, |ctx| {
+        let mut init_rng = ctx.rng(StreamRole::InitialState);
         let state = model
-            .random_state(n_cr, seed + STATE_SEED_OFFSET)
+            .random_state_with_rng(n_cr, &mut init_rng)
             .expect("valid state");
-        let (times, samples, fired) = sample_run(model.clone(), state, seed, t_end, k_count, 1.0);
-        let d_v = estimate(&times, &samples, origin_slope).vacancy;
-        let late = estimate(&times[10..], &samples[10..], ols_slope);
-        (d_v, late.tracer_all, fired)
-    })
-    .expect("seeds do not overflow");
+        let mut sim = Simulation::with_rng(model.clone(), state, ctx.rng(StreamRole::Dynamics));
+        let traj = sample_fecr_run(&mut sim, &grid, 1.0, None).expect("valid run");
+        let d_v = estimate(&traj.times, &traj.values, origin_slope).vacancy;
+        let late = estimate(&traj.times[10..], &traj.values[10..], ols_slope);
+        (d_v, late.tracer_all, traj.fired_steps)
+    });
     let mut d_v = Vec::with_capacity(runs);
     let mut d_all = Vec::with_capacity(runs);
-    let mut f_n = Vec::with_capacity(runs);
     let mut total_fired = 0_u64;
-    for replica in replicas {
-        let (v, t, fired) = replica.value;
+    for (v, t, fired) in replicas {
         d_v.push(v);
         d_all.push(t);
-        f_n.push(n_atoms * t);
         total_fired += fired;
     }
+    let (f_mean, f_se) = jackknife_ratio_mean_se(&d_all, &d_v, n_atoms);
     println!(
         "# correlation factor, equal-energy limit (all rates 1), N = {n_sites}, N_Cr = {n_cr}"
     );
     report("D_v", &d_v);
     report("D_tracer_all", &d_all);
-    report("f_N", &f_n);
+    println!("f_N = {f_mean:.12e}");
+    println!("f_N_se = {f_se:.12e}");
     println!("runs = {runs}");
     println!("seed_base = {seed_base}");
     println!("total_fired_steps = {total_fired}");
@@ -110,7 +111,6 @@ fn illustrative(anneal_sweeps: u64) {
     println!("seed_base = {seed_base}");
     if anneal_sweeps > 0 {
         println!("anneal_sweeps = {anneal_sweeps}");
-        println!("anneal_seed_offset = {ANNEAL_SEED_OFFSET}");
     }
     for n_cr in [0_usize, 22, 43, 86] {
         let replicas = run_composition(
@@ -123,7 +123,7 @@ fn illustrative(anneal_sweeps: u64) {
             1.0,
             anneal_sweeps,
         )
-        .expect("valid state");
+        .expect("valid run");
         let estimates: Vec<ReplicaEstimate> = replicas.iter().map(|r| r.estimate).collect();
         let total_fired: u64 = replicas.iter().map(|r| r.fired).sum();
         let column =

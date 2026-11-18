@@ -4,10 +4,12 @@
 
 use std::collections::HashMap;
 
+use okrates_core::KmcRng;
 use okrates_core::ensemble::run_replicas;
+use okrates_core::testing::chi2_upper_quantile;
 use okrates_models::bcc::BccLattice;
 use okrates_models::fecr::{Energetics, FeCrModel, PairEnergetics, Species};
-use okrates_models::fecr_anneal::anneal;
+use okrates_models::fecr_anneal::{KawasakiAnnealer, anneal, warren_cowley_alpha1};
 use okrates_models::fecr_martinez::Martinez2012;
 
 const ATTEMPT_FREQUENCY: f64 = 1e13;
@@ -25,88 +27,43 @@ fn model(cells: [usize; 3]) -> FeCrModel<PairEnergetics> {
     .unwrap()
 }
 
-fn ln_gamma(z: f64) -> f64 {
-    const G: f64 = 7.0;
-    const C: [f64; 9] = [
-        0.999_999_999_999_809_9,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-    if z < 0.5 {
-        return (std::f64::consts::PI / (std::f64::consts::PI * z).sin()).ln() - ln_gamma(1.0 - z);
+#[test]
+fn chunked_annealer_matches_single_call_bitwise() {
+    let m = model([4, 4, 4]);
+    let init = m.random_state(32, 42).unwrap().occupancy().to_vec();
+    let one_shot = anneal(&m, init.clone(), 24, 99).unwrap();
+
+    let mut chunked = KawasakiAnnealer::new(&m, init, KmcRng::from_seed(99)).unwrap();
+    for step in [5, 7, 12] {
+        chunked.run_sweeps(&m, step).unwrap();
     }
-    let z = z - 1.0;
-    let mut sum = C[0];
-    for (i, c) in C.iter().enumerate().skip(1) {
-        sum += c / (z + i as f64);
-    }
-    let t = z + G + 0.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + sum.ln()
+    assert_eq!(chunked.sweeps_completed(), 24);
+    assert_eq!(chunked.finish(), one_shot);
 }
 
-/// Regularized upper incomplete gamma function Q(a, x).
-fn gamma_q(a: f64, x: f64) -> f64 {
-    if x <= 0.0 {
-        return 1.0;
-    }
-    if x < a + 1.0 {
-        let mut term = 1.0;
-        let mut sum = 1.0;
-        let mut n = 1.0;
-        while term > sum * 1e-17 {
-            term *= x / (a + n);
-            sum += term;
-            n += 1.0;
+#[test]
+fn warren_cowley_alpha1_distinguishes_ordering_and_clustering() {
+    let lattice = BccLattice::new([4, 4, 4]).unwrap();
+    // B2 ordered alloy (corner sites Fe, body-centre sites Cr, one vacancy at 0):
+    // every 1NN of Fe is on the Cr sublattice -> P(Cr | Fe) = 1 > x_Cr -> alpha_1 < 0.
+    let mut b2 = vec![Species::Fe; lattice.site_count()];
+    for (s, sp) in b2.iter_mut().enumerate() {
+        if lattice.position(s)[0] % 2 != 0 {
+            *sp = Species::Cr;
         }
-        let p = (a * x.ln() - x - ln_gamma(a + 1.0) + sum.ln()).exp();
-        1.0 - p
-    } else {
-        const TINY: f64 = 1e-300;
-        let mut b = x + 1.0 - a;
-        let mut c = 1.0 / TINY;
-        let mut d = 1.0 / b;
-        let mut h = d;
-        for i in 1..1000 {
-            let an = -(i as f64) * (i as f64 - a);
-            b += 2.0;
-            d = an * d + b;
-            if d.abs() < TINY {
-                d = TINY;
-            }
-            c = b + an / c;
-            if c.abs() < TINY {
-                c = TINY;
-            }
-            d = 1.0 / d;
-            let delta = d * c;
-            h *= delta;
-            if (delta - 1.0).abs() < 1e-16 {
-                break;
-            }
-        }
-        (a * x.ln() - x - ln_gamma(a)).exp() * h
     }
-}
+    b2[0] = Species::Vacancy;
+    assert!(warren_cowley_alpha1(&lattice, &b2) < -0.8);
 
-/// Upper `alpha` quantile of the chi-square distribution with `df` degrees of freedom.
-fn chi2_upper_quantile(df: usize, alpha: f64) -> f64 {
-    let a = df as f64 / 2.0;
-    let (mut lo, mut hi) = (0.0, 1000.0);
-    for _ in 0..200 {
-        let mid = 0.5 * (lo + hi);
-        if gamma_q(a, mid / 2.0) > alpha {
-            lo = mid;
-        } else {
-            hi = mid;
+    // Phase-separated slab (x < 4 Fe, x >= 4 Cr): few Fe-Cr bonds -> alpha_1 > 0.
+    let mut slab = vec![Species::Fe; lattice.site_count()];
+    for (s, sp) in slab.iter_mut().enumerate() {
+        if lattice.position(s)[0] >= 4 {
+            *sp = Species::Cr;
         }
     }
-    0.5 * (lo + hi)
+    slab[0] = Species::Vacancy;
+    assert!(warren_cowley_alpha1(&lattice, &slab) > 0.5);
 }
 #[test]
 fn swap_delta_matches_total_energy() {

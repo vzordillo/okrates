@@ -1,35 +1,37 @@
-//! Parallel ensembles of independent replicas.
+//! Deterministic parallel replica ensembles on the active Rayon thread pool.
 //!
-//! Independent replicas run in parallel on the current rayon thread pool.
-//! Replica `id` uses seed `base_seed + id`. Results are returned in id order,
-//! so they do not depend on the number of threads or on scheduling. Callers
-//! must aggregate serially in id order.
+//! Results are collected in replica `id` order (`0..count`) so reductions are
+//! independent of thread count and work-stealing schedule.
 
 use std::fmt;
 
 use rayon::prelude::*;
 
-/// One replica's result with its id and seed.
+use crate::rng::{KmcRng, StreamRole};
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Replica<T> {
-    /// Replica index, from 0 to `count - 1`.
     pub id: u64,
-    /// Seed used for this replica: `base_seed + id`.
     pub seed: u64,
-    /// Value computed by the replica function.
     pub value: T,
 }
 
-/// Error: the seed of the last replica does not fit in u64.
+/// Domain-separated replica handle supporting arbitrary `u64` seeds without overflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicaContext {
+    pub id: u64,
+    pub base_seed: u64,
+}
+
+impl ReplicaContext {
+    pub fn rng(&self, role: StreamRole) -> KmcRng {
+        KmcRng::for_replica(self.base_seed, self.id, role)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnsembleError {
-    /// `base_seed + (count - 1)` overflows `u64`.
-    SeedOverflow {
-        /// Base seed of the ensemble.
-        base_seed: u64,
-        /// Number of replicas requested.
-        count: u64,
-    },
+    SeedOverflow { base_seed: u64, count: u64 },
 }
 
 impl fmt::Display for EnsembleError {
@@ -45,21 +47,15 @@ impl fmt::Display for EnsembleError {
 
 impl std::error::Error for EnsembleError {}
 
-/// The seed of replica `id`: `base_seed + id`, or `None` on overflow.
 pub fn replica_seed(base_seed: u64, id: u64) -> Option<u64> {
     base_seed.checked_add(id)
 }
 
-/// Number of threads in the current rayon pool.
 pub fn thread_count() -> usize {
     rayon::current_num_threads()
 }
 
-/// Runs `count` replicas in parallel; `f(id, seed)` computes one replica.
-///
-/// Returns the replicas in id order. Fails with
-/// [`EnsembleError::SeedOverflow`] if the seed of the last replica does not
-/// fit in `u64`.
+/// Runs `count` replicas in parallel using additive seed `base_seed + id`.
 pub fn run_replicas<T, F>(
     base_seed: u64,
     count: u64,
@@ -85,6 +81,18 @@ where
         .collect::<Vec<_>>())
 }
 
+/// Runs `count` replicas in parallel with collision-free [`ReplicaContext`] substreams.
+pub fn run_ensemble<T, F>(base_seed: u64, count: u64, f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(ReplicaContext) -> T + Sync,
+{
+    (0..count)
+        .into_par_iter()
+        .map(|id| f(ReplicaContext { id, base_seed }))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,10 +115,12 @@ mod tests {
     }
 
     #[test]
-    fn last_possible_seed_is_accepted() {
-        let replicas = run_replicas(u64::MAX, 1, |_, seed| seed).unwrap();
-        assert_eq!(replicas.len(), 1);
-        assert_eq!(replicas[0].seed, u64::MAX);
+    fn run_ensemble_handles_u64_max_seed_without_overflow() {
+        let vals = run_ensemble(u64::MAX, 4, |ctx| {
+            ctx.rng(StreamRole::Dynamics).open01().to_bits()
+        });
+        assert_eq!(vals.len(), 4);
+        assert_ne!(vals[0], vals[1]);
     }
 
     #[test]

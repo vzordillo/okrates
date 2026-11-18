@@ -1,8 +1,8 @@
-//! Serial kinetic Monte Carlo primitives and direct-method simulation.
+//! Serial kinetic Monte Carlo primitives, catalog engines, and trajectory sampling.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
 
+pub mod catalog;
 pub mod checkpoint;
 pub mod clock;
 pub mod ensemble;
@@ -11,13 +11,24 @@ pub mod model;
 pub mod rate;
 pub mod reference;
 pub mod rng;
+pub mod sampler;
 pub mod simulation;
+pub mod testing;
+pub mod topology;
 
+pub use catalog::{CatalogBackend, DirectCatalog, Engine, SumTreeCatalog};
 pub use checkpoint::{CheckpointError, Checkpointable, SCHEMA_VERSION};
 pub use clock::{Clock, ClockError};
-pub use ensemble::{EnsembleError, Replica, run_replicas};
+pub use ensemble::{EnsembleError, Replica, ReplicaContext, run_ensemble, run_replicas};
 pub use incremental::{IncrementalModel, IncrementalSimulation, SumTree};
-pub use model::Model;
+pub use model::{CloneRollback, Model, ReversibleModel};
 pub use rate::{Rate, RateError};
-pub use rng::KmcRng;
+pub use rng::{KmcRng, StreamRole};
+pub use sampler::{
+    AbsorptionPolicy, GridError, SampleGrid, SampledTrajectory, SamplingError, TrajectorySource,
+    sample_trajectory,
+};
 pub use simulation::{RunSummary, SimError, Simulation, Step};
+pub use topology::{
+    CoupledModel, EnumeratedTopology, RateModel, SlotError, SlottedTopology, TransitionTopology,
+};

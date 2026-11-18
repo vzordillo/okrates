@@ -1,23 +1,15 @@
-//! Writes extended-XYZ frames of one Fe–Cr (Martínez 2012) box for visualization:
-//! the pre-anneal from a random solid solution, then vacancy diffusion.
+//! Writes extended-XYZ frames of one Fe–Cr (Martínez 2012) cell (`a = 2.855` Å)
+//! across Kawasaki pre-annealing and subsequent single-vacancy diffusion.
 //!
 //! Usage: `fecr_snapshot <cr_count> <seed> <anneal_sweeps> <sweeps_per_frame> <jumps> <jumps_per_frame> <temperature_k>`.
-//!
-//! Each frame is `N`, a comment line (`Lattice`, `Properties`, `Stage`, `Step`,
-//! `Time` in s, `VacancyDisp` = unwrapped vacancy displacement in Å), then one
-//! `species x y z` line per site, with the vacancy written as `V`. Positions use
-//! a = 2.855 Å, inferred from the Fig. 4 line of the paper, which states no
-//! lattice parameter. Each anneal frame is a separate `anneal` call of
-//! `sweeps_per_frame` sweeps with seed `seed + 2e9 + frame`, so the anneal
-//! differs from the single-call anneal used in R-0008.
 
 use std::env;
 use std::io::{self, BufWriter, Write};
 
-use okrates_core::{Simulation, Step};
+use okrates_core::{KmcRng, Simulation, Step, StreamRole};
 use okrates_models::bcc::BccLattice;
 use okrates_models::fecr::{FeCrModel, Species};
-use okrates_models::fecr_anneal::anneal;
+use okrates_models::fecr_anneal::KawasakiAnnealer;
 use okrates_models::fecr_martinez::{Martinez2012, params};
 
 const A: f64 = 2.855;
@@ -96,26 +88,45 @@ fn main() -> io::Result<()> {
         .unwrap_or_else(|e| fail(e));
     let mut out = BufWriter::new(io::stdout().lock());
 
-    let mut occupancy = model
-        .random_state(cr, seed + 1_000_000_000)
+    let mut init_rng = KmcRng::for_replica(seed, 0, StreamRole::InitialState);
+    let initial = model
+        .random_state_with_rng(cr, &mut init_rng)
         .unwrap_or_else(|e| fail(e))
         .occupancy()
         .to_vec();
-    frame(&mut out, &lattice, &occupancy, "anneal", 0, 0.0, [0; 3])?;
+    frame(&mut out, &lattice, &initial, "anneal", 0, 0.0, [0; 3])?;
+
+    let mut annealer = KawasakiAnnealer::new(
+        &model,
+        initial,
+        KmcRng::for_replica(seed, 0, StreamRole::Equilibration),
+    )
+    .unwrap_or_else(|e| fail(e));
+
     let mut done = 0;
-    let mut index = 0;
     while done < sweeps {
         let n = per_frame.min(sweeps - done);
-        occupancy = anneal(&model, occupancy, n, seed + 2_000_000_000 + index)
-            .unwrap_or_else(|e| fail(e))
-            .occupancy;
+        annealer.run_sweeps(&model, n).unwrap_or_else(|e| fail(e));
         done += n;
-        index += 1;
-        frame(&mut out, &lattice, &occupancy, "anneal", done, 0.0, [0; 3])?;
+        frame(
+            &mut out,
+            &lattice,
+            annealer.occupancy(),
+            "anneal",
+            done,
+            0.0,
+            [0; 3],
+        )?;
     }
 
-    let state = model.state(occupancy).unwrap_or_else(|e| fail(e));
-    let mut sim = Simulation::new(model, state, seed);
+    let state = model
+        .state(annealer.finish().occupancy)
+        .unwrap_or_else(|e| fail(e));
+    let mut sim = Simulation::with_rng(
+        model,
+        state,
+        KmcRng::for_replica(seed, 0, StreamRole::Dynamics),
+    );
     for jump in 1..=jumps {
         match sim.step().unwrap_or_else(|e| fail(e)) {
             Step::Fired { .. } => {}

@@ -146,90 +146,6 @@ fn composition_is_conserved() {
     }
 }
 
-fn ln_gamma(z: f64) -> f64 {
-    const G: f64 = 7.0;
-    const C: [f64; 9] = [
-        0.999_999_999_999_809_9,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-    if z < 0.5 {
-        return (std::f64::consts::PI / (std::f64::consts::PI * z).sin()).ln() - ln_gamma(1.0 - z);
-    }
-    let z = z - 1.0;
-    let mut sum = C[0];
-    for (i, c) in C.iter().enumerate().skip(1) {
-        sum += c / (z + i as f64);
-    }
-    let t = z + G + 0.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + sum.ln()
-}
-
-/// Regularized upper incomplete gamma function Q(a, x).
-fn gamma_q(a: f64, x: f64) -> f64 {
-    if x <= 0.0 {
-        return 1.0;
-    }
-    if x < a + 1.0 {
-        let mut term = 1.0;
-        let mut sum = 1.0;
-        let mut n = 1.0;
-        while term > sum * 1e-17 {
-            term *= x / (a + n);
-            sum += term;
-            n += 1.0;
-        }
-        let p = (a * x.ln() - x - ln_gamma(a + 1.0) + sum.ln()).exp();
-        1.0 - p
-    } else {
-        const TINY: f64 = 1e-300;
-        let mut b = x + 1.0 - a;
-        let mut c = 1.0 / TINY;
-        let mut d = 1.0 / b;
-        let mut h = d;
-        for i in 1..1000 {
-            let an = -(i as f64) * (i as f64 - a);
-            b += 2.0;
-            d = an * d + b;
-            if d.abs() < TINY {
-                d = TINY;
-            }
-            c = b + an / c;
-            if c.abs() < TINY {
-                c = TINY;
-            }
-            d = 1.0 / d;
-            let delta = d * c;
-            h *= delta;
-            if (delta - 1.0).abs() < 1e-16 {
-                break;
-            }
-        }
-        (a * x.ln() - x - ln_gamma(a)).exp() * h
-    }
-}
-
-/// Upper `alpha` quantile of the chi-square distribution with `df` degrees of freedom.
-fn chi2_upper_quantile(df: usize, alpha: f64) -> f64 {
-    let a = df as f64 / 2.0;
-    let (mut lo, mut hi) = (0.0, 1000.0);
-    for _ in 0..200 {
-        let mid = 0.5 * (lo + hi);
-        if gamma_q(a, mid / 2.0) > alpha {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    0.5 * (lo + hi)
-}
-
 #[test]
 fn chi2_quantile_matches_textbook() {
     for (df, alpha, expected) in [
@@ -237,12 +153,116 @@ fn chi2_quantile_matches_textbook() {
         (3, 0.05, 7.814727903251178),
         (3, 1e-6, 30.6648497062136),
     ] {
-        let got = chi2_upper_quantile(df, alpha);
+        let got = okrates_core::testing::chi2_upper_quantile(df, alpha);
         assert!(
             (got - expected).abs() <= 1e-6,
             "df {df}: {got} vs {expected}"
         );
     }
+}
+
+#[test]
+fn tabulated_energetics_detailed_balance_and_missing_env_error() {
+    use okrates_core::SimError;
+    use okrates_models::tabulated::TabulatedEnergetics;
+    use okrates_schema::{BarrierRecord, BarrierSet};
+
+    let records = vec![
+        BarrierRecord {
+            id: "fe_asym".to_string(),
+            migrating_species: "Fe".to_string(),
+            env_key: "cr_atom=0,cr_vac=1".to_string(),
+            forward_barrier_ev: 0.62,
+            reverse_barrier_ev: 0.68,
+            delta_energy_ev: -0.06,
+            attempt_frequency_hz: 1.0e13,
+            reverse_attempt_frequency_hz: None,
+            barrier_std_ev: Some(0.01),
+            temp_range_k: Some([300.0, 1200.0]),
+            provenance: None,
+        },
+        BarrierRecord {
+            id: "fe_default".to_string(),
+            migrating_species: "Fe".to_string(),
+            env_key: "*".to_string(),
+            forward_barrier_ev: 0.65,
+            reverse_barrier_ev: 0.65,
+            delta_energy_ev: 0.0,
+            attempt_frequency_hz: 1.0e13,
+            reverse_attempt_frequency_hz: None,
+            barrier_std_ev: None,
+            temp_range_k: Some([300.0, 1200.0]),
+            provenance: None,
+        },
+        BarrierRecord {
+            id: "cr_default".to_string(),
+            migrating_species: "Cr".to_string(),
+            env_key: "*".to_string(),
+            forward_barrier_ev: 0.58,
+            reverse_barrier_ev: 0.58,
+            delta_energy_ev: 0.0,
+            attempt_frequency_hz: 1.2e13,
+            reverse_attempt_frequency_hz: None,
+            barrier_std_ev: None,
+            temp_range_k: Some([300.0, 1200.0]),
+            provenance: None,
+        },
+    ];
+    let set = BarrierSet::new("test_fecr", 1e-9, records).unwrap();
+    let energetics = TabulatedEnergetics::new(set).unwrap();
+    let m = FeCrModel::new(
+        BccLattice::new([3, 3, 3]).unwrap(),
+        energetics,
+        ATTEMPT_FREQUENCY,
+        TEMPERATURE_K,
+    )
+    .unwrap();
+    let kt = m.kt();
+    let state = m.random_state(5, 77).unwrap();
+    for d in 0..8 {
+        let kf = m.rate(&state, d);
+        let target = m.lattice().neighbor(state.vacancy(), d);
+        let de =
+            m.energetics()
+                .exchange_delta(m.lattice(), state.occupancy(), state.vacancy(), target);
+        let mut after = state.clone();
+        m.apply(&mut after, &FeCrJump { direction: d }).unwrap();
+        let kr = m.rate(&after, 7 - d);
+        assert!(((kf / kr).ln() + de / kt).abs() <= 1e-12);
+    }
+
+    // Missing Cr record surfaces SimError::InvalidRate without panicking.
+    let fe_only = BarrierSet::new(
+        "fe_only",
+        1e-9,
+        vec![BarrierRecord {
+            id: "fe_default".to_string(),
+            migrating_species: "Fe".to_string(),
+            env_key: "*".to_string(),
+            forward_barrier_ev: 0.65,
+            reverse_barrier_ev: 0.65,
+            delta_energy_ev: 0.0,
+            attempt_frequency_hz: 1.0e13,
+            reverse_attempt_frequency_hz: None,
+            barrier_std_ev: None,
+            temp_range_k: None,
+            provenance: None,
+        }],
+    )
+    .unwrap();
+    let incomplete = FeCrModel::new(
+        BccLattice::new([2, 2, 2]).unwrap(),
+        TabulatedEnergetics::new(fe_only).unwrap(),
+        ATTEMPT_FREQUENCY,
+        TEMPERATURE_K,
+    )
+    .unwrap();
+    let mut occ = vec![Species::Cr; 16];
+    occ[0] = Species::Vacancy;
+    let init = incomplete.state(occ).unwrap();
+    let mut sim = Simulation::new(incomplete, init.clone(), 1);
+    assert!(matches!(sim.step(), Err(SimError::InvalidRate { .. })));
+    assert_eq!(sim.state(), &init);
 }
 
 /// Runs `replicas` replicas started from the Boltzmann distribution and applies
@@ -362,7 +382,7 @@ fn equilibrium_chi2(base_seed: u64, replicas: u64) {
         println!("group {g}: observed {} expected {expected:.3}", observed[g]);
     }
     let df = groups - 1;
-    let critical = chi2_upper_quantile(df, ALPHA);
+    let critical = okrates_core::testing::chi2_upper_quantile(df, ALPHA);
     println!("chi2={chi2:.6} df={df} critical={critical:.6} groups={groups} t_s={t_s:.6e}");
     assert!(chi2 <= critical, "chi2 = {chi2}, critical = {critical}");
 }

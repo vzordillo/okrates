@@ -1,17 +1,15 @@
 //! Validates displacement tracking and the diffusion estimators of the Fe–Cr model.
 
 use okrates_core::ensemble::run_replicas;
-use okrates_core::{Simulation, Step};
+use okrates_core::{KmcRng, Simulation, Step};
 use okrates_models::bcc::{BccLattice, DISPLACEMENTS};
 use okrates_models::fecr::{FeCrModel, PairEnergetics, Species};
 use okrates_models::fecr_diffusion::{
-    ReplicaEstimate, estimate, mean_se, origin_slope, sample_run,
+    ReplicaEstimate, TransportConfig, build_fecr_manifest, estimate, jackknife_ratio_mean_se,
+    mean_se, origin_slope, run_transport, sample_run, summarize,
 };
 
-/// Offset between a replica's dynamics seed and its `random_state` seed, so that
-/// the initial labels are independent of the dynamics stream.
 const STATE_SEED_OFFSET: u64 = 1_000_000_000;
-
 const Z_CRIT: f64 = 4.89163847569859;
 const M: u64 = 2000;
 
@@ -57,7 +55,6 @@ fn tracking_invariants_hold_after_every_event() {
         assert_eq!(sim.model().check_invariants(state), Ok(()));
         let shift = DISPLACEMENTS[event.direction];
         let new_vacancy = state.vacancy();
-        // Entity bookkeeping: the vacancy entity was on `old_vacancy`, the atom on `new_vacancy`.
         assert_eq!(
             sub(state.vacancy_displacement(), before[old_vacancy]),
             shift
@@ -89,16 +86,14 @@ fn tracking_invariants_hold_after_every_event() {
 fn gate(name: &str, values: &[f64]) {
     let (mean, se) = mean_se(values);
     let z = mean / se;
-    println!("{name}: mean={mean:.9e} se={se:.9e} z={z:.6}");
     assert!(z.abs() <= Z_CRIT, "{name}: z = {z}, threshold = {Z_CRIT}");
 }
 
-/// Runs `m` equal-energy replicas to `t_end` and applies gates G1, G2 and the sum rule.
 fn equal_energy_estimates(base_seed: u64, m: u64, t_end: f64) -> Vec<ReplicaEstimate> {
     let model = equal_energy_model();
     let estimates: Vec<ReplicaEstimate> = run_replicas(base_seed, m, |_, seed| {
         let state = model.random_state(63, seed + STATE_SEED_OFFSET).unwrap();
-        let (times, samples, _) = sample_run(model.clone(), state, seed, t_end, 10, 1.0);
+        let (times, samples, _) = sample_run(model.clone(), state, seed, t_end, 10, 1.0).unwrap();
         estimate(&times, &samples, origin_slope)
     })
     .unwrap()
@@ -160,14 +155,12 @@ fn equal_energy_limit_gates() {
         mean(&|e| e.collective[1]),
         mean(&|e| e.collective[2]),
     );
-    println!("Lambda mean: FeFe={ff:.9e} FeCr={fc:.9e} CrCr={cc:.9e}");
     let trace = ff + cc;
     let det = ff * cc - fc * fc;
     assert!(ff >= 0.0 && cc >= 0.0, "negative diagonal");
     assert!(det >= -1e-9 * trace * trace, "det = {det}, trace = {trace}");
 }
 
-/// Runs `m` pure-Fe replicas for about `hops` vacancy jumps each and applies gate G5.
 fn pure_fe_vacancy(base_seed: u64, m: u64, hops: f64) {
     let model = FeCrModel::new(
         BccLattice::new([4, 4, 4]).unwrap(),
@@ -188,7 +181,7 @@ fn pure_fe_vacancy(base_seed: u64, m: u64, hops: f64) {
     let t_end = hops / (8.0 * r);
     let estimates: Vec<ReplicaEstimate> = run_replicas(base_seed, m, |_, seed| {
         let state = model.random_state(0, seed + STATE_SEED_OFFSET).unwrap();
-        let (times, samples, _) = sample_run(model.clone(), state, seed, t_end, 10, 1.0);
+        let (times, samples, _) = sample_run(model.clone(), state, seed, t_end, 10, 1.0).unwrap();
         estimate(&times, &samples, origin_slope)
     })
     .unwrap()
@@ -216,4 +209,50 @@ fn pure_fe_vacancy_smoke() {
 #[ignore = "full tier: statistical"]
 fn pure_fe_vacancy_gate() {
     pure_fe_vacancy(20261119, M, 1000.0);
+}
+
+#[test]
+fn jackknife_ratio_eliminates_per_replica_jensen_bias() {
+    // True E[u] = 0.727, E[v] = 1.0 with independent exponential draws:
+    // per-replica u_i / v_i has divergent/huge positive Jensen bias from 1/v_i,
+    // whereas ratio-of-means + jackknife SE concentrates cleanly around 0.727.
+    let mut rng = KmcRng::from_seed(12345);
+    let n = 2000;
+    let mut u = Vec::with_capacity(n);
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        u.push(-0.727 * rng.open01().ln());
+        v.push(-rng.open01().ln());
+    }
+    let (ratio, se) = jackknife_ratio_mean_se(&u, &v, 1.0);
+    assert!(((ratio - 0.727) / se).abs() <= 4.0, "ratio={ratio} se={se}");
+
+    let naive_per_replica: Vec<f64> = u.iter().zip(&v).map(|(a, b)| a / b).collect();
+    let (naive_mean, _) = mean_se(&naive_per_replica);
+    assert!(
+        naive_mean > 1.5,
+        "naive mean {naive_mean} should exhibit Jensen bias"
+    );
+
+    // Single zero-displacement replica does not poison the ensemble ratio.
+    let (r_zero, se_zero) = jackknife_ratio_mean_se(&[0.0, 0.7, 0.8], &[0.0, 1.0, 1.0], 1.0);
+    assert!((r_zero - 0.75).abs() < 1e-12);
+    assert!(se_zero.is_finite() && se_zero > 0.0);
+}
+
+#[test]
+fn windowed_ols_transport_handles_u64_max_seed_and_builds_manifest() {
+    let model = equal_energy_model();
+    let cfg = TransportConfig::windowed(5.0, 25.0, 8, 1.0);
+    let runs = run_transport(&model, 32, u64::MAX, 4, &cfg, 2).unwrap();
+    assert_eq!(runs.len(), 4);
+    assert!(runs.iter().all(|r| r.final_sro_alpha1.is_some()));
+    let summary = summarize(&runs, 32, 127);
+    assert!(summary.f.0.is_finite() && summary.f.1.is_finite());
+    assert!(summary.window_drift_ratio.is_finite());
+
+    let manifest = build_fecr_manifest(&model, [4, 4, 4], 32, 1000.0, u64::MAX, 4, &cfg, 2, None);
+    let json = manifest.to_json_pretty().unwrap();
+    let decoded = okrates_schema::RunManifest::from_json(&json).unwrap();
+    assert_eq!(decoded, manifest);
 }

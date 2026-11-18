@@ -1,23 +1,70 @@
-//! The model contract for state, rates, and transitions.
+//! Core model and reversible transition contracts.
 
-/// A kinetic Monte Carlo model.
+use std::error::Error;
+
+/// Baseline KMC model contract: enumerates `(event, rate)` pairs and applies transitions.
 ///
-/// The engine owns sampling, the clock, and the lifecycle; the model owns
-/// state, legality, rates, and transitions. The event catalog is rebuilt
-/// from scratch every step as the baseline; incremental updates come later.
+/// Rates are in inverse time units; zero-rate events are ignored by the engine.
 pub trait Model {
-    /// The model's mutable simulation state.
     type State;
-    /// An event that can be applied to the state.
     type Event;
-    /// An error returned when applying an event fails.
-    type Error: std::error::Error;
+    type Error: Error;
 
-    /// Emit every currently possible event with its rate (inverse time units).
-    ///
-    /// The engine validates each rate; zero-rate events are ignored.
     fn enumerate_events(&self, state: &Self::State, emit: &mut dyn FnMut(Self::Event, f64));
 
-    /// Execute `event` on `state`.
     fn apply(&self, state: &mut Self::State, event: &Self::Event) -> Result<(), Self::Error>;
+}
+
+/// Extension of [`Model`] with an `O(1)` rollback token so post-transition catalog
+/// validation failures leave `state` bitwise unchanged.
+pub trait ReversibleModel: Model {
+    type Undo;
+
+    fn apply_reversible(
+        &self,
+        state: &mut Self::State,
+        event: &Self::Event,
+    ) -> Result<Self::Undo, Self::Error>;
+
+    fn undo(&self, state: &mut Self::State, undo: Self::Undo);
+}
+
+/// Adapter supplying [`ReversibleModel`] for any [`Model`] whose `State: Clone`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CloneRollback<M>(pub M);
+
+impl<M: Model> Model for CloneRollback<M> {
+    type State = M::State;
+    type Event = M::Event;
+    type Error = M::Error;
+
+    fn enumerate_events(&self, state: &Self::State, emit: &mut dyn FnMut(Self::Event, f64)) {
+        self.0.enumerate_events(state, emit);
+    }
+
+    fn apply(&self, state: &mut Self::State, event: &Self::Event) -> Result<(), Self::Error> {
+        self.0.apply(state, event)
+    }
+}
+
+impl<M> ReversibleModel for CloneRollback<M>
+where
+    M: Model,
+    M::State: Clone,
+{
+    type Undo = M::State;
+
+    fn apply_reversible(
+        &self,
+        state: &mut Self::State,
+        event: &Self::Event,
+    ) -> Result<Self::Undo, Self::Error> {
+        let snapshot = state.clone();
+        self.0.apply(state, event)?;
+        Ok(snapshot)
+    }
+
+    fn undo(&self, state: &mut Self::State, undo: Self::Undo) {
+        *state = undo;
+    }
 }

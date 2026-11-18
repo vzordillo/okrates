@@ -1,6 +1,6 @@
 {
-  "source": "E. Martinez, O. Senninger, C.-C. Fu, F. Soisson, Phys. Rev. B 86, 224109 (2012), DOI 10.1103/PhysRevB.86.224109. Local PDF papers/Martinez_2012_Decomposition_kinetics_of_Fe-Cr_solid_solutions_during_thermal_aging.pdf. Omega(x) from M. Levesque et al., arXiv:1307.7561v1 (29 Jul 2013; no journal reference printed in the PDF).",
-  "extraction": "Table I read from a 150-dpi render of p.4 (pdftotext garbles it); Table II from p.6. Second independent transcription (Sonnet pass, scratchpad check/second_extraction.json) matched every value; see fecr-dft-sources.md section 0.",
+  "source": "E. Martinez, O. Senninger, C.-C. Fu, F. Soisson, Phys. Rev. B 86, 224109 (2012), DOI 10.1103/PhysRevB.86.224109; Omega(x) from M. Levesque et al., arXiv:1307.7561v1.",
+  "extraction": "Transcribed from Martinez et al. (2012) Tables I (p.4) and II (p.6) and Levesque et al. Table I (p.6).",
   "units": "energies eV, entropies k_B, temperatures K, frequencies s^-1",
   "coordination": {"z1": 8, "z2": 6, "loc": "p.3, after Eq. (7)"},
   "shell_ratio": {"h2_over_h1": 0.5, "s2_over_s1": 0.5, "loc": "Table I caption (the text on p.2 garbles it as '12', i.e. 1/2)"},
@@ -47,7 +47,7 @@
     "definition": "c(Fe_i Cr_j) = [sum_{n=0..r} sum_k p_ik + sum_{n=0..r} sum_k p_jk] / (2 sum_{n=0..r} z(n)), z(0)=1, r=2 -> denominator 30; p=1 if site holds Cr; sites i and j themselves included"
   },
   "targets": {
-    "note": "Paper-reported values used only for comparison by replicate.py.",
+    "note": "Paper-reported reference values for validation.",
     "table_II": {
       "loc": "Martinez Table II, p.6",
       "Fe_SIESTA": {"H0": 0.69, "H2": 0.57, "H3": 0.64, "H3'": 0.69, "H3''": 0.67, "H4": 0.66, "H4'": 0.65, "H4''": 0.66, "H5": 0.74, "H6": 0.74},

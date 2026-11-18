@@ -1,4 +1,4 @@
-"""Rust/Python parity and error tests for the okrates bindings (plan §7 item 10)."""
+"""Rust/Python parity and error tests for single-vacancy bindings."""
 
 import subprocess
 from pathlib import Path

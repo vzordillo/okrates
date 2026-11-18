@@ -1,38 +1,151 @@
-//! Diffusion observables and estimators for the single-vacancy Fe–Cr model.
+//! Transport observables and statistical estimators for the single-vacancy Fe–Cr model.
 //!
-//! Tracer coefficients are D*_α = slope(Σ_α |Δr|² / N_α)/6 and the vacancy
-//! coefficient is D_v = slope(|ΔR_v|²)/6. The collective coefficient per vacancy
-//! is Λ_αβ = slope(ΔR_α·ΔR_β)/6, where ΔR_α is the summed displacement of all
-//! atoms of species α. It is related to the Onsager coefficient by
-//! Λ = L·k_B·T·Ω/c_v with the vacancy concentration c_v = 1/N; details are in the
-//! local theory notes.
+//! Tracer coefficients are `D*_a = slope(Sum_a |dr|^2 / N_a) / 6`, vacancy diffusivity
+//! is `D_v = slope(|dR_v|^2) / 6`, and collective Onsager-related coefficients per vacancy
+//! (`Lambda = L k_B T Omega / c_v`, `c_v = 1/N`) are `Lambda_ab = slope(dR_a . dR_b) / 6`.
+//! The correlation factor `f = N_atoms * mean(D*_all) / mean(D_v)` is estimated as a ratio
+//! of ensemble means with delete-1 jackknife standard error.
 
-use okrates_core::ensemble::run_replicas;
-use okrates_core::{Simulation, Step};
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::error::Error;
+use std::fmt;
+
+use okrates_core::{
+    AbsorptionPolicy, Checkpointable, GridError, SampleGrid, SampledTrajectory, SamplingError,
+    Simulation, StreamRole, run_ensemble, sample_trajectory,
+};
+use okrates_schema::{Conditions, EstimatorSpec, RngPolicy, RunManifest};
 
 use crate::fecr::{Energetics, FeCrError, FeCrModel, FeCrState, Species};
-use crate::fecr_anneal::anneal;
+use crate::fecr_anneal::KawasakiAnnealer;
 
-/// Offset between a replica's dynamics seed and its `random_state` seed, so that
-/// the initial labels are independent of the dynamics stream.
-pub const STATE_SEED_OFFSET: u64 = 1_000_000_000;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FitMethod {
+    #[default]
+    WindowedOls,
+    OriginSlope,
+}
 
-/// Offset between a replica's dynamics seed and its pre-anneal seed.
-pub const ANNEAL_SEED_OFFSET: u64 = 2_000_000_000;
+impl FitMethod {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::WindowedOls => "windowed_ols",
+            Self::OriginSlope => "origin_slope",
+        }
+    }
+}
 
-/// Squared and dot-product observables of one Fe–Cr state, computed in (a/2)² integer
-/// units, converted to `f64` and multiplied by a²/4.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransportConfig {
+    pub t_equil: f64,
+    pub t_end: f64,
+    pub sample_count: usize,
+    pub lattice_parameter: f64,
+    pub fit_method: FitMethod,
+    pub max_steps: Option<u64>,
+}
+
+impl TransportConfig {
+    pub fn windowed(t_equil: f64, t_end: f64, sample_count: usize, lattice_parameter: f64) -> Self {
+        Self {
+            t_equil,
+            t_end,
+            sample_count,
+            lattice_parameter,
+            fit_method: FitMethod::WindowedOls,
+            max_steps: None,
+        }
+    }
+
+    pub fn from_origin(t_end: f64, sample_count: usize, lattice_parameter: f64) -> Self {
+        Self {
+            t_equil: 0.0,
+            t_end,
+            sample_count,
+            lattice_parameter,
+            fit_method: FitMethod::OriginSlope,
+            max_steps: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum TransportError {
+    Model(FeCrError),
+    InvalidLatticeParameter(f64),
+    InsufficientSamples {
+        fit_method: FitMethod,
+        sample_count: usize,
+    },
+    InsufficientReplicas(u64),
+    Sampling(SamplingError<Infallible>),
+}
+
+impl fmt::Display for TransportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Model(err) => write!(f, "{err}"),
+            Self::InvalidLatticeParameter(a) => {
+                write!(f, "lattice_parameter must be finite and positive, got {a}")
+            }
+            Self::InsufficientSamples {
+                fit_method,
+                sample_count,
+            } => write!(
+                f,
+                "fit method {} requires more samples than {sample_count}",
+                fit_method.name()
+            ),
+            Self::InsufficientReplicas(runs) => {
+                write!(
+                    f,
+                    "ensemble summary requires at least 2 replicas, got {runs}"
+                )
+            }
+            Self::Sampling(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl Error for TransportError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Model(err) => Some(err),
+            Self::Sampling(err) => Some(err),
+            Self::InvalidLatticeParameter(_)
+            | Self::InsufficientSamples { .. }
+            | Self::InsufficientReplicas(_) => None,
+        }
+    }
+}
+
+impl From<FeCrError> for TransportError {
+    fn from(err: FeCrError) -> Self {
+        Self::Model(err)
+    }
+}
+
+impl From<SamplingError<Infallible>> for TransportError {
+    fn from(err: SamplingError<Infallible>) -> Self {
+        Self::Sampling(err)
+    }
+}
+
+impl From<GridError> for TransportError {
+    fn from(err: GridError) -> Self {
+        Self::Sampling(SamplingError::Grid(err))
+    }
+}
+
+/// Squared and collective dot-product displacements in `lattice_parameter^2` units.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Observables {
-    /// `[Σ_Fe |Δr|² / N_Fe, Σ_Cr |Δr|² / N_Cr]`; 0.0 when that species count is 0.
     pub tracer: [f64; 2],
-    /// Σ over all atoms of |Δr|² divided by the number of atoms.
     pub tracer_all: f64,
-    /// `[ΔR_Fe·ΔR_Fe, ΔR_Fe·ΔR_Cr, ΔR_Cr·ΔR_Cr]`.
+    /// `[dR_Fe.dR_Fe, dR_Fe.dR_Cr, dR_Cr.dR_Cr]`.
     pub collective: [f64; 3],
-    /// Σ over all atoms of |Δr|².
     pub s: f64,
-    /// |ΔR_v|², the squared vacancy displacement.
     pub vacancy: f64,
 }
 
@@ -40,7 +153,6 @@ fn dot(a: [i64; 3], b: [i64; 3]) -> i64 {
     (0..3).map(|axis| a[axis] * b[axis]).sum()
 }
 
-/// Computes the [`Observables`] of `state` for lattice parameter `lattice_parameter`.
 pub fn observables(state: &FeCrState, lattice_parameter: f64) -> Observables {
     let scale = lattice_parameter * lattice_parameter / 4.0;
     let [n_fe, n_cr, _] = state.counts();
@@ -69,50 +181,48 @@ pub fn observables(state: &FeCrState, lattice_parameter: f64) -> Observables {
     }
 }
 
-/// Samples [`observables`] at t_k = k·`t_end`/`k_count`, k = 1..=`k_count`, using the value
-/// held before the first jump whose time exceeds t_k.
-///
-/// Returns the sample times, the samples and the number of fired steps.
-///
-/// # Panics
-///
-/// Panics if the simulation fails or is absorbed.
-pub fn sample_run<E: Energetics + Clone>(
+/// Lazily samples [`observables`] on `grid` without evaluating displacements on intermediate jumps.
+pub fn sample_fecr_run<E: Energetics>(
+    sim: &mut Simulation<FeCrModel<E>>,
+    grid: &SampleGrid,
+    lattice_parameter: f64,
+    max_steps: Option<u64>,
+) -> Result<SampledTrajectory<Observables>, TransportError> {
+    if !lattice_parameter.is_finite() || lattice_parameter <= 0.0 {
+        return Err(TransportError::InvalidLatticeParameter(lattice_parameter));
+    }
+    Ok(sample_trajectory(
+        sim,
+        grid,
+        max_steps,
+        AbsorptionPolicy::Error,
+        |_model, state| observables(state, lattice_parameter),
+    )?)
+}
+
+/// Samples [`observables`] at `t_k = k * t_end / k_count` (`k = 1..=k_count`), returning `(times, samples, fired_steps)`.
+pub fn sample_run<E: Energetics>(
     model: FeCrModel<E>,
     state: FeCrState,
     seed: u64,
     t_end: f64,
     k_count: usize,
     lattice_parameter: f64,
-) -> (Vec<f64>, Vec<Observables>, u64) {
+) -> Result<(Vec<f64>, Vec<Observables>, u64), TransportError> {
+    let grid = SampleGrid::from_origin(t_end, k_count)?;
     let mut sim = Simulation::new(model, state, seed);
-    let times: Vec<f64> = (1..=k_count)
-        .map(|k| k as f64 * t_end / k_count as f64)
-        .collect();
-    let mut samples = Vec::with_capacity(k_count);
-    let mut fired = 0_u64;
-    while samples.len() < k_count {
-        let held = observables(sim.state(), lattice_parameter);
-        match sim.step().expect("Fe-Cr events have valid rates") {
-            Step::Fired { .. } => fired += 1,
-            Step::Absorbed => panic!("Fe-Cr model unexpectedly absorbed"),
-        }
-        let t_after = sim.time();
-        while samples.len() < k_count && times[samples.len()] < t_after {
-            samples.push(held);
-        }
-    }
-    (times, samples, fired)
+    let traj = sample_fecr_run(&mut sim, &grid, lattice_parameter, None)?;
+    Ok((traj.times, traj.values, traj.fired_steps))
 }
 
-/// Returns the slope of a line through the origin, Σ t v / Σ t².
+/// Through-origin slope `Sum(t_i v_i) / Sum(t_i^2)`.
 pub fn origin_slope(times: &[f64], values: &[f64]) -> f64 {
     let num: f64 = times.iter().zip(values).map(|(t, v)| t * v).sum();
     let den: f64 = times.iter().map(|t| t * t).sum();
     num / den
 }
 
-/// Returns the ordinary least-squares slope of a line with intercept.
+/// Ordinary least-squares slope with free intercept.
 pub fn ols_slope(times: &[f64], values: &[f64]) -> f64 {
     let n = times.len() as f64;
     let mean_t = times.iter().sum::<f64>() / n;
@@ -126,7 +236,7 @@ pub fn ols_slope(times: &[f64], values: &[f64]) -> f64 {
     num / den
 }
 
-/// Returns the sample mean and its standard error sd/√n, with sd using n − 1.
+/// Sample mean and standard error `s / sqrt(n)` with Bessel correction `n - 1`.
 pub fn mean_se(values: &[f64]) -> (f64, f64) {
     let n = values.len() as f64;
     let mean = values.iter().sum::<f64>() / n;
@@ -134,22 +244,45 @@ pub fn mean_se(values: &[f64]) -> (f64, f64) {
     (mean, (variance / n).sqrt())
 }
 
-/// Per-replica estimates; every entry is a slope of the named quantity divided by 6.
+/// Ratio-of-means `scale * mean(u) / mean(v)` and delete-1 jackknife standard error.
+pub fn jackknife_ratio_mean_se(numerators: &[f64], denominators: &[f64], scale: f64) -> (f64, f64) {
+    let r = numerators.len();
+    if r == 0 || r != denominators.len() {
+        return (f64::NAN, f64::NAN);
+    }
+    let sum_u: f64 = numerators.iter().sum();
+    let sum_v: f64 = denominators.iter().sum();
+    if sum_v == 0.0 || !sum_u.is_finite() || !sum_v.is_finite() {
+        return (f64::NAN, f64::NAN);
+    }
+    let ratio = scale * (sum_u / sum_v);
+    if r < 2 {
+        return (ratio, f64::NAN);
+    }
+    let mut loo = Vec::with_capacity(r);
+    for (&u, &v) in numerators.iter().zip(denominators) {
+        let den_minus = sum_v - v;
+        if den_minus == 0.0 {
+            return (ratio, f64::NAN);
+        }
+        loo.push(scale * ((sum_u - u) / den_minus));
+    }
+    let mean_loo = loo.iter().sum::<f64>() / r as f64;
+    let factor = (r - 1) as f64 / r as f64;
+    let var = factor * loo.iter().map(|&x| (x - mean_loo).powi(2)).sum::<f64>();
+    (ratio, var.sqrt())
+}
+
+/// Per-replica diffusivity estimates (`slope / 6`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReplicaEstimate {
-    /// D*_Fe and D*_Cr.
     pub tracer: [f64; 2],
-    /// D*_all.
     pub tracer_all: f64,
-    /// Λ_FeFe, Λ_FeCr, Λ_CrCr.
     pub collective: [f64; 3],
-    /// Slope of S divided by 6.
     pub s: f64,
-    /// The vacancy coefficient D_v.
     pub vacancy: f64,
 }
 
-/// Estimates every coefficient of one replica with the given `slope` fit.
 pub fn estimate(
     times: &[f64],
     samples: &[Observables],
@@ -172,33 +305,96 @@ pub fn estimate(
     }
 }
 
-/// The outcome of one replica of [`run_composition`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReplicaRun {
-    /// The coefficients estimated from the replica.
     pub estimate: ReplicaEstimate,
-    /// The number of fired steps.
+    pub early_tracer_all: Option<f64>,
+    pub late_tracer_all: Option<f64>,
     pub fired: u64,
-    /// Total configuration energy in eV after each anneal sweep (entry 0 is the
-    /// initial energy); empty when no anneal ran.
     pub anneal_energy: Vec<f64>,
+    pub final_sro_alpha1: Option<f64>,
 }
 
-/// Runs `runs` replicas of one composition with `cr_count` Cr atoms, seeds
-/// `seed_base`, `seed_base + 1`, ..., and returns them in replica order.
-///
-/// Each replica draws a random state with seed `seed + STATE_SEED_OFFSET`. If
-/// `anneal_sweeps > 0` it is annealed for that many sweeps with seed
-/// `seed + ANNEAL_SEED_OFFSET`. The dynamics then run through [`sample_run`] and
-/// the coefficients are fitted with [`origin_slope`].
-///
-/// # Errors
-///
-/// Returns the [`FeCrError`] of the first failing replica, such as too many atoms.
-///
-/// # Panics
-///
-/// Panics if the replica seeds overflow `u64`, or under the conditions of [`sample_run`].
+/// Runs `runs` parallel replicas using domain-separated [`StreamRole`] RNG substreams and `config`.
+pub fn run_transport<E: Energetics + Clone + Sync>(
+    model: &FeCrModel<E>,
+    cr_count: usize,
+    seed_base: u64,
+    runs: u64,
+    config: &TransportConfig,
+    anneal_sweeps: u64,
+) -> Result<Vec<ReplicaRun>, TransportError> {
+    if !config.lattice_parameter.is_finite() || config.lattice_parameter <= 0.0 {
+        return Err(TransportError::InvalidLatticeParameter(
+            config.lattice_parameter,
+        ));
+    }
+    let min_samples = match config.fit_method {
+        FitMethod::WindowedOls => 2,
+        FitMethod::OriginSlope => 1,
+    };
+    if config.sample_count < min_samples {
+        return Err(TransportError::InsufficientSamples {
+            fit_method: config.fit_method,
+            sample_count: config.sample_count,
+        });
+    }
+    if cr_count + 1 > model.lattice().site_count() {
+        return Err(TransportError::Model(FeCrError::TooManyAtoms));
+    }
+    let grid = SampleGrid::windowed(config.t_equil, config.t_end, config.sample_count)?;
+    let slope_fn: fn(&[f64], &[f64]) -> f64 = match config.fit_method {
+        FitMethod::WindowedOls => ols_slope,
+        FitMethod::OriginSlope => origin_slope,
+    };
+
+    run_ensemble(
+        seed_base,
+        runs,
+        |ctx| -> Result<ReplicaRun, TransportError> {
+            let mut init_rng = ctx.rng(StreamRole::InitialState);
+            let mut state = model.random_state_with_rng(cr_count, &mut init_rng)?;
+            let mut anneal_energy = Vec::new();
+            let mut final_sro_alpha1 = None;
+            if anneal_sweeps > 0 {
+                let mut annealer = KawasakiAnnealer::new(
+                    model,
+                    state.occupancy().to_vec(),
+                    ctx.rng(StreamRole::Equilibration),
+                )?;
+                annealer.run_sweeps(model, anneal_sweeps)?;
+                let a = annealer.finish();
+                final_sro_alpha1 = Some(a.diagnostics.final_sro_alpha1);
+                anneal_energy = a.energy;
+                state = model.state(a.occupancy)?;
+            }
+            let mut sim = Simulation::with_rng(model.clone(), state, ctx.rng(StreamRole::Dynamics));
+            let traj =
+                sample_fecr_run(&mut sim, &grid, config.lattice_parameter, config.max_steps)?;
+            let est = estimate(&traj.times, &traj.values, slope_fn);
+            let (early_tracer_all, late_tracer_all) = if traj.times.len() >= 4 {
+                let mid = traj.times.len() / 2;
+                let early = estimate(&traj.times[..mid], &traj.values[..mid], ols_slope).tracer_all;
+                let late = estimate(&traj.times[mid..], &traj.values[mid..], ols_slope).tracer_all;
+                (Some(early), Some(late))
+            } else {
+                (None, None)
+            };
+            Ok(ReplicaRun {
+                estimate: est,
+                early_tracer_all,
+                late_tracer_all,
+                fired: traj.fired_steps,
+                anneal_energy,
+                final_sro_alpha1,
+            })
+        },
+    )
+    .into_iter()
+    .collect()
+}
+
+/// Convenience wrapper running `runs` replicas on `[0, t_end]` with [`FitMethod::OriginSlope`].
 #[allow(clippy::too_many_arguments)]
 pub fn run_composition<E: Energetics + Clone + Sync>(
     model: &FeCrModel<E>,
@@ -209,67 +405,49 @@ pub fn run_composition<E: Energetics + Clone + Sync>(
     k_count: usize,
     lattice_parameter: f64,
     anneal_sweeps: u64,
-) -> Result<Vec<ReplicaRun>, FeCrError> {
-    run_replicas(seed_base, runs, |_, seed| {
-        let mut state = model.random_state(cr_count, seed + STATE_SEED_OFFSET)?;
-        let mut anneal_energy = Vec::new();
-        if anneal_sweeps > 0 {
-            let a = anneal(
-                model,
-                state.occupancy().to_vec(),
-                anneal_sweeps,
-                seed + ANNEAL_SEED_OFFSET,
-            )?;
-            state = model.state(a.occupancy)?;
-            anneal_energy = a.energy;
-        }
-        let (times, samples, fired) = sample_run(
-            model.clone(),
-            state,
-            seed,
-            t_end,
-            k_count,
-            lattice_parameter,
-        );
-        Ok(ReplicaRun {
-            estimate: estimate(&times, &samples, origin_slope),
-            fired,
-            anneal_energy,
-        })
-    })
-    .expect("seeds do not overflow")
-    .into_iter()
-    .map(|replica| replica.value)
-    .collect()
+) -> Result<Vec<ReplicaRun>, TransportError> {
+    let config = TransportConfig::from_origin(t_end, k_count, lattice_parameter);
+    run_transport(model, cr_count, seed_base, runs, &config, anneal_sweeps)
 }
 
-/// Means and standard errors, each `(mean, se)`, over the replicas of one composition.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Summary {
-    /// D_v.
     pub vacancy: (f64, f64),
-    /// D*_Fe and D*_Cr; Cr is `(NaN, NaN)` when there is no Cr.
     pub tracer: [(f64, f64); 2],
-    /// D*_all.
     pub tracer_all: (f64, f64),
-    /// Λ_FeFe, Λ_FeCr, Λ_CrCr.
     pub collective: [(f64, f64); 3],
-    /// The correlation factor `n_atoms · D*_all / D_v`, computed per replica.
+    /// Unbiased ratio-of-means `n_atoms * mean(D*_all) / mean(D_v)` and delete-1 jackknife SE.
     pub f: (f64, f64),
-    /// Mean number of fired steps per replica.
     pub mean_jumps: f64,
+    /// Relative drift `(mean_late - mean_early) / |mean_late|` of `D*_all` (`NaN` if `< 4` samples).
+    pub window_drift_ratio: f64,
 }
 
-/// Summarizes `runs` for a composition with `n_cr` Cr atoms among `n_atoms` atoms.
 pub fn summarize(runs: &[ReplicaRun], n_cr: usize, n_atoms: usize) -> Summary {
     let column = |f: &dyn Fn(&ReplicaEstimate) -> f64| {
         let values: Vec<f64> = runs.iter().map(|r| f(&r.estimate)).collect();
         mean_se(&values)
     };
-    let f_values: Vec<f64> = runs
+    let numerators: Vec<f64> = runs.iter().map(|r| r.estimate.tracer_all).collect();
+    let denominators: Vec<f64> = runs.iter().map(|r| r.estimate.vacancy).collect();
+    let window_drift_ratio = if runs
         .iter()
-        .map(|r| n_atoms as f64 * r.estimate.tracer_all / r.estimate.vacancy)
-        .collect();
+        .all(|r| r.early_tracer_all.is_some() && r.late_tracer_all.is_some())
+        && !runs.is_empty()
+    {
+        let mean_early =
+            runs.iter().filter_map(|r| r.early_tracer_all).sum::<f64>() / runs.len() as f64;
+        let mean_late =
+            runs.iter().filter_map(|r| r.late_tracer_all).sum::<f64>() / runs.len() as f64;
+        if mean_late.abs() > 0.0 {
+            (mean_late - mean_early) / mean_late.abs()
+        } else {
+            f64::NAN
+        }
+    } else {
+        f64::NAN
+    };
+
     Summary {
         vacancy: column(&|e| e.vacancy),
         tracer: [
@@ -286,7 +464,53 @@ pub fn summarize(runs: &[ReplicaRun], n_cr: usize, n_atoms: usize) -> Summary {
             column(&|e| e.collective[1]),
             column(&|e| e.collective[2]),
         ],
-        f: mean_se(&f_values),
+        f: jackknife_ratio_mean_se(&numerators, &denominators, n_atoms as f64),
         mean_jumps: runs.iter().map(|r| r.fired).sum::<u64>() as f64 / runs.len() as f64,
+        window_drift_ratio,
     }
+}
+
+/// Builds a [`RunManifest`] recording model parameter digest, optional barrier digest, RNG policy, and estimator config.
+#[allow(clippy::too_many_arguments)]
+pub fn build_fecr_manifest<M: Checkpointable>(
+    model: &M,
+    cells: [usize; 3],
+    cr_count: usize,
+    temperature_k: f64,
+    seed_base: u64,
+    runs: u64,
+    config: &TransportConfig,
+    anneal_sweeps: u64,
+    barrier_set_sha256: Option<String>,
+) -> RunManifest {
+    let mut encoded_params = Vec::new();
+    model.encode_params(&mut encoded_params);
+    let n_sites = 2 * cells[0] * cells[1] * cells[2];
+    let n_fe = n_sites.saturating_sub(cr_count + 1);
+    let mut composition = BTreeMap::new();
+    composition.insert("Fe".to_string(), n_fe);
+    composition.insert("Cr".to_string(), cr_count);
+    composition.insert("Vacancy".to_string(), 1);
+    let mut manifest = RunManifest::new(
+        M::MODEL_ID,
+        &encoded_params,
+        "direct",
+        RngPolicy::chacha12_substreams(seed_base),
+        Conditions {
+            cells,
+            lattice_parameter: config.lattice_parameter,
+            temperature_k,
+            composition,
+        },
+    );
+    manifest.barrier_set_sha256 = barrier_set_sha256;
+    manifest.estimator = Some(EstimatorSpec {
+        fit_method: config.fit_method.name().to_string(),
+        t_equil: config.t_equil,
+        t_end: config.t_end,
+        sample_count: config.sample_count,
+        replicas: runs,
+        anneal_sweeps,
+    });
+    manifest
 }

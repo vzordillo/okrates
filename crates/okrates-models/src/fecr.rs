@@ -1,39 +1,27 @@
-//! A single vacancy in a BCC Fe–Cr alloy with pluggable energetics and KRA barriers.
+//! Single-vacancy BCC Fe–Cr alloy model with pluggable energetics and KRA barriers.
 //!
-//! The vacancy exchanges with one of its eight nearest neighbours. The activation
-//! energy of a jump comes from [`Energetics::barrier`]. For [`PairEnergetics`] it is
-//! the kinetically resolved activation energy (KRA) of the migrating atom plus half
-//! the energy change of the exchange, so that forward and reverse rates satisfy
-//! detailed balance exactly.
-//!
-//! The energetics are supplied through the [`Energetics`] trait. [`PairEnergetics`]
-//! is a nearest-neighbour pair model. The values returned by
-//! [`PairEnergetics::illustrative`] are ILLUSTRATIVE: round numbers with no source,
-//! not DFT or literature values. They exist to exercise the model, not to describe
-//! any real alloy.
+//! [`PairEnergetics::illustrative`] provides round-number test parameters with no
+//! DFT or literature source; use [`crate::fecr_martinez::Martinez2012`] or
+//! [`crate::tabulated::TabulatedEnergetics`] for parameterized alloy studies.
 
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
-use okrates_core::{KmcRng, Model};
+use okrates_core::{Checkpointable, IncrementalModel, KmcRng, Model, ReversibleModel};
 
 use crate::bcc::{BccLattice, DISPLACEMENTS};
 use crate::vacancy::BOLTZMANN_EV_PER_K;
 
-/// The species occupying a lattice site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Species {
-    /// An iron atom.
     Fe,
-    /// A chromium atom.
     Cr,
-    /// The single vacancy.
     Vacancy,
 }
 
 impl Species {
-    /// Returns the species' index: Fe 0, Cr 1, Vacancy 2.
+    /// Index into symmetric 3×3 pair matrices (`Fe = 0`, `Cr = 1`, `Vacancy = 2`).
     pub fn index(self) -> usize {
         match self {
             Self::Fe => 0,
@@ -41,13 +29,34 @@ impl Species {
             Self::Vacancy => 2,
         }
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fe => "Fe",
+            Self::Cr => "Cr",
+            Self::Vacancy => "Vacancy",
+        }
+    }
+
+    pub(crate) fn to_byte(self) -> u8 {
+        self.index() as u8
+    }
+
+    pub(crate) fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Fe),
+            1 => Some(Self::Cr),
+            2 => Some(Self::Vacancy),
+            _ => None,
+        }
+    }
 }
 
-/// Energetics of a single-vacancy Fe–Cr configuration.
+/// Energetics contract (energies in eV, frequencies in s⁻¹) for single-vacancy Fe–Cr states.
 pub trait Energetics {
-    /// Total configuration energy in eV.
     fn total_energy(&self, lattice: &BccLattice, occupancy: &[Species]) -> f64;
-    /// E_after − E_before in eV for exchanging the vacancy at `vacancy_site` with the atom at its neighbour `atom_site`, computed locally.
+
+    /// Local `E_after - E_before` in eV for exchanging `vacancy_site` with neighbour `atom_site`.
     fn exchange_delta(
         &self,
         lattice: &BccLattice,
@@ -55,16 +64,16 @@ pub trait Energetics {
         vacancy_site: usize,
         atom_site: usize,
     ) -> f64;
-    /// E_after − E_before in eV for swapping the atoms on sites `i` and `j`, neither of which is the vacancy.
-    ///
-    /// The default recomputes [`total_energy`](Self::total_energy) before and after the swap.
+
+    /// `E_after - E_before` in eV for swapping non-vacancy sites `i` and `j`.
     fn swap_delta(&self, lattice: &BccLattice, occupancy: &[Species], i: usize, j: usize) -> f64 {
         let before = self.total_energy(lattice, occupancy);
         let mut after = occupancy.to_vec();
         after.swap(i, j);
         self.total_energy(lattice, &after) - before
     }
-    /// Activation energy in eV of the atom on `atom_site` jumping into the vacancy at `vacancy_site`.
+
+    /// Forward migration barrier in eV for `atom_site` jumping into `vacancy_site`.
     fn barrier(
         &self,
         lattice: &BccLattice,
@@ -72,19 +81,32 @@ pub trait Energetics {
         vacancy_site: usize,
         atom_site: usize,
     ) -> f64;
-    /// A per-species attempt frequency (prefactor) in s⁻¹; `None` means the model's attempt frequency is used.
+
+    /// Species-specific attempt frequency in s⁻¹ (`None` falls back to the model default).
     fn attempt_frequency(&self, atom: Species) -> Option<f64> {
         let _ = atom;
         None
     }
-    /// Checks the energetics against the model's lattice and temperature; called by [`FeCrModel::new`].
+
+    /// Environment-specific attempt frequency in s⁻¹; defaults to [`Self::attempt_frequency`].
+    fn jump_attempt_frequency(
+        &self,
+        lattice: &BccLattice,
+        occupancy: &[Species],
+        vacancy_site: usize,
+        atom_site: usize,
+    ) -> Option<f64> {
+        let _ = (lattice, vacancy_site);
+        self.attempt_frequency(occupancy[atom_site])
+    }
+
     fn validate(&self, lattice: &BccLattice, temperature_k: f64) -> Result<(), FeCrError> {
         let _ = (lattice, temperature_k);
         Ok(())
     }
 }
 
-/// A nearest-neighbour pair model with per-species KRA values.
+/// Nearest-neighbour pair model with kinetically resolved activation (KRA) barriers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PairEnergetics {
     pair: [[f64; 3]; 3],
@@ -93,7 +115,6 @@ pub struct PairEnergetics {
 }
 
 impl PairEnergetics {
-    /// Kinetically resolved activation energy of `atom` (Fe or Cr) in eV.
     pub fn kra(&self, atom: Species) -> f64 {
         match atom {
             Species::Fe => self.kra_fe,
@@ -101,7 +122,7 @@ impl PairEnergetics {
         }
     }
 
-    /// A bound B with |exchange_delta| ≤ B for every single-vacancy configuration in which `atom` jumps.
+    /// Upper bound `B` with `|exchange_delta| <= B` for any jump of `atom`.
     pub fn delta_bound(&self, atom: Species) -> f64 {
         let values = [self.d(atom, Species::Fe), self.d(atom, Species::Cr)];
         let max = values[0].max(values[1]);
@@ -109,8 +130,6 @@ impl PairEnergetics {
         7.0 * (max - min)
     }
 
-    /// Creates pair energetics from a symmetric pair-energy matrix (eV, indexed by
-    /// [`Species::index`]) and the Fe and Cr KRA values (eV).
     pub fn new(pair: [[f64; 3]; 3], kra_fe: f64, kra_cr: f64) -> Result<Self, FeCrError> {
         if pair.iter().flatten().any(|v| !v.is_finite())
             || !kra_fe.is_finite()
@@ -138,11 +157,7 @@ impl PairEnergetics {
         })
     }
 
-    /// Returns ILLUSTRATIVE energetics: round numbers with no source, not DFT or
-    /// literature values.
-    ///
-    /// Pair energies in eV: FeFe −0.60, CrCr −0.55, FeCr −0.56, FeV −0.20,
-    /// CrV −0.25, VV 0.0. KRA in eV: Fe 0.60, Cr 0.55.
+    /// Synthetic round-number parameters (eV) for testing only, not DFT/literature values.
     pub fn illustrative() -> Self {
         let (fe, cr, v) = (0, 1, 2);
         let mut pair = [[0.0; 3]; 3];
@@ -159,7 +174,6 @@ impl PairEnergetics {
         Self::new(pair, 0.60, 0.55).expect("illustrative energetics are valid")
     }
 
-    /// Returns the pair-energy matrix indexed by [`Species::index`].
     pub fn pair(&self) -> &[[f64; 3]; 3] {
         &self.pair
     }
@@ -251,38 +265,31 @@ impl Energetics for PairEnergetics {
     }
 }
 
-/// A vacancy jump along one of the eight BCC nearest-neighbour directions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FeCrJump {
-    /// The index into [`DISPLACEMENTS`](crate::bcc::DISPLACEMENTS).
     pub direction: usize,
 }
 
-/// The occupancy of every site of an Fe–Cr lattice with one vacancy.
+/// Lattice occupancy and per-entity unwrapped displacements (in `a/2` integer units).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FeCrState {
     occupancy: Vec<Species>,
     vacancy: usize,
-    /// Entity id on each site. Ids equal the initial site index.
     atom_at: Vec<usize>,
-    /// Initial site of each entity, indexed by entity id.
     origin: Vec<usize>,
-    /// Unwrapped displacement of each entity in half-lattice units, indexed by entity id.
     disp: Vec<[i64; 3]>,
 }
 
 impl FeCrState {
-    /// Returns the species at every lattice site.
     pub fn occupancy(&self) -> &[Species] {
         &self.occupancy
     }
 
-    /// Returns the vacancy's lattice site.
     pub fn vacancy(&self) -> usize {
         self.vacancy
     }
 
-    /// Returns the counts of Fe, Cr and vacancy sites, in that order.
+    /// Counts `[n_fe, n_cr, n_vacancy]`.
     pub fn counts(&self) -> [usize; 3] {
         let mut counts = [0; 3];
         for species in &self.occupancy {
@@ -291,17 +298,14 @@ impl FeCrState {
         counts
     }
 
-    /// Returns the unwrapped displacement of the vacancy in half-lattice units (a/2).
     pub fn vacancy_displacement(&self) -> [i64; 3] {
         self.disp[self.atom_at[self.vacancy]]
     }
 
-    /// Returns the unwrapped displacement (a/2 units) of the entity currently on `site`.
     pub fn displacement_of_site(&self, site: usize) -> [i64; 3] {
         self.disp[self.atom_at[site]]
     }
 
-    /// Returns the species and unwrapped displacement (a/2 units) of every atom, in site order.
     pub fn atom_displacements(&self) -> impl Iterator<Item = (Species, [i64; 3])> + '_ {
         self.occupancy
             .iter()
@@ -310,7 +314,6 @@ impl FeCrState {
             .map(|(site, &species)| (species, self.displacement_of_site(site)))
     }
 
-    /// Returns the summed unwrapped displacement (a/2 units) of all atoms of `species`.
     pub fn collective_displacement(&self, species: Species) -> [i64; 3] {
         let mut sum = [0; 3];
         for (s, d) in self.atom_displacements() {
@@ -323,7 +326,6 @@ impl FeCrState {
         sum
     }
 
-    /// Returns the sum of squared unwrapped displacements (a/2 units squared) of all atoms of `species`.
     pub fn tracer_squared_sum(&self, species: Species) -> i64 {
         self.atom_displacements()
             .filter(|&(s, _)| s == species)
@@ -332,7 +334,6 @@ impl FeCrState {
     }
 }
 
-/// A single-vacancy Fe–Cr exchange model on a periodic BCC lattice.
 #[derive(Clone, Debug)]
 pub struct FeCrModel<E: Energetics> {
     lattice: BccLattice,
@@ -342,9 +343,6 @@ pub struct FeCrModel<E: Energetics> {
 }
 
 impl<E: Energetics> FeCrModel<E> {
-    /// Creates a model; rejects non-positive attempt frequency or temperature and
-    /// energetics that fail [`Energetics::validate`] (for [`PairEnergetics`], KRA
-    /// values too small to keep every barrier non-negative).
     pub fn new(
         lattice: BccLattice,
         energetics: E,
@@ -366,22 +364,27 @@ impl<E: Energetics> FeCrModel<E> {
         })
     }
 
-    /// Returns the model's lattice.
     pub fn lattice(&self) -> &BccLattice {
         &self.lattice
     }
 
-    /// Returns the model's energetics.
     pub fn energetics(&self) -> &E {
         &self.energetics
     }
 
-    /// Returns k_B T in eV.
+    pub fn attempt_frequency(&self) -> f64 {
+        self.attempt_frequency
+    }
+
+    pub fn temperature_k(&self) -> f64 {
+        self.temperature_k
+    }
+
+    /// Thermal energy `k_B T` in eV.
     pub fn kt(&self) -> f64 {
         BOLTZMANN_EV_PER_K * self.temperature_k
     }
 
-    /// Creates a state from an occupancy vector with exactly one vacancy.
     pub fn state(&self, occupancy: Vec<Species>) -> Result<FeCrState, FeCrError> {
         let expected = self.lattice.site_count();
         if occupancy.len() != expected {
@@ -408,13 +411,20 @@ impl<E: Energetics> FeCrModel<E> {
         })
     }
 
-    /// Creates a reproducible random state with one vacancy and `cr_count` Cr atoms.
     pub fn random_state(&self, cr_count: usize, seed: u64) -> Result<FeCrState, FeCrError> {
+        let mut rng = KmcRng::from_seed(seed);
+        self.random_state_with_rng(cr_count, &mut rng)
+    }
+
+    pub fn random_state_with_rng(
+        &self,
+        cr_count: usize,
+        rng: &mut KmcRng,
+    ) -> Result<FeCrState, FeCrError> {
         let n = self.lattice.site_count();
         if cr_count + 1 > n {
             return Err(FeCrError::TooManyAtoms);
         }
-        let mut rng = KmcRng::from_seed(seed);
         let mut order: Vec<usize> = (0..n).collect();
         for i in 0..cr_count + 1 {
             let j = i + ((rng.open01() * (n - i) as f64) as usize).min(n - i - 1);
@@ -428,28 +438,26 @@ impl<E: Energetics> FeCrModel<E> {
         self.state(occupancy)
     }
 
-    /// Returns the activation energy in eV of the jump along `direction`.
     pub fn barrier(&self, state: &FeCrState, direction: usize) -> f64 {
         let target = self.lattice.neighbor(state.vacancy, direction);
         self.energetics
             .barrier(&self.lattice, &state.occupancy, state.vacancy, target)
     }
 
-    /// Returns the jump rate in s⁻¹ along `direction`.
-    ///
-    /// The model's attempt frequency is ignored for species where the energetics supply one.
+    /// Jump rate in s⁻¹ along `direction`; returns `NaN` if the energetics produce a non-finite barrier.
     pub fn rate(&self, state: &FeCrState, direction: usize) -> f64 {
         let target = self.lattice.neighbor(state.vacancy, direction);
-        let atom = state.occupancy[target];
         let nu = self
             .energetics
-            .attempt_frequency(atom)
+            .jump_attempt_frequency(&self.lattice, &state.occupancy, state.vacancy, target)
             .unwrap_or(self.attempt_frequency);
-        nu * (-self.barrier(state, direction) / self.kt()).exp()
+        let b = self.barrier(state, direction);
+        if !nu.is_finite() || nu <= 0.0 || !b.is_finite() {
+            return f64::NAN;
+        }
+        nu * (-b / self.kt()).exp()
     }
 
-    /// Checks occupancy length, vacancy count, the vacancy field, that displacements
-    /// sum to zero and that each entity's displacement matches its current site.
     pub fn check_invariants(&self, state: &FeCrState) -> Result<(), FeCrError> {
         let expected = self.lattice.site_count();
         if state.occupancy.len() != expected {
@@ -483,11 +491,13 @@ impl<E: Energetics> FeCrModel<E> {
             return Err(FeCrError::DisplacementSum);
         }
         let period: [i64; 3] = std::array::from_fn(|axis| 2 * self.lattice.cells()[axis] as i64);
+        let mut seen_entities = vec![false; expected];
         for site in 0..expected {
             let entity = state.atom_at[site];
-            if entity >= expected || state.origin[entity] >= expected {
+            if entity >= expected || state.origin[entity] >= expected || seen_entities[entity] {
                 return Err(FeCrError::UnwrappedMismatch { site });
             }
+            seen_entities[entity] = true;
             let here = self.lattice.position(site);
             let start = self.lattice.position(state.origin[entity]);
             let d = state.disp[entity];
@@ -498,6 +508,96 @@ impl<E: Energetics> FeCrModel<E> {
         }
         Ok(())
     }
+}
+
+pub(crate) fn encode_fecr_common_params<E: Energetics>(model: &FeCrModel<E>, out: &mut Vec<u8>) {
+    for c in model.lattice.cells() {
+        out.extend_from_slice(&(c as u64).to_le_bytes());
+    }
+    out.extend_from_slice(&model.attempt_frequency.to_bits().to_le_bytes());
+    out.extend_from_slice(&model.temperature_k.to_bits().to_le_bytes());
+}
+
+pub(crate) fn encode_fecr_state(state: &FeCrState, out: &mut Vec<u8>) {
+    let n = state.occupancy.len();
+    out.reserve(16 + 41 * n);
+    out.extend_from_slice(&(n as u64).to_le_bytes());
+    out.extend_from_slice(&(state.vacancy as u64).to_le_bytes());
+    for &sp in &state.occupancy {
+        out.push(sp.to_byte());
+    }
+    for &id in &state.atom_at {
+        out.extend_from_slice(&(id as u64).to_le_bytes());
+    }
+    for &orig in &state.origin {
+        out.extend_from_slice(&(orig as u64).to_le_bytes());
+    }
+    for d in &state.disp {
+        for &c in d {
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+    }
+}
+
+pub(crate) fn decode_fecr_state<E: Energetics>(
+    model: &FeCrModel<E>,
+    bytes: &[u8],
+) -> Result<FeCrState, Box<dyn Error + Send + Sync>> {
+    let n = model.lattice.site_count();
+    let expected_bytes = 16 + 41 * n;
+    if bytes.len() != expected_bytes {
+        return Err(format!(
+            "FeCrState requires {expected_bytes} bytes, got {}",
+            bytes.len()
+        )
+        .into());
+    }
+    let mut pos = 0_usize;
+    let u64_at = |buf: &[u8], p: &mut usize| -> u64 {
+        let w: [u8; 8] = buf[*p..*p + 8].try_into().unwrap();
+        *p += 8;
+        u64::from_le_bytes(w)
+    };
+    let stored_n = usize::try_from(u64_at(bytes, &mut pos))?;
+    if stored_n != n {
+        return Err(FeCrError::SiteCount {
+            expected: n,
+            found: stored_n,
+        }
+        .into());
+    }
+    let vacancy = usize::try_from(u64_at(bytes, &mut pos))?;
+    let mut occupancy = Vec::with_capacity(n);
+    for &b in &bytes[pos..pos + n] {
+        let sp = Species::from_byte(b).ok_or_else(|| format!("invalid species tag {b}"))?;
+        occupancy.push(sp);
+    }
+    pos += n;
+    let mut atom_at = Vec::with_capacity(n);
+    for _ in 0..n {
+        atom_at.push(usize::try_from(u64_at(bytes, &mut pos))?);
+    }
+    let mut origin = Vec::with_capacity(n);
+    for _ in 0..n {
+        origin.push(usize::try_from(u64_at(bytes, &mut pos))?);
+    }
+    let mut disp = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut v = [0_i64; 3];
+        for item in &mut v {
+            *item = u64_at(bytes, &mut pos) as i64;
+        }
+        disp.push(v);
+    }
+    let state = FeCrState {
+        occupancy,
+        vacancy,
+        atom_at,
+        origin,
+        disp,
+    };
+    model.check_invariants(&state)?;
+    Ok(state)
 }
 
 impl<E: Energetics> Model for FeCrModel<E> {
@@ -528,60 +628,86 @@ impl<E: Energetics> Model for FeCrModel<E> {
     }
 }
 
-/// An error constructing or validating Fe–Cr energetics, models or states.
-#[derive(Clone, Copy, Debug, PartialEq)]
+impl<E: Energetics> ReversibleModel for FeCrModel<E> {
+    type Undo = usize;
+
+    fn apply_reversible(
+        &self,
+        state: &mut Self::State,
+        event: &Self::Event,
+    ) -> Result<Self::Undo, Self::Error> {
+        self.apply(state, event)?;
+        Ok(7 - event.direction)
+    }
+
+    fn undo(&self, state: &mut Self::State, opposite: Self::Undo) {
+        let _ = self.apply(
+            state,
+            &FeCrJump {
+                direction: opposite,
+            },
+        );
+    }
+}
+
+impl<E: Energetics> IncrementalModel for FeCrModel<E> {
+    fn slot_count(&self, _state: &Self::State) -> usize {
+        8
+    }
+
+    fn slot_rate(&self, state: &Self::State, slot: usize) -> f64 {
+        self.rate(state, slot)
+    }
+
+    fn slot_event(&self, _state: &Self::State, slot: usize) -> Self::Event {
+        FeCrJump { direction: slot }
+    }
+
+    fn affected_slots(&self, _state: &Self::State, _event: &Self::Event, out: &mut Vec<usize>) {
+        out.extend(0..8);
+    }
+}
+
+impl Checkpointable for FeCrModel<PairEnergetics> {
+    const MODEL_ID: &'static str = "okrates.fecr_pair";
+
+    fn encode_params(&self, out: &mut Vec<u8>) {
+        encode_fecr_common_params(self, out);
+        for row in &self.energetics.pair {
+            for &val in row {
+                out.extend_from_slice(&val.to_bits().to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&self.energetics.kra_fe.to_bits().to_le_bytes());
+        out.extend_from_slice(&self.energetics.kra_cr.to_bits().to_le_bytes());
+    }
+
+    fn encode_state(&self, state: &Self::State, out: &mut Vec<u8>) {
+        encode_fecr_state(state, out);
+    }
+
+    fn decode_state(&self, bytes: &[u8]) -> Result<Self::State, Box<dyn Error + Send + Sync>> {
+        decode_fecr_state(self, bytes)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum FeCrError {
-    /// A pair energy or KRA value was not finite.
     NonFinite,
-    /// The pair-energy matrix was not symmetric.
     Asymmetric,
-    /// A KRA value was negative.
     NegativeKra(Species),
-    /// The attempt frequency was not finite and positive.
     AttemptFrequency(f64),
-    /// The temperature was not finite and positive.
     Temperature(f64),
-    /// The KRA is below half the exchange-energy bound, so a barrier could be negative.
-    NegativeBarrier {
-        /// The migrating species.
-        atom: Species,
-        /// Its KRA in eV.
-        kra: f64,
-        /// The exchange-energy bound in eV.
-        bound: f64,
-    },
-    /// The occupancy length differs from the lattice site count.
-    SiteCount {
-        /// The lattice site count.
-        expected: usize,
-        /// The occupancy vector length.
-        found: usize,
-    },
-    /// The occupancy contains a number of vacancies other than one.
+    NegativeBarrier { atom: Species, kra: f64, bound: f64 },
+    SiteCount { expected: usize, found: usize },
     VacancyCount(usize),
-    /// The vacancy field does not point to the vacancy.
     VacancyMismatch,
-    /// More Cr atoms and vacancies were requested than there are sites.
     TooManyAtoms,
-    /// The unwrapped displacements of all entities do not sum to zero.
     DisplacementSum,
-    /// An entity's unwrapped displacement does not map its origin to its current site.
-    UnwrappedMismatch {
-        /// The site holding the inconsistent entity.
-        site: usize,
-    },
-    /// The lattice has fewer than `min_cells` conventional cells along some axis.
-    LatticeTooSmall {
-        /// The smallest supported number of cells per axis.
-        min_cells: usize,
-    },
-    /// The model temperature differs from the temperature the energetics were built for.
-    TemperatureMismatch {
-        /// The model temperature in K.
-        model: f64,
-        /// The energetics temperature in K.
-        energetics: f64,
-    },
+    UnwrappedMismatch { site: usize },
+    LatticeTooSmall { min_cells: usize },
+    TemperatureMismatch { model: f64, energetics: f64 },
+    BarrierTable(String),
 }
 
 impl fmt::Display for FeCrError {
@@ -621,6 +747,7 @@ impl fmt::Display for FeCrError {
                 f,
                 "model temperature {model} K differs from energetics temperature {energetics} K"
             ),
+            Self::BarrierTable(msg) => write!(f, "invalid barrier table: {msg}"),
         }
     }
 }
@@ -629,7 +756,9 @@ impl Error for FeCrError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{FeCrError, PairEnergetics, Species};
+    use super::{FeCrError, FeCrJump, FeCrModel, PairEnergetics, Species};
+    use crate::bcc::BccLattice;
+    use okrates_core::ReversibleModel;
 
     #[test]
     fn illustrative_passes_new() {
@@ -663,5 +792,24 @@ mod tests {
         let e = PairEnergetics::illustrative();
         assert!((e.delta_bound(Species::Fe) - 7.0 * 0.09).abs() < 1e-12);
         assert!((e.delta_bound(Species::Cr) - 7.0 * 0.06).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reversible_undo_restores_exact_state() {
+        let model = FeCrModel::new(
+            BccLattice::new([3, 3, 3]).unwrap(),
+            PairEnergetics::illustrative(),
+            1e13,
+            800.0,
+        )
+        .unwrap();
+        let mut state = model.random_state(11, 42).unwrap();
+        let before = state.clone();
+        let undo = model
+            .apply_reversible(&mut state, &FeCrJump { direction: 3 })
+            .unwrap();
+        assert_ne!(state, before);
+        model.undo(&mut state, undo);
+        assert_eq!(state, before);
     }
 }

@@ -1,21 +1,17 @@
 //! Incremental event catalog with a binary sum-tree selector.
-//!
-//! An alternative scheduler beside the direct-method
-//! [`Simulation`](crate::simulation::Simulation): events live in stable slots
-//! whose rates are updated locally after each step.
 
-use crate::checkpoint::{self, CheckpointError, Checkpointable};
+use crate::catalog::{Engine, SumTreeCatalog};
+use crate::checkpoint::{CheckpointError, Checkpointable};
 use crate::clock::Clock;
-use crate::model::Model;
-use crate::rate::Rate;
+use crate::model::ReversibleModel;
 use crate::rng::KmcRng;
 use crate::simulation::{RunSummary, SimError, Step};
+use crate::topology::SlotError;
 
-/// A complete binary tree of partial rate sums over a fixed number of slots.
+/// Complete binary tree of partial rate sums over a fixed slot count.
 ///
-/// Every internal node is exactly the sum of its two children, recomputed
-/// from the children on each update, so the tree depends only on the current
-/// slot rates and not on the order of updates.
+/// Ancestors are recomputed directly from children on every update, making the tree
+/// independent of update history.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SumTree {
     len: usize,
@@ -24,9 +20,7 @@ pub struct SumTree {
 }
 
 impl SumTree {
-    /// Builds a tree whose slot `i` has rate `rates[i]`.
-    ///
-    /// Callers pass validated non-negative finite rates.
+    /// Builds a tree from finite non-negative slot `rates`.
     pub fn new(rates: &[f64]) -> Self {
         debug_assert!(rates.iter().all(|r| r.is_finite() && *r >= 0.0));
         let len = rates.len();
@@ -39,51 +33,43 @@ impl SumTree {
         Self { len, cap, nodes }
     }
 
-    /// Returns the number of slots.
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// Returns whether the tree has no slots.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// Returns the sum of all slot rates.
     pub fn total(&self) -> f64 {
         self.nodes[1]
     }
 
-    /// Returns the rate of `slot`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `slot >= len()`.
-    pub fn rate(&self, slot: usize) -> f64 {
-        assert!(
-            slot < self.len,
-            "slot {slot} out of range for {} slots",
-            self.len
-        );
-        self.nodes[self.cap + slot]
+    pub fn try_rate(&self, slot: usize) -> Result<f64, SlotError> {
+        if slot >= self.len {
+            return Err(SlotError::OutOfRange {
+                slot,
+                slot_count: self.len,
+            });
+        }
+        Ok(self.nodes[self.cap + slot])
     }
 
-    /// Returns the raw node array; index 0 is unused and index 1 is the root.
+    pub fn rate(&self, slot: usize) -> f64 {
+        self.try_rate(slot).unwrap_or_else(|e| panic!("{e}"))
+    }
+
     pub fn nodes(&self) -> &[f64] {
         &self.nodes
     }
 
-    /// Sets the rate of `slot` and recomputes its ancestors from their children.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `slot >= len()`.
-    pub fn set(&mut self, slot: usize, rate: f64) {
-        assert!(
-            slot < self.len,
-            "slot {slot} out of range for {} slots",
-            self.len
-        );
+    pub fn try_set(&mut self, slot: usize, rate: f64) -> Result<(), SlotError> {
+        if slot >= self.len {
+            return Err(SlotError::OutOfRange {
+                slot,
+                slot_count: self.len,
+            });
+        }
         debug_assert!(rate.is_finite() && rate >= 0.0);
         self.nodes[self.cap + slot] = rate;
         let mut k = (self.cap + slot) / 2;
@@ -91,15 +77,16 @@ impl SumTree {
             self.nodes[k] = self.nodes[2 * k] + self.nodes[2 * k + 1];
             k /= 2;
         }
+        Ok(())
     }
 
-    /// Returns the slot selected by `u`, which must lie in the open interval (0, 1).
+    pub fn set(&mut self, slot: usize, rate: f64) {
+        self.try_set(slot, rate).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// Selects a positive-rate slot from `u` in `(0, 1)`; requires `total() > 0`.
     ///
-    /// Requires `total() > 0`. The descent goes left when the target is below
-    /// the left sum, otherwise right with the left sum subtracted. The
-    /// `r == 0.0` guard means the descent never enters a zero-sum subtree, so
-    /// the selected slot always has a positive rate, even if rounding puts the
-    /// target at or above the left sum.
+    /// The `r == 0.0` guard prevents rounding from descending into zero-sum subtrees.
     pub fn select(&self, u: f64) -> usize {
         debug_assert!(self.total() > 0.0);
         debug_assert!(u > 0.0 && u < 1.0);
@@ -118,174 +105,93 @@ impl SumTree {
     }
 }
 
-/// A model whose events live in stable slots that can be updated locally.
-pub trait IncrementalModel: Model {
-    /// The number of slots. Must not change while the model runs.
+/// Reversible model with stable integer event slots for local `O(k log M)` catalog updates.
+pub trait IncrementalModel: ReversibleModel {
+    /// Fixed slot count across the lifetime of a simulation.
     fn slot_count(&self, state: &Self::State) -> usize;
-    /// The current rate of `slot`; 0 disables it. Must equal the rate that `enumerate_events` emits for the same event.
+
+    /// Non-negative rate of `slot` (`0.0` disables the slot).
     fn slot_rate(&self, state: &Self::State, slot: usize) -> f64;
-    /// The event stored in `slot`.
+
     fn slot_event(&self, state: &Self::State, slot: usize) -> Self::Event;
-    /// After `event` has been applied to give `state`, push every slot whose rate may have changed (duplicates allowed).
+
+    /// Appends every slot whose rate may have changed after `event` produced `state` (duplicates allowed).
     fn affected_slots(&self, state: &Self::State, event: &Self::Event, out: &mut Vec<usize>);
 }
 
-/// A serial kinetic Monte Carlo simulation using an incremental sum-tree catalog.
+/// Serial KMC simulation backed by [`Engine`] and [`SumTreeCatalog`].
 pub struct IncrementalSimulation<M: IncrementalModel> {
-    model: M,
-    state: M::State,
-    clock: Clock,
-    rng: KmcRng,
-    steps: u64,
-    tree: SumTree,
-    scratch: Vec<usize>,
-}
-
-fn build_tree<M: IncrementalModel>(
-    model: &M,
-    state: &M::State,
-) -> Result<SumTree, (usize, crate::rate::RateError)> {
-    let count = model.slot_count(state);
-    let mut rates = Vec::with_capacity(count);
-    for slot in 0..count {
-        match Rate::new(model.slot_rate(state, slot)) {
-            Ok(rate) => rates.push(rate.get()),
-            Err(err) => return Err((slot, err)),
-        }
-    }
-    Ok(SumTree::new(&rates))
+    engine: Engine<M, SumTreeCatalog>,
 }
 
 impl<M: IncrementalModel> IncrementalSimulation<M> {
-    /// Creates a simulation with a seeded random stream, building the catalog
-    /// from every slot's current rate.
     pub fn new(model: M, state: M::State, seed: u64) -> Result<Self, SimError<M::Error>> {
-        let tree = build_tree(&model, &state)
-            .map_err(|(index, source)| SimError::InvalidRate { index, source })?;
         Ok(Self {
-            model,
-            state,
-            clock: Clock::new(),
-            rng: KmcRng::from_seed(seed),
-            steps: 0,
-            tree,
-            scratch: Vec::new(),
+            engine: Engine::new(model, state, seed)?,
         })
     }
 
-    /// Returns the model.
+    pub fn with_rng(model: M, state: M::State, rng: KmcRng) -> Result<Self, SimError<M::Error>> {
+        Ok(Self {
+            engine: Engine::with_rng(model, state, rng)?,
+        })
+    }
+
+    pub fn engine(&self) -> &Engine<M, SumTreeCatalog> {
+        &self.engine
+    }
+
     pub fn model(&self) -> &M {
-        &self.model
+        self.engine.model()
     }
 
-    /// Returns the current model state.
     pub fn state(&self) -> &M::State {
-        &self.state
+        self.engine.state()
     }
 
-    /// Returns the current simulation time.
+    pub fn clock(&self) -> Clock {
+        self.engine.clock()
+    }
+
     pub fn time(&self) -> f64 {
-        self.clock.time()
+        self.engine.time()
     }
 
-    /// Returns the total number of events fired by this simulation.
     pub fn steps(&self) -> u64 {
-        self.steps
+        self.engine.steps()
     }
 
-    /// Returns the sum tree holding the current slot rates.
     pub fn tree(&self) -> &SumTree {
-        &self.tree
+        self.engine.catalog().tree()
     }
 
-    /// Fires one event, or reports that the state is absorbing.
-    ///
-    /// Uses the same two random draws per step as ADR-0002 (selection, then
-    /// waiting time). Selection is the sum-tree descent, so trajectories are
-    /// not bitwise equal to those of `Simulation`.
     pub fn step(&mut self) -> Result<Step<M::Event>, SimError<M::Error>> {
-        let total = self.tree.total();
-        if !total.is_finite() {
-            return Err(SimError::TotalRateNotFinite);
-        }
-        if total == 0.0 {
-            return Ok(Step::Absorbed);
-        }
-
-        let u1 = self.rng.open01();
-        let slot = self.tree.select(u1);
-        let u2 = self.rng.open01();
-        let dt = -u2.ln() / total;
-
-        let mut advanced_clock = self.clock;
-        advanced_clock.advance(dt).map_err(SimError::Clock)?;
-        let event = self.model.slot_event(&self.state, slot);
-        self.model
-            .apply(&mut self.state, &event)
-            .map_err(SimError::Model)?;
-        self.clock = advanced_clock;
-        self.steps += 1;
-
-        self.scratch.clear();
-        self.model
-            .affected_slots(&self.state, &event, &mut self.scratch);
-        for &slot in &self.scratch {
-            let rate = Rate::new(self.model.slot_rate(&self.state, slot)).map_err(|source| {
-                SimError::InvalidRate {
-                    index: slot,
-                    source,
-                }
-            })?;
-            self.tree.set(slot, rate.get());
-        }
-        Ok(Step::Fired { event, dt })
+        self.engine.step()
     }
 
-    /// Runs up to max_steps events, stopping early if the state is absorbing.
+    pub fn step_observing<F>(
+        &mut self,
+        before_apply: F,
+    ) -> Result<Step<M::Event>, SimError<M::Error>>
+    where
+        F: FnOnce(&M, &M::State, Clock),
+    {
+        self.engine.step_observing(before_apply)
+    }
+
     pub fn run(&mut self, max_steps: u64) -> Result<RunSummary, SimError<M::Error>> {
-        let mut fired = 0;
-        let mut absorbed = false;
-        for _ in 0..max_steps {
-            match self.step()? {
-                Step::Fired { .. } => fired += 1,
-                Step::Absorbed => {
-                    absorbed = true;
-                    break;
-                }
-            }
-        }
-        Ok(RunSummary {
-            steps: fired,
-            time: self.clock.time(),
-            absorbed,
-        })
+        self.engine.run(max_steps)
     }
 }
 
 impl<M: IncrementalModel + Checkpointable> IncrementalSimulation<M> {
-    /// Encodes the simulation as a checkpoint in schema version 1.
-    ///
-    /// The bytes equal those a direct `Simulation` writes for the same
-    /// steps, time, random stream and state.
     pub fn checkpoint(&self) -> Vec<u8> {
-        checkpoint::encode(self.steps, &self.clock, &self.rng, &self.model, &self.state)
+        self.engine.checkpoint()
     }
 
-    /// Rebuilds a simulation from `bytes`, validating them against `model`
-    /// and rebuilding the catalog from every slot's rate.
     pub fn resume(model: M, bytes: &[u8]) -> Result<Self, CheckpointError> {
-        let (steps, clock, rng, state) = checkpoint::decode(&model, bytes)?;
-        let tree = build_tree(&model, &state).map_err(|(slot, err)| {
-            CheckpointError::InvalidState(format!("invalid rate in slot {slot}: {err}").into())
-        })?;
         Ok(Self {
-            model,
-            state,
-            clock,
-            rng,
-            steps,
-            tree,
-            scratch: Vec::new(),
+            engine: Engine::resume(model, bytes)?,
         })
     }
 }
@@ -293,6 +199,7 @@ impl<M: IncrementalModel + Checkpointable> IncrementalSimulation<M> {
 #[cfg(test)]
 mod tests {
     use super::SumTree;
+    use crate::topology::SlotError;
 
     #[test]
     fn select_matches_linear_scan() {
@@ -322,25 +229,37 @@ mod tests {
         assert_eq!(tree.select(f64::EPSILON / 2.0), 1);
         let tree = SumTree::new(&[0.1, 0.2, 0.0, 0.0]);
         assert_eq!(tree.select(1.0 - f64::EPSILON / 2.0), 1);
-        // Here `target - (0.1 + 1/3)` rounds up to exactly 3.3, the left sum of
-        // the right subtree, whose right child is 0; only the zero guard keeps
-        // the descent out of slot 3.
+        // `target - (0.1 + 1/3)` rounds up to 3.3, so only `r == 0.0` avoids slot 3.
         let tree = SumTree::new(&[0.1, 1.0 / 3.0, 3.3, 0.0]);
         assert_eq!(tree.select(1.0 - f64::EPSILON / 2.0), 2);
     }
 
     #[test]
-    fn tree_is_history_independent() {
+    fn tree_is_history_independent_and_bounds_checked() {
         let rates: Vec<f64> = (0..37).map(|i| 0.1 * ((i * 7) % 11) as f64).collect();
         let a = SumTree::new(&rates);
         let mut b = SumTree::new(&[0.0; 37]);
         for j in 0..37 {
             let i = (j * 17) % 37;
-            b.set(i, rates[i]);
+            b.try_set(i, rates[i]).unwrap();
         }
-        b.set(5, 9.9);
-        b.set(5, rates[5]);
+        b.try_set(5, 9.9).unwrap();
+        b.try_set(5, rates[5]).unwrap();
         assert_eq!(a, b);
+        assert_eq!(
+            b.try_set(37, 1.0),
+            Err(SlotError::OutOfRange {
+                slot: 37,
+                slot_count: 37
+            })
+        );
+        assert_eq!(
+            b.try_rate(37),
+            Err(SlotError::OutOfRange {
+                slot: 37,
+                slot_count: 37
+            })
+        );
     }
 
     #[test]
