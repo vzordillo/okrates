@@ -13,7 +13,16 @@
 - [Google Antigravity](https://antigravity.google/use-cases/science/) with Google's frontier Gemini models, through Google's free access offer for scientists;
 - Anthropic Claude models through [Claude Code](https://claude.com/claude-code).
 
-<p align="center"><img src="assets/fecr-snapshot.gif" width="560" alt="Fe-20%Cr box: Cr atoms cluster during a Monte Carlo anneal, then a vacancy diffuses through the alloy"></p>
+<table>
+  <tr>
+    <td width="50%"><img src="assets/fecr-snapshot.gif" width="100%" alt="Fe-20% Cr box: Cr atoms (orange) cluster during a Monte Carlo anneal, then a single vacancy (red ring) diffuses through the alloy"></td>
+    <td width="50%"><img src="assets/fecr-ris.gif" width="100%" alt="Fe-10% Cr box under irradiation: vacancies (red rings) and self-interstitial dumbbells (green) appear in pairs, migrate, recombine or are absorbed at a sink plane (violet)"></td>
+  </tr>
+  <tr>
+    <td>Thermal ageing of Fe–20 % Cr (Martínez 2012 energetics, 432 BCC sites, 769 K): Cr atoms cluster during 400 Kawasaki Monte Carlo sweeps, then a single vacancy makes 4,000 kinetic Monte Carlo jumps through the alloy.</td>
+    <td>Irradiation of Fe–10 % Cr (864 BCC sites, 573 K, accelerated rate of 3×10⁵ dpa/s): Frenkel pairs of vacancies and self-interstitial dumbbells are created, the dumbbells migrate quickly, and the defects recombine or are absorbed at the sink plane (6,000 events, 0.03 dpa).</td>
+  </tr>
+</table>
 
 ## What it does
 
