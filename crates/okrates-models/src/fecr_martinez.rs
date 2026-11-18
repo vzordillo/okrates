@@ -477,6 +477,9 @@ impl Martinez2012 {
         vacancy_site: usize,
         atom_site: usize,
     ) -> f64 {
+        if occupancy.len() != lattice.site_count() {
+            return f64::NAN;
+        }
         let (q, p) = (vacancy_site, atom_site);
         if q >= occupancy.len() || p >= occupancy.len() || occupancy[q] != Species::Vacancy {
             return f64::NAN;
@@ -514,6 +517,9 @@ impl Martinez2012 {
 
 impl Energetics for Martinez2012 {
     fn total_energy(&self, lattice: &BccLattice, occupancy: &[Species]) -> f64 {
+        if occupancy.len() != lattice.site_count() {
+            return f64::NAN;
+        }
         let view = View {
             occupancy,
             overrides: [None, None],
@@ -545,7 +551,10 @@ impl Energetics for Martinez2012 {
         vacancy_site: usize,
         atom_site: usize,
     ) -> f64 {
-        if vacancy_site >= occupancy.len() || atom_site >= occupancy.len() {
+        if occupancy.len() != lattice.site_count()
+            || vacancy_site >= occupancy.len()
+            || atom_site >= occupancy.len()
+        {
             return f64::NAN;
         }
         self.local_delta(
@@ -557,7 +566,7 @@ impl Energetics for Martinez2012 {
     }
 
     fn swap_delta(&self, lattice: &BccLattice, occupancy: &[Species], i: usize, j: usize) -> f64 {
-        if i >= occupancy.len() || j >= occupancy.len() {
+        if occupancy.len() != lattice.site_count() || i >= occupancy.len() || j >= occupancy.len() {
             return f64::NAN;
         }
         self.local_delta(

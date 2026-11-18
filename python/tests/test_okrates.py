@@ -45,6 +45,7 @@ def test_parity_with_rust_example(seed):
 @pytest.mark.parametrize("kwargs", [
     {"jump_rate": 0.0}, {"jump_rate": float("nan")},
     {"lattice_parameter_m": -1.0}, {"cells": (0, 4, 4)},
+    {"cells": (2**62, 2, 2)}, {"steps": 2**62},
 ])
 def test_invalid_arguments_raise_value_error(kwargs):
     args = dict(cells=CELLS, jump_rate=1.0, lattice_parameter_m=A, seed=1, steps=1)

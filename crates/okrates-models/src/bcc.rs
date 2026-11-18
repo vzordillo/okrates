@@ -39,13 +39,30 @@ impl BccLattice {
         if cells.iter().any(|&dimension| dimension < 2) {
             return Err(LatticeError::TooSmall { cells });
         }
+        let max_axis = (i64::MAX as usize) / 2;
+        let Some(site_count) = 2_usize
+            .checked_mul(cells[0])
+            .and_then(|n| n.checked_mul(cells[1]))
+            .and_then(|n| n.checked_mul(cells[2]))
+            .filter(|_| cells.iter().all(|&d| d <= max_axis))
+        else {
+            return Err(LatticeError::TooLarge { cells });
+        };
+
+        let mut neighbors = Vec::new();
+        let mut second_neighbors = Vec::new();
+        if neighbors.try_reserve_exact(site_count).is_err()
+            || second_neighbors.try_reserve_exact(site_count).is_err()
+        {
+            return Err(LatticeError::TooLarge { cells });
+        }
 
         let mut lattice = Self {
             cells,
-            neighbors: Vec::with_capacity(2 * cells[0] * cells[1] * cells[2]),
-            second_neighbors: Vec::with_capacity(2 * cells[0] * cells[1] * cells[2]),
+            neighbors,
+            second_neighbors,
         };
-        for site in 0..lattice.site_count() {
+        for site in 0..site_count {
             let position = lattice.position(site);
             let neighbors = std::array::from_fn(|direction| {
                 let target = std::array::from_fn(|axis| {
@@ -127,6 +144,7 @@ impl BccLattice {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatticeError {
     TooSmall { cells: [usize; 3] },
+    TooLarge { cells: [usize; 3] },
 }
 
 impl fmt::Display for LatticeError {
@@ -136,6 +154,12 @@ impl fmt::Display for LatticeError {
                 write!(
                     f,
                     "BCC cell dimensions must all be at least 2, got {cells:?}"
+                )
+            }
+            Self::TooLarge { cells } => {
+                write!(
+                    f,
+                    "BCC cell dimensions exceed addressable capacity: {cells:?}"
                 )
             }
         }
@@ -149,11 +173,17 @@ mod tests {
     use super::{BccLattice, DISPLACEMENTS, LatticeError};
 
     #[test]
-    fn rejects_small_cells() {
+    fn rejects_small_or_overflowing_cells() {
         for cells in [[1, 2, 2], [2, 1, 2], [2, 2, 1], [2, 2, 0]] {
             assert_eq!(
                 BccLattice::new(cells).unwrap_err(),
                 LatticeError::TooSmall { cells }
+            );
+        }
+        for cells in [[usize::MAX, 2, 2], [1 << 30, 1 << 30, 2]] {
+            assert_eq!(
+                BccLattice::new(cells).unwrap_err(),
+                LatticeError::TooLarge { cells }
             );
         }
     }

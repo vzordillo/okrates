@@ -4,7 +4,8 @@
 //! parameters follow Senninger et al., Acta Mater. 103, 1 (2016)
 //! ([`DumbbellParams::senninger2016_r1`]). Positions are in half-lattice units (`a/2`).
 //!
-//! All rates use local energy differences so detailed balance holds to rounding.
+//! Thermal vacancy and dumbbell jumps use local energy differences obeying detailed balance to rounding;
+//! Frenkel-pair creation, I–V recombination, and sink absorption are driven or irreversible.
 //! Jump barriers apply a shared saddle-level floor `max(raw, max(0, ΔE))`.
 
 use std::cell::RefCell;
@@ -1450,6 +1451,15 @@ impl FeCrRis {
         true
     }
 
+    fn build_chain(&self, start: usize, dir: usize) -> [usize; 11] {
+        let mut cur = start;
+        std::array::from_fn(|_| {
+            let s = cur;
+            cur = self.lattice.neighbor(cur, dir);
+            s
+        })
+    }
+
     fn create(
         &self,
         s: &mut FeCrRisState,
@@ -1473,15 +1483,7 @@ impl FeCrRis {
             let dir = draw(&mut rng, 8);
             let orient = draw(&mut rng, 12);
             attempts += 1;
-            let (p0, t) = (self.lattice.position(site), DISPLACEMENTS[dir]);
-            let mut chain = [0_usize; 11];
-            for (idx, slot) in chain.iter_mut().enumerate() {
-                let i = idx as i64;
-                *slot = self
-                    .lattice
-                    .site_at([p0[0] + i * t[0], p0[1] + i * t[1], p0[2] + i * t[2]])
-                    .expect("a chain along a 111 direction stays on the lattice");
-            }
+            let chain = self.build_chain(site, dir);
             if chain
                 .iter()
                 .all(|&c| matches!(s.cells[c], Cell::Fe | Cell::Cr) && !self.on_sink(c))
@@ -1490,8 +1492,29 @@ impl FeCrRis {
                 break;
             }
         }
-        let Some((chain, orient)) = found else {
-            return Err(FeCrRisError::CreationFailed);
+        let (chain, orient) = match found {
+            Some(pair) => pair,
+            None => {
+                let mut valid = Vec::new();
+                for site in 0..n {
+                    for dir in 0..8 {
+                        let chain = self.build_chain(site, dir);
+                        if chain
+                            .iter()
+                            .all(|&c| matches!(s.cells[c], Cell::Fe | Cell::Cr) && !self.on_sink(c))
+                        {
+                            valid.push(chain);
+                        }
+                    }
+                }
+                if valid.is_empty() {
+                    return Err(FeCrRisError::CreationFailed);
+                }
+                let chain = valid[draw(&mut rng, valid.len())];
+                let orient = draw(&mut rng, 12);
+                attempts += 1;
+                (chain, orient)
+            }
         };
         if let Some(u) = undo.as_deref_mut() {
             for &c in &chain {
@@ -2084,27 +2107,27 @@ mod tests {
         assert_eq!(INFLUENCE_OFFSETS.len(), 363);
     }
 
+    use super::{
+        Checkpointable, DumbbellParams, FeCrRis, FeCrRisError, FeCrRisEvent, FeCrRisParams,
+        FeCrRisState, IncrementalModel, Model, ReversibleModel,
+    };
+
+    fn snapshot(m: &FeCrRis, s: &FeCrRisState) -> (Vec<u8>, Vec<usize>, Vec<usize>, Vec<u64>) {
+        let mut bytes = Vec::new();
+        m.encode_state(s, &mut bytes);
+        let rates: Vec<u64> = (0..m.slot_count(s))
+            .map(|slot| m.slot_rate(s, slot).to_bits())
+            .collect();
+        (
+            bytes,
+            s.last_changed().to_vec(),
+            s.last_records().to_vec(),
+            rates,
+        )
+    }
+
     #[test]
     fn reversible_apply_and_undo_restores_state_bitwise() {
-        use super::{
-            Checkpointable, DumbbellParams, FeCrRis, FeCrRisError, FeCrRisEvent, FeCrRisParams,
-            FeCrRisState, IncrementalModel, Model, ReversibleModel,
-        };
-
-        let snapshot = |m: &FeCrRis, s: &FeCrRisState| {
-            let mut bytes = Vec::new();
-            m.encode_state(s, &mut bytes);
-            let rates: Vec<u64> = (0..m.slot_count(s))
-                .map(|slot| m.slot_rate(s, slot).to_bits())
-                .collect();
-            (
-                bytes,
-                s.last_changed().to_vec(),
-                s.last_records().to_vec(),
-                rates,
-            )
-        };
-
         let model = FeCrRis::new(FeCrRisParams {
             cells: [6, 6, 6],
             sink_planes: vec![0],
@@ -2122,7 +2145,10 @@ mod tests {
             model.enumerate_events(&state, &mut |e, r| candidates.push((e, r)));
             for (ev, _) in &candidates {
                 let before = snapshot(&model, &state);
+                let mut expected = state.clone();
+                model.apply(&mut expected, ev).unwrap();
                 let undo = model.apply_reversible(&mut state, ev).unwrap();
+                assert_eq!(snapshot(&model, &state), snapshot(&model, &expected));
                 model.undo(&mut state, undo);
                 assert_eq!(snapshot(&model, &state), before);
             }
@@ -2156,5 +2182,48 @@ mod tests {
             FeCrRisError::CreationFailed
         );
         assert_eq!(snapshot(&all_sinks, &blocked), before_blocked);
+    }
+
+    #[test]
+    fn create_falls_back_exhaustively_when_single_chain_remains() {
+        let sparse = FeCrRis::new(FeCrRisParams {
+            cells: [6, 6, 6],
+            sink_planes: vec![],
+            temperature_k: 773.0,
+            k0_dpa_per_s: 1.0,
+            capacity: 432,
+            dumbbell: DumbbellParams::senninger2016_r1(),
+        })
+        .unwrap();
+        let n = sparse.lattice().site_count();
+        let keep = sparse.build_chain(0, 0);
+        let blocker_defects: Vec<super::Defect> = (0..n)
+            .filter(|s| !keep.contains(s))
+            .map(|site| super::Defect::Vacancy { site })
+            .collect();
+        let occ = vec![super::Species::Fe; n];
+        let mut saw_fallback = false;
+        for run_seed in 0..12 {
+            let mut sparse_state = sparse
+                .state_with_defects(occ.clone(), &blocker_defects, run_seed)
+                .unwrap();
+            let before_sparse = snapshot(&sparse, &sparse_state);
+            let mut expected = sparse_state.clone();
+            sparse.apply(&mut expected, &FeCrRisEvent::Create).unwrap();
+            let undo = sparse
+                .apply_reversible(&mut sparse_state, &FeCrRisEvent::Create)
+                .unwrap();
+            assert_eq!(
+                snapshot(&sparse, &sparse_state),
+                snapshot(&sparse, &expected)
+            );
+            assert_eq!(sparse_state.created(), 1);
+            if sparse_state.creation_attempts() == 1001 {
+                saw_fallback = true;
+            }
+            sparse.undo(&mut sparse_state, undo);
+            assert_eq!(snapshot(&sparse, &sparse_state), before_sparse);
+        }
+        assert!(saw_fallback);
     }
 }

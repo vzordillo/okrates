@@ -3,7 +3,9 @@
 use std::error::Error;
 use std::fmt;
 
-use okrates_core::{Checkpointable, IncrementalModel, KmcRng, Model, ReversibleModel};
+use okrates_core::{
+    Checkpointable, IncrementalModel, IndependentSnapshot, KmcRng, Model, ReversibleModel,
+};
 
 use crate::bcc::{BccLattice, DISPLACEMENTS};
 
@@ -13,6 +15,12 @@ pub struct MultiVacancyState {
     sites: Vec<usize>,
     origins: Vec<usize>,
     displacements: Vec<[i64; 3]>,
+}
+
+impl IndependentSnapshot for MultiVacancyState {
+    fn snapshot(&self) -> Self {
+        self.clone()
+    }
 }
 
 impl MultiVacancyState {
@@ -34,11 +42,11 @@ impl MultiVacancyState {
     }
 
     pub fn squared_displacement(&self, id: usize, lattice_parameter: f64) -> f64 {
-        let integer_squared = self.displacements[id]
+        let sq_sum = self.displacements[id]
             .iter()
-            .map(|&component| component * component)
-            .sum::<i64>();
-        integer_squared as f64 * lattice_parameter * lattice_parameter / 4.0
+            .map(|&component| (component as f64) * (component as f64))
+            .sum::<f64>();
+        sq_sum * lattice_parameter * lattice_parameter / 4.0
     }
 
     /// Number of unordered 1NN vacancy–vacancy pairs.
@@ -142,9 +150,13 @@ impl MultiVacancyDiffusion {
             });
         }
         let n = state.sites.len();
+        if n == 0 {
+            return Err(MultiVacancyError::NoVacancies);
+        }
         if state.origins.len() != n || state.displacements.len() != n {
             return Err(MultiVacancyError::LengthMismatch);
         }
+        let mut seen_origins = vec![false; site_count];
         for v in 0..n {
             for site in [state.sites[v], state.origins[v]] {
                 if site >= site_count {
@@ -157,6 +169,10 @@ impl MultiVacancyDiffusion {
             if state.site_vacancy[state.sites[v]] != Some(v) {
                 return Err(MultiVacancyError::VacancyMismatch { vacancy: v });
             }
+            if seen_origins[state.origins[v]] {
+                return Err(MultiVacancyError::DuplicateSite(state.origins[v]));
+            }
+            seen_origins[state.origins[v]] = true;
         }
         let found = state.site_vacancy.iter().filter(|s| s.is_some()).count();
         if found != n {
@@ -204,17 +220,30 @@ impl Model for MultiVacancyDiffusion {
 
     fn apply(&self, state: &mut Self::State, event: &Self::Event) -> Result<(), Self::Error> {
         let MultiVacancyJump { vacancy, direction } = *event;
+        if vacancy >= state.sites.len() {
+            return Err(MultiVacancyError::VacancyOutOfRange {
+                vacancy,
+                count: state.sites.len(),
+            });
+        }
+        let Some(&shift) = DISPLACEMENTS.get(direction) else {
+            return Err(MultiVacancyError::InvalidDirection(direction));
+        };
         let old = state.sites[vacancy];
         let target = self.lattice.neighbor(old, direction);
         if state.site_vacancy[target].is_some() {
             return Err(MultiVacancyError::VacancyExchange { vacancy, direction });
         }
+        let mut next_disp = [0_i64; 3];
+        for axis in 0..3 {
+            next_disp[axis] = state.displacements[vacancy][axis]
+                .checked_add(shift[axis])
+                .ok_or(MultiVacancyError::DisplacementOverflow { vacancy })?;
+        }
         state.site_vacancy[old] = None;
         state.site_vacancy[target] = Some(vacancy);
         state.sites[vacancy] = target;
-        for axis in 0..3 {
-            state.displacements[vacancy][axis] += DISPLACEMENTS[direction][axis];
-        }
+        state.displacements[vacancy] = next_disp;
         Ok(())
     }
 }
@@ -245,7 +274,11 @@ impl IncrementalModel for MultiVacancyDiffusion {
     }
 
     fn slot_rate(&self, state: &Self::State, slot: usize) -> f64 {
-        self.rate_of(state, slot / 8, slot % 8)
+        let vacancy = slot / 8;
+        if vacancy >= state.sites.len() {
+            return f64::NAN;
+        }
+        self.rate_of(state, vacancy, slot % 8)
     }
 
     fn slot_event(&self, _state: &Self::State, slot: usize) -> Self::Event {
@@ -256,8 +289,13 @@ impl IncrementalModel for MultiVacancyDiffusion {
     }
 
     fn affected_slots(&self, state: &Self::State, event: &Self::Event, out: &mut Vec<usize>) {
+        let Some(&new) = state.sites.get(event.vacancy) else {
+            return;
+        };
+        if event.direction >= 8 {
+            return;
+        }
         out.extend((0..8).map(|d| event.vacancy * 8 + d));
-        let new = state.sites[event.vacancy];
         let old = self.lattice.neighbor(new, 7 - event.direction);
         for site in [old, new] {
             for &neighbor in self.lattice.neighbors(site) {
@@ -353,7 +391,10 @@ pub enum MultiVacancyError {
     VacancyMismatch { vacancy: usize },
     VacancyCount { expected: usize, found: usize },
     UnwrappedMismatch { vacancy: usize },
+    DisplacementOverflow { vacancy: usize },
     VacancyExchange { vacancy: usize, direction: usize },
+    VacancyOutOfRange { vacancy: usize, count: usize },
+    InvalidDirection(usize),
 }
 
 impl fmt::Display for MultiVacancyError {
@@ -381,10 +422,20 @@ impl fmt::Display for MultiVacancyError {
                 f,
                 "unwrapped displacement of vacancy {vacancy} does not match its site"
             ),
+            Self::DisplacementOverflow { vacancy } => write!(
+                f,
+                "unwrapped displacement of vacancy {vacancy} overflowed i64"
+            ),
             Self::VacancyExchange { vacancy, direction } => write!(
                 f,
                 "vacancy {vacancy} cannot jump in direction {direction} onto another vacancy"
             ),
+            Self::VacancyOutOfRange { vacancy, count } => {
+                write!(f, "vacancy {vacancy} is out of range for {count} vacancies")
+            }
+            Self::InvalidDirection(dir) => {
+                write!(f, "multi-vacancy jump direction {dir} is out of 0..8")
+            }
         }
     }
 }
@@ -420,6 +471,7 @@ mod tests {
     fn blocks_vacancy_vacancy_exchange_and_reversible_undo_works() {
         let m = model();
         let mut state = pair_state(&m);
+        let unchanged = state.clone();
         assert_eq!(
             m.apply(
                 &mut state,
@@ -433,6 +485,7 @@ mod tests {
                 direction: 3
             })
         );
+        assert_eq!(state, unchanged);
 
         let before = state.clone();
         let undo = m
@@ -447,5 +500,77 @@ mod tests {
         assert_ne!(state, before);
         m.undo(&mut state, undo);
         assert_eq!(state, before);
+
+        let near_max = i64::MAX - 3;
+        let mut raw = Vec::new();
+        m.encode_state(&m.initial_state(&[0]).unwrap(), &mut raw);
+        raw[24..32].copy_from_slice(&near_max.to_le_bytes());
+        let mut hi_state = m.decode_state(&raw).unwrap();
+        assert!(hi_state.squared_displacement(0, 1.0).is_finite());
+        for _ in 0..3 {
+            m.apply(
+                &mut hi_state,
+                &MultiVacancyJump {
+                    vacancy: 0,
+                    direction: 7,
+                },
+            )
+            .unwrap();
+        }
+        let snap = hi_state.clone();
+        assert_eq!(
+            m.apply(
+                &mut hi_state,
+                &MultiVacancyJump {
+                    vacancy: 0,
+                    direction: 7,
+                }
+            ),
+            Err(MultiVacancyError::DisplacementOverflow { vacancy: 0 })
+        );
+        assert_eq!(hi_state, snap);
+    }
+
+    #[test]
+    fn check_invariants_rejects_duplicate_origins_and_invalid_apply_indices() {
+        let m = model();
+        let mut state = pair_state(&m);
+        let base = state.clone();
+        assert_eq!(
+            m.apply(
+                &mut state,
+                &MultiVacancyJump {
+                    vacancy: 9,
+                    direction: 0,
+                }
+            ),
+            Err(MultiVacancyError::VacancyOutOfRange {
+                vacancy: 9,
+                count: 2,
+            })
+        );
+        assert_eq!(state, base);
+        assert_eq!(
+            m.apply(
+                &mut state,
+                &MultiVacancyJump {
+                    vacancy: 0,
+                    direction: 8,
+                }
+            ),
+            Err(MultiVacancyError::InvalidDirection(8))
+        );
+        assert_eq!(state, base);
+
+        let mut dup = pair_state(&m);
+        dup.origins[1] = 0;
+        dup.displacements[1] = DISPLACEMENTS[3];
+        assert_eq!(
+            m.check_invariants(&dup),
+            Err(MultiVacancyError::DuplicateSite(0))
+        );
+        let mut raw = Vec::new();
+        m.encode_state(&dup, &mut raw);
+        assert!(m.decode_state(&raw).is_err());
     }
 }

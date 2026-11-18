@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import json
+from types import MappingProxyType
 from typing import Any, Literal, TypeAlias, TypedDict
 
 import numpy as np
@@ -16,7 +18,7 @@ BarrierPolicyName: TypeAlias = Literal["symmetric_floor", "unfloored", "strict"]
 
 
 class IllustrativeEnergeticsDict(TypedDict):
-    """Typed return structure of :func:`fecr_illustrative_energetics`."""
+    """Symmetric 3x3 pair energies ordered `(Fe, Cr, Vacancy)` on both axes and `(Fe, Cr)` KRA barriers in eV."""
 
     pair_energies_ev: npt.NDArray[np.float64]
     kra_ev: tuple[float, float]
@@ -53,7 +55,6 @@ class BarrierTableConfig:
     """Tabulated Fe–Cr NEB barrier set validated for forward/reverse detailed balance."""
 
     barrier_set_json: str
-    default_attempt_frequency_hz: float = 1e13
 
 
 EnergeticsConfig: TypeAlias = (
@@ -84,6 +85,77 @@ class SamplingConfig:
         return 0.2 * self.t_end if self.fit_method == "windowed_ols" else 0.0
 
 
+def _req_obj(obj: dict[str, Any], key: str, ctx: str) -> dict[str, Any]:
+    val = obj.get(key)
+    if not isinstance(val, dict):
+        raise ValueError(f"{ctx}.{key} must be a JSON object")
+    return val
+
+
+def _req_str(obj: dict[str, Any], key: str, ctx: str) -> str:
+    val = obj.get(key)
+    if not isinstance(val, str):
+        raise ValueError(f"{ctx}.{key} must be a string")
+    return val
+
+
+def _opt_str(obj: dict[str, Any], key: str, ctx: str) -> str | None:
+    if key not in obj or obj[key] is None:
+        return None
+    val = obj[key]
+    if not isinstance(val, str):
+        raise ValueError(f"{ctx}.{key} must be a string or null")
+    return val
+
+
+def _req_nonneg_int(obj: dict[str, Any], key: str, ctx: str) -> int:
+    val = obj.get(key)
+    if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+        raise ValueError(f"{ctx}.{key} must be a non-negative integer")
+    return val
+
+
+def _req_float(obj: dict[str, Any], key: str, ctx: str) -> float:
+    val = obj.get(key)
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValueError(f"{ctx}.{key} must be a number")
+    return float(val)
+
+
+@dataclass(frozen=True, slots=True)
+class RngPolicy:
+    """Deterministic RNG algorithm, base seed, and 256-bit key domain-separation policy."""
+
+    algorithm: str
+    base_seed: int
+    stream_policy: str
+
+
+@dataclass(frozen=True, slots=True)
+class ManifestConditions:
+    """Supercell dimensions, lattice constant in metres, temperature in kelvin, and site counts by species."""
+
+    cells: tuple[int, int, int]
+    lattice_parameter: float
+    temperature_k: float
+    composition: Mapping[str, int]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "composition", MappingProxyType(dict(self.composition)))
+
+
+@dataclass(frozen=True, slots=True)
+class EstimatorSpec:
+    """Trajectory window `[t_equil, t_end]` in seconds, sample/replica counts, and pre-run Kawasaki sweeps."""
+
+    fit_method: str
+    t_equil: float
+    t_end: float
+    sample_count: int
+    replicas: int
+    anneal_sweeps: int
+
+
 @dataclass(frozen=True, slots=True)
 class RunManifest:
     """Provenance record capturing model parameter SHA-256, optional barrier SHA-256, RNG streams, and estimator settings."""
@@ -97,27 +169,87 @@ class RunManifest:
     barrier_set_sha256: str | None
     parent_checkpoint_sha256: str | None
     catalog_backend: str
-    rng: dict[str, Any]
-    conditions: dict[str, Any]
-    estimator: dict[str, Any] | None
+    rng: RngPolicy
+    conditions: ManifestConditions
+    estimator: EstimatorSpec | None
     raw_json: str
 
     @classmethod
     def from_json(cls, raw_json: str) -> RunManifest:
+        if not isinstance(raw_json, str):
+            raise ValueError("manifest input must be a JSON string")
         data = json.loads(raw_json)
+        if not isinstance(data, dict):
+            raise ValueError("manifest JSON root must be an object")
+        version = data.get("schema_version")
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError("manifest.schema_version must be an integer")
+        if version != 1:
+            raise ValueError(f"unsupported manifest schema version {version}, expected 1")
+
+        rng_obj = _req_obj(data, "rng", "manifest")
+        rng = RngPolicy(
+            algorithm=_req_str(rng_obj, "algorithm", "rng"),
+            base_seed=_req_nonneg_int(rng_obj, "base_seed", "rng"),
+            stream_policy=_req_str(rng_obj, "stream_policy", "rng"),
+        )
+
+        cond_obj = _req_obj(data, "conditions", "manifest")
+        raw_cells = cond_obj.get("cells")
+        if (
+            not isinstance(raw_cells, list)
+            or len(raw_cells) != 3
+            or any(isinstance(c, bool) or not isinstance(c, int) or c < 0 for c in raw_cells)
+        ):
+            raise ValueError("conditions.cells must be a 3-element non-negative integer list")
+        raw_comp = _req_obj(cond_obj, "composition", "conditions")
+        comp: dict[str, int] = {}
+        for sp, count in raw_comp.items():
+            if (
+                not isinstance(sp, str)
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 0
+            ):
+                raise ValueError(
+                    "conditions.composition must map species names to non-negative integers"
+                )
+            comp[sp] = count
+        conditions = ManifestConditions(
+            cells=(raw_cells[0], raw_cells[1], raw_cells[2]),
+            lattice_parameter=_req_float(cond_obj, "lattice_parameter", "conditions"),
+            temperature_k=_req_float(cond_obj, "temperature_k", "conditions"),
+            composition=MappingProxyType(comp),
+        )
+
+        est_raw = data.get("estimator")
+        if est_raw is None:
+            estimator = None
+        elif isinstance(est_raw, dict):
+            estimator = EstimatorSpec(
+                fit_method=_req_str(est_raw, "fit_method", "estimator"),
+                t_equil=_req_float(est_raw, "t_equil", "estimator"),
+                t_end=_req_float(est_raw, "t_end", "estimator"),
+                sample_count=_req_nonneg_int(est_raw, "sample_count", "estimator"),
+                replicas=_req_nonneg_int(est_raw, "replicas", "estimator"),
+                anneal_sweeps=_req_nonneg_int(est_raw, "anneal_sweeps", "estimator"),
+            )
+        else:
+            raise ValueError("manifest.estimator must be a JSON object or null")
+
         return cls(
-            schema_version=int(data["schema_version"]),
-            crate_version=str(data["crate_version"]),
-            git_sha=str(data["git_sha"]),
-            reproducibility_tier=str(data["reproducibility_tier"]),
-            model_id=str(data["model_id"]),
-            params_sha256=str(data["params_sha256"]),
-            barrier_set_sha256=data.get("barrier_set_sha256"),
-            parent_checkpoint_sha256=data.get("parent_checkpoint_sha256"),
-            catalog_backend=str(data["catalog_backend"]),
-            rng=dict(data["rng"]),
-            conditions=dict(data["conditions"]),
-            estimator=data.get("estimator"),
+            schema_version=version,
+            crate_version=_req_str(data, "crate_version", "manifest"),
+            git_sha=_req_str(data, "git_sha", "manifest"),
+            reproducibility_tier=_req_str(data, "reproducibility_tier", "manifest"),
+            model_id=_req_str(data, "model_id", "manifest"),
+            params_sha256=_req_str(data, "params_sha256", "manifest"),
+            barrier_set_sha256=_opt_str(data, "barrier_set_sha256", "manifest"),
+            parent_checkpoint_sha256=_opt_str(data, "parent_checkpoint_sha256", "manifest"),
+            catalog_backend=_req_str(data, "catalog_backend", "manifest"),
+            rng=rng,
+            conditions=conditions,
+            estimator=estimator,
             raw_json=raw_json,
         )
 
@@ -181,17 +313,21 @@ class AnnealResult:
     tail_energy_drift_ev: float
 
 
+def _coerce_pair_matrix(pair_energies_ev: npt.ArrayLike | None) -> list[list[float]] | None:
+    if pair_energies_ev is None:
+        return None
+    arr = np.asarray(pair_energies_ev, dtype=np.float64)
+    if arr.shape != (3, 3):
+        raise ValueError(f"pair_energies_ev must have shape (3, 3), got {arr.shape}")
+    return arr.tolist()
+
+
 def _unpack_energetics(config: EnergeticsConfig) -> dict[str, Any]:
     if isinstance(config, PairEnergeticsConfig):
-        pair = (
-            np.asarray(config.pair_energies_ev, dtype=np.float64).tolist()
-            if config.pair_energies_ev is not None
-            else None
-        )
         return {
             "energetics": "pair",
             "attempt_frequency": config.attempt_frequency_hz,
-            "pair_energies_ev": pair,
+            "pair_energies_ev": _coerce_pair_matrix(config.pair_energies_ev),
             "kra_ev": config.kra_ev,
         }
     if isinstance(config, Martinez2012Config):
@@ -204,7 +340,6 @@ def _unpack_energetics(config: EnergeticsConfig) -> dict[str, Any]:
     if isinstance(config, BarrierTableConfig):
         return {
             "energetics": "tabulated",
-            "attempt_frequency": config.default_attempt_frequency_hz,
             "barrier_set_json": config.barrier_set_json,
         }
     raise TypeError(f"unsupported energetics config: {type(config)!r}")
@@ -262,7 +397,7 @@ def jump_rate(
     migration_energy_ev: float,
     temperature_k: float,
 ) -> float:
-    """Compute Arrhenius rate `nu * exp(-E_m / (k_B T))` in `s^-1` (`ValueError` on invalid inputs)."""
+    """Compute Arrhenius rate `nu * exp(-E_m / (k_B T))` in `s^-1`."""
     return _okrates.jump_rate(attempt_frequency, migration_energy_ev, temperature_k)
 
 
@@ -305,7 +440,7 @@ def run_fecr_diffusion(
     seed: int,
     anneal: AnnealConfig = AnnealConfig(),
 ) -> DiffusionResult:
-    """Run an ensemble Fe–Cr diffusion calculation (`ValueError` on invalid config, `RuntimeError` on dynamics failure)."""
+    """Run an ensemble Fe–Cr diffusion calculation."""
     kwargs = _unpack_energetics(energetics)
     raw = _okrates.run_fecr_transport(
         cells=lattice.cells,
@@ -375,29 +510,17 @@ def validate_barrier_set(
     )
 
 
-def import_pymatgen_vasp_barriers(
-    payload_json: str,
-    *,
-    default_attempt_frequency_hz: float = 1e13,
-) -> BarrierTableConfig:
+def import_pymatgen_vasp_barriers(payload_json: str) -> BarrierTableConfig:
     """Convert pymatgen/atomate2 VASP NEB JSON into a validated `BarrierTableConfig`."""
-    barrier_json = _okrates.import_pymatgen_vasp_barriers_json(payload_json)
     return BarrierTableConfig(
-        barrier_set_json=barrier_json,
-        default_attempt_frequency_hz=default_attempt_frequency_hz,
+        barrier_set_json=_okrates.import_pymatgen_vasp_barriers_json(payload_json)
     )
 
 
-def import_aiida_qe_barriers(
-    payload_json: str,
-    *,
-    default_attempt_frequency_hz: float = 1e13,
-) -> BarrierTableConfig:
+def import_aiida_qe_barriers(payload_json: str) -> BarrierTableConfig:
     """Convert AiiDA-QuantumESPRESSO NEB JSON into a validated `BarrierTableConfig`."""
-    barrier_json = _okrates.import_aiida_qe_barriers_json(payload_json)
     return BarrierTableConfig(
-        barrier_set_json=barrier_json,
-        default_attempt_frequency_hz=default_attempt_frequency_hz,
+        barrier_set_json=_okrates.import_aiida_qe_barriers_json(payload_json)
     )
 
 
@@ -420,11 +543,7 @@ def fecr_diffusion(
     fit_method: FitMethodName = "origin_slope",
 ) -> dict[str, float | int | None | npt.NDArray[np.float64]]:
     """Keyword convenience wrapper returning Fe–Cr transport observables as a dictionary."""
-    pair = (
-        np.asarray(pair_energies_ev, dtype=np.float64).tolist()
-        if pair_energies_ev is not None
-        else None
-    )
+    pair = _coerce_pair_matrix(pair_energies_ev)
     raw = _okrates.run_fecr_transport(
         cells=cells,
         cr_count=cr_count,
@@ -453,11 +572,14 @@ __all__ = [
     "BarrierTableConfig",
     "DiffusionResult",
     "EnergeticsConfig",
+    "EstimatorSpec",
     "FitMethodName",
     "IllustrativeEnergeticsDict",
     "LatticeConfig",
+    "ManifestConditions",
     "Martinez2012Config",
     "PairEnergeticsConfig",
+    "RngPolicy",
     "RunManifest",
     "SamplingConfig",
     "fecr_diffusion",

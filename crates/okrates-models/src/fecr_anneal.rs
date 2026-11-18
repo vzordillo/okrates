@@ -11,7 +11,14 @@ use crate::fecr::{Energetics, FeCrError, FeCrModel, Species};
 /// Warren–Cowley 1NN short-range order `alpha_1 = 1 - P(Cr | Fe) / x_Cr` over atom–atom 1NN bonds.
 ///
 /// Positive values indicate Fe–Cr clustering/phase separation; negative values indicate ordering.
-pub fn warren_cowley_alpha1(lattice: &BccLattice, occupancy: &[Species]) -> f64 {
+pub fn warren_cowley_alpha1(lattice: &BccLattice, occupancy: &[Species]) -> Result<f64, FeCrError> {
+    let expected = lattice.site_count();
+    if occupancy.len() != expected {
+        return Err(FeCrError::SiteCount {
+            expected,
+            found: occupancy.len(),
+        });
+    }
     let mut n_fe = 0_usize;
     let mut n_cr = 0_usize;
     let mut fe_atom_bonds = 0_usize;
@@ -38,11 +45,11 @@ pub fn warren_cowley_alpha1(lattice: &BccLattice, occupancy: &[Species]) -> f64 
     }
 
     if n_fe == 0 || n_cr == 0 || fe_atom_bonds == 0 {
-        return 0.0;
+        return Ok(0.0);
     }
     let x_cr = n_cr as f64 / (n_fe + n_cr) as f64;
     let p_cr_given_fe = fe_cr_bonds as f64 / fe_atom_bonds as f64;
-    1.0 - p_cr_given_fe / x_cr
+    Ok(1.0 - p_cr_given_fe / x_cr)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -65,15 +72,21 @@ pub struct Anneal {
     pub diagnostics: AnnealDiagnostics,
 }
 
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+    let s = a + b;
+    let v = s - a;
+    (s, (a - (s - v)) + (b - v))
+}
+
 /// Stateful Kawasaki Metropolis annealer preserving RNG and lattice state across sweep chunks.
 #[derive(Clone, Debug)]
-pub struct KawasakiAnnealer {
-    cells: [usize; 3],
-    temperature_bits: u64,
+pub struct KawasakiAnnealer<'a, E: Energetics> {
+    model: &'a FeCrModel<E>,
     occupancy: Vec<Species>,
     fe: Vec<usize>,
     cr: Vec<usize>,
     current_energy: f64,
+    energy_comp: f64,
     attempts: u64,
     accepted: u64,
     energy: Vec<f64>,
@@ -81,9 +94,9 @@ pub struct KawasakiAnnealer {
     rng: KmcRng,
 }
 
-impl KawasakiAnnealer {
-    pub fn new<E: Energetics>(
-        model: &FeCrModel<E>,
+impl<'a, E: Energetics> KawasakiAnnealer<'a, E> {
+    pub fn new(
+        model: &'a FeCrModel<E>,
         occupancy: Vec<Species>,
         rng: KmcRng,
     ) -> Result<Self, FeCrError> {
@@ -103,14 +116,14 @@ impl KawasakiAnnealer {
             }
         }
         let current_energy = model.energetics().total_energy(model.lattice(), &occupancy);
-        let initial_sro = warren_cowley_alpha1(model.lattice(), &occupancy);
+        let initial_sro = warren_cowley_alpha1(model.lattice(), &occupancy)?;
         Ok(Self {
-            cells: model.lattice().cells(),
-            temperature_bits: model.temperature_k().to_bits(),
+            model,
             occupancy,
             fe,
             cr,
             current_energy,
+            energy_comp: 0.0,
             attempts: 0,
             accepted: 0,
             energy: vec![current_energy],
@@ -119,38 +132,25 @@ impl KawasakiAnnealer {
         })
     }
 
-    pub fn run_sweeps<E: Energetics>(
-        &mut self,
-        model: &FeCrModel<E>,
-        sweeps: u64,
-    ) -> Result<(), FeCrError> {
-        if !model.energetics().supports_equilibrium_swaps() {
-            return Err(FeCrError::UnsupportedEquilibration(
-                "tabulated barrier sets define local jump rates only, not global swap energies",
-            ));
-        }
-        if model.lattice().cells() != self.cells
-            || model.temperature_k().to_bits() != self.temperature_bits
-        {
-            return Err(FeCrError::AnnealerModelMismatch);
-        }
-        let recomputed = model
-            .energetics()
-            .total_energy(model.lattice(), &self.occupancy);
-        if (recomputed - self.current_energy).abs() > 1e-9 {
-            return Err(FeCrError::AnnealerModelMismatch);
-        }
-        let lattice = model.lattice();
-        let energetics = model.energetics();
-        let kt = model.kt();
+    pub fn run_sweeps(&mut self, sweeps: u64) -> Result<(), FeCrError> {
+        let additional = usize::try_from(sweeps).map_err(|_| FeCrError::SweepAllocation(sweeps))?;
+        self.energy
+            .try_reserve(additional)
+            .map_err(|_| FeCrError::SweepAllocation(sweeps))?;
+        self.sro_alpha1
+            .try_reserve(additional)
+            .map_err(|_| FeCrError::SweepAllocation(sweeps))?;
+
+        let lattice = self.model.lattice();
+        let energetics = self.model.energetics();
+        let kt = self.model.kt();
         let proposals = if self.fe.is_empty() || self.cr.is_empty() {
             0
         } else {
             self.fe.len() + self.cr.len()
         };
-        self.energy.reserve(sweeps as usize);
-        self.sro_alpha1.reserve(sweeps as usize);
         for _ in 0..sweeps {
+            let mut changed = false;
             for _ in 0..proposals {
                 let a =
                     ((self.rng.open01() * self.fe.len() as f64) as usize).min(self.fe.len() - 1);
@@ -162,13 +162,27 @@ impl KawasakiAnnealer {
                 if u < (-delta / kt).exp() {
                     self.occupancy.swap(self.fe[a], self.cr[b]);
                     std::mem::swap(&mut self.fe[a], &mut self.cr[b]);
-                    self.current_energy += delta;
+                    let prev = self.current_energy;
+                    let (s, err) = two_sum(prev, delta);
+                    let (hi, lo) = two_sum(s, self.energy_comp + err);
+                    if hi.abs() < 1e-3 * prev.abs() {
+                        self.current_energy = energetics.total_energy(lattice, &self.occupancy);
+                        self.energy_comp = 0.0;
+                    } else {
+                        self.current_energy = hi;
+                        self.energy_comp = lo;
+                    }
                     self.accepted += 1;
+                    changed = true;
                 }
             }
             self.energy.push(self.current_energy);
-            self.sro_alpha1
-                .push(warren_cowley_alpha1(lattice, &self.occupancy));
+            let sro = if changed {
+                warren_cowley_alpha1(lattice, &self.occupancy)?
+            } else {
+                self.current_sro_alpha1()
+            };
+            self.sro_alpha1.push(sro);
         }
         Ok(())
     }
@@ -230,6 +244,6 @@ pub fn anneal<E: Energetics>(
     seed: u64,
 ) -> Result<Anneal, FeCrError> {
     let mut annealer = KawasakiAnnealer::new(model, occupancy, KmcRng::from_seed(seed))?;
-    annealer.run_sweeps(model, sweeps)?;
+    annealer.run_sweeps(sweeps)?;
     Ok(annealer.finish())
 }

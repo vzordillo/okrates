@@ -1,5 +1,6 @@
 //! Simulation clock using exact TwoSum compensated summation.
 
+use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
 
@@ -31,11 +32,19 @@ impl Clock {
         if !time.is_finite() || time.is_sign_negative() || !comp.is_finite() {
             return Err(ClockError::InvalidState { time, comp });
         }
-        let comp = if comp == 0.0 { 0.0 } else { comp };
-        if (time + comp).to_bits() != time.to_bits() {
+        let norm_comp = if comp == 0.0 { 0.0 } else { comp };
+        if (time == 0.0 && norm_comp != 0.0) || time + norm_comp < 0.0 {
             return Err(ClockError::InvalidState { time, comp });
         }
-        Ok(Self { time, comp })
+        let (s, e) = two_sum(time, norm_comp);
+        let norm_e = if e == 0.0 { 0.0 } else { e };
+        if s.to_bits() != time.to_bits() || norm_e.to_bits() != norm_comp.to_bits() {
+            return Err(ClockError::InvalidState { time, comp });
+        }
+        Ok(Self {
+            time,
+            comp: norm_comp,
+        })
     }
 
     pub fn time(&self) -> f64 {
@@ -72,6 +81,25 @@ impl Clock {
         self.time = next_time;
         self.comp = if next_comp == 0.0 { 0.0 } else { next_comp };
         Ok(())
+    }
+
+    /// Orders `time + comp` against `target` without collapsing `comp`.
+    pub fn cmp_f64(&self, target: f64) -> Ordering {
+        if !target.is_finite() {
+            return self.time.total_cmp(&target);
+        }
+        if target < 0.0 {
+            return Ordering::Greater;
+        }
+        let (diff, err) = two_sum(self.time, -target);
+        let (hi, lo) = two_sum(diff, err + self.comp);
+        if hi > 0.0 || (hi == 0.0 && lo > 0.0) {
+            Ordering::Greater
+        } else if hi < 0.0 || (hi == 0.0 && lo < 0.0) {
+            Ordering::Less
+        } else {
+            Ordering::Equal
+        }
     }
 }
 
@@ -161,5 +189,56 @@ mod tests {
             })
         );
         assert_eq!(clock, before);
+    }
+
+    #[test]
+    fn from_parts_enforces_canonical_twosum_and_nonnegative_time() {
+        let zero = Clock::from_parts(0.0, -0.0).unwrap();
+        assert_eq!(zero.compensation().to_bits(), 0.0_f64.to_bits());
+
+        for (time, comp) in [
+            (-0.0, 0.0),
+            (0.0, 1e-300),
+            (0.0, -1e-300),
+            (1e-320, -1e-300),
+            (10.0, 1.0),
+            (f64::MAX, f64::MAX),
+            (1.0, f64::NAN),
+        ] {
+            assert!(
+                matches!(
+                    Clock::from_parts(time, comp),
+                    Err(ClockError::InvalidState { .. })
+                ),
+                "accepted invalid clock parts ({time:e}, {comp:e})"
+            );
+        }
+    }
+
+    #[test]
+    fn cmp_f64_orders_sub_ulp_compensations_and_binade_midpoints() {
+        use std::cmp::Ordering;
+
+        let prev = 1.0 - 2.0_f64.powi(-53);
+        let below = Clock::from_parts(1.0, -2.0_f64.powi(-54)).unwrap();
+        let exact = Clock::from_parts(1.0, 0.0).unwrap();
+        let above = Clock::from_parts(1.0, 2.0_f64.powi(-54)).unwrap();
+
+        assert_eq!(below.cmp_f64(prev), Ordering::Greater);
+        assert_eq!(below.cmp_f64(1.0), Ordering::Less);
+        assert_eq!(exact.cmp_f64(1.0), Ordering::Equal);
+        assert_eq!(above.cmp_f64(1.0), Ordering::Greater);
+        assert_eq!(
+            Clock::from_parts(prev, 0.0).unwrap().cmp_f64(prev),
+            Ordering::Equal
+        );
+        assert_eq!(Clock::new().cmp_f64(-0.0), Ordering::Equal);
+        assert_eq!(Clock::new().cmp_f64(-1.0), Ordering::Greater);
+        assert_eq!(
+            Clock::from_parts(f64::MAX, 0.0).unwrap().cmp_f64(-f64::MAX),
+            Ordering::Greater
+        );
+        assert_eq!(exact.cmp_f64(f64::INFINITY), Ordering::Less);
+        assert_eq!(exact.cmp_f64(f64::NEG_INFINITY), Ordering::Greater);
     }
 }

@@ -4,11 +4,12 @@
 //! DFT or literature source; use [`crate::fecr_martinez::Martinez2012`] or
 //! [`crate::tabulated::TabulatedEnergetics`] for parameterized alloy studies.
 
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
-use okrates_core::{Checkpointable, IncrementalModel, KmcRng, Model, ReversibleModel};
+use okrates_core::{
+    Checkpointable, IncrementalModel, IndependentSnapshot, KmcRng, Model, ReversibleModel,
+};
 
 use crate::bcc::{BccLattice, DISPLACEMENTS};
 use crate::vacancy::BOLTZMANN_EV_PER_K;
@@ -53,6 +54,10 @@ impl Species {
 }
 
 /// Energetics contract (energies in eV, frequencies in s⁻¹) for single-vacancy Fe–Cr states.
+///
+/// Conservative Hamiltonians (`supports_equilibrium_swaps() == true`) define `total_energy`,
+/// `swap_delta`, and path-independent `exchange_delta == E_after - E_before`; rate-only tables
+/// (`false`) return `NaN` on those methods and supply local jump parameters directly.
 pub trait Energetics {
     fn total_energy(&self, lattice: &BccLattice, occupancy: &[Species]) -> f64;
 
@@ -67,6 +72,9 @@ pub trait Energetics {
 
     /// `E_after - E_before` in eV for swapping non-vacancy sites `i` and `j`.
     fn swap_delta(&self, lattice: &BccLattice, occupancy: &[Species], i: usize, j: usize) -> f64 {
+        if occupancy.len() != lattice.site_count() || i >= occupancy.len() || j >= occupancy.len() {
+            return f64::NAN;
+        }
         let before = self.total_energy(lattice, occupancy);
         let mut after = occupancy.to_vec();
         after.swap(i, j);
@@ -82,13 +90,13 @@ pub trait Energetics {
         atom_site: usize,
     ) -> f64;
 
-    /// Species-specific attempt frequency in s⁻¹ (`None` falls back to the model default).
+    /// Species-specific attempt frequency in s⁻¹ (`None` uses model default; `0.0` disables jumps).
     fn attempt_frequency(&self, atom: Species) -> Option<f64> {
         let _ = atom;
         None
     }
 
-    /// Environment-specific attempt frequency in s⁻¹; defaults to [`Self::attempt_frequency`].
+    /// Environment-specific attempt frequency in s⁻¹ (`0.0` disables jumps; negative/non-finite values surface `SimError::InvalidRate`).
     fn jump_attempt_frequency(
         &self,
         lattice: &BccLattice,
@@ -97,7 +105,24 @@ pub trait Energetics {
         atom_site: usize,
     ) -> Option<f64> {
         let _ = (lattice, vacancy_site);
-        self.attempt_frequency(occupancy[atom_site])
+        occupancy
+            .get(atom_site)
+            .copied()
+            .and_then(|s| self.attempt_frequency(s))
+    }
+
+    /// Combined `(barrier_ev, attempt_frequency_hz)` lookup for single-pass table resolution.
+    fn jump_parameters(
+        &self,
+        lattice: &BccLattice,
+        occupancy: &[Species],
+        vacancy_site: usize,
+        atom_site: usize,
+    ) -> (f64, Option<f64>) {
+        (
+            self.barrier(lattice, occupancy, vacancy_site, atom_site),
+            self.jump_attempt_frequency(lattice, occupancy, vacancy_site, atom_site),
+        )
     }
 
     /// Whether `total_energy` and `swap_delta` define a conservative Hamiltonian for Kawasaki swaps.
@@ -190,6 +215,9 @@ impl PairEnergetics {
 
 impl Energetics for PairEnergetics {
     fn total_energy(&self, lattice: &BccLattice, occupancy: &[Species]) -> f64 {
+        if occupancy.len() != lattice.site_count() {
+            return f64::NAN;
+        }
         let mut sum = 0.0;
         for (site, &species) in occupancy.iter().enumerate() {
             for direction in 0..8 {
@@ -207,6 +235,12 @@ impl Energetics for PairEnergetics {
         vacancy_site: usize,
         atom_site: usize,
     ) -> f64 {
+        if occupancy.len() != lattice.site_count()
+            || vacancy_site >= occupancy.len()
+            || atom_site >= occupancy.len()
+        {
+            return f64::NAN;
+        }
         let atom = occupancy[atom_site];
         let gained: f64 = lattice
             .neighbors(vacancy_site)
@@ -224,6 +258,9 @@ impl Energetics for PairEnergetics {
     }
 
     fn swap_delta(&self, lattice: &BccLattice, occupancy: &[Species], i: usize, j: usize) -> f64 {
+        if occupancy.len() != lattice.site_count() || i >= occupancy.len() || j >= occupancy.len() {
+            return f64::NAN;
+        }
         let a = occupancy[i].index();
         let b = occupancy[j].index();
         let around_i: f64 = lattice
@@ -254,8 +291,10 @@ impl Energetics for PairEnergetics {
         vacancy_site: usize,
         atom_site: usize,
     ) -> f64 {
-        self.kra(occupancy[atom_site])
-            + self.exchange_delta(lattice, occupancy, vacancy_site, atom_site) / 2.0
+        let Some(&jumper) = occupancy.get(atom_site) else {
+            return f64::NAN;
+        };
+        self.kra(jumper) + self.exchange_delta(lattice, occupancy, vacancy_site, atom_site) / 2.0
     }
 
     fn validate(&self, _lattice: &BccLattice, _temperature_k: f64) -> Result<(), FeCrError> {
@@ -283,6 +322,12 @@ pub struct FeCrState {
     atom_at: Vec<usize>,
     origin: Vec<usize>,
     disp: Vec<[i64; 3]>,
+}
+
+impl IndependentSnapshot for FeCrState {
+    fn snapshot(&self) -> Self {
+        self.clone()
+    }
 }
 
 impl FeCrState {
@@ -319,22 +364,22 @@ impl FeCrState {
             .map(|(site, &species)| (species, self.displacement_of_site(site)))
     }
 
-    pub fn collective_displacement(&self, species: Species) -> [i64; 3] {
-        let mut sum = [0; 3];
+    pub fn collective_displacement(&self, species: Species) -> [i128; 3] {
+        let mut sum = [0_i128; 3];
         for (s, d) in self.atom_displacements() {
             if s == species {
                 for axis in 0..3 {
-                    sum[axis] += d[axis];
+                    sum[axis] += d[axis] as i128;
                 }
             }
         }
         sum
     }
 
-    pub fn tracer_squared_sum(&self, species: Species) -> i64 {
+    pub fn tracer_squared_sum(&self, species: Species) -> f64 {
         self.atom_displacements()
             .filter(|&(s, _)| s == species)
-            .map(|(_, d)| d.iter().map(|c| c * c).sum::<i64>())
+            .map(|(_, d)| d.iter().map(|&c| (c as f64) * (c as f64)).sum::<f64>())
             .sum()
     }
 }
@@ -427,7 +472,7 @@ impl<E: Energetics> FeCrModel<E> {
         rng: &mut KmcRng,
     ) -> Result<FeCrState, FeCrError> {
         let n = self.lattice.site_count();
-        if cr_count + 1 > n {
+        if cr_count >= n {
             return Err(FeCrError::TooManyAtoms);
         }
         let mut order: Vec<usize> = (0..n).collect();
@@ -444,21 +489,29 @@ impl<E: Energetics> FeCrModel<E> {
     }
 
     pub fn barrier(&self, state: &FeCrState, direction: usize) -> f64 {
+        if direction >= 8 {
+            return f64::NAN;
+        }
         let target = self.lattice.neighbor(state.vacancy, direction);
         self.energetics
             .barrier(&self.lattice, &state.occupancy, state.vacancy, target)
     }
 
-    /// Jump rate in s⁻¹ along `direction`; returns `NaN` if the energetics produce a non-finite barrier.
+    /// Jump rate in s⁻¹ along `direction` (`0.0` when attempt frequency is `0.0`, `NaN` on invalid prefactor or non-finite barrier).
     pub fn rate(&self, state: &FeCrState, direction: usize) -> f64 {
-        let target = self.lattice.neighbor(state.vacancy, direction);
-        let nu = self
-            .energetics
-            .jump_attempt_frequency(&self.lattice, &state.occupancy, state.vacancy, target)
-            .unwrap_or(self.attempt_frequency);
-        let b = self.barrier(state, direction);
-        if !nu.is_finite() || nu <= 0.0 || !b.is_finite() {
+        if direction >= 8 {
             return f64::NAN;
+        }
+        let target = self.lattice.neighbor(state.vacancy, direction);
+        let (b, nu_opt) =
+            self.energetics
+                .jump_parameters(&self.lattice, &state.occupancy, state.vacancy, target);
+        let nu = nu_opt.unwrap_or(self.attempt_frequency);
+        if !nu.is_finite() || nu < 0.0 || !b.is_finite() {
+            return f64::NAN;
+        }
+        if nu == 0.0 {
+            return 0.0;
         }
         nu * (-b / self.kt()).exp()
     }
@@ -497,14 +550,20 @@ impl<E: Energetics> FeCrModel<E> {
         }
         let period: [i128; 3] = std::array::from_fn(|axis| 2 * self.lattice.cells()[axis] as i128);
         let mut seen_entities = vec![false; expected];
+        let mut seen_origins = vec![false; expected];
         for site in 0..expected {
             let entity = state.atom_at[site];
-            if entity >= expected || state.origin[entity] >= expected || seen_entities[entity] {
+            if entity >= expected {
+                return Err(FeCrError::UnwrappedMismatch { site });
+            }
+            let orig = state.origin[entity];
+            if orig >= expected || seen_entities[entity] || seen_origins[orig] {
                 return Err(FeCrError::UnwrappedMismatch { site });
             }
             seen_entities[entity] = true;
+            seen_origins[orig] = true;
             let here = self.lattice.position(site);
-            let start = self.lattice.position(state.origin[entity]);
+            let start = self.lattice.position(orig);
             let d = state.disp[entity];
             if (0..3).any(|axis| {
                 (here[axis] as i128 - start[axis] as i128 - d[axis] as i128)
@@ -611,7 +670,7 @@ pub(crate) fn decode_fecr_state<E: Energetics>(
 impl<E: Energetics> Model for FeCrModel<E> {
     type State = FeCrState;
     type Event = FeCrJump;
-    type Error = Infallible;
+    type Error = FeCrError;
 
     fn enumerate_events(&self, state: &Self::State, emit: &mut dyn FnMut(Self::Event, f64)) {
         for direction in 0..8 {
@@ -620,15 +679,25 @@ impl<E: Energetics> Model for FeCrModel<E> {
     }
 
     fn apply(&self, state: &mut Self::State, event: &Self::Event) -> Result<(), Self::Error> {
+        let Some(&shift) = DISPLACEMENTS.get(event.direction) else {
+            return Err(FeCrError::InvalidDirection(event.direction));
+        };
         let v = state.vacancy;
         let target = self.lattice.neighbor(v, event.direction);
-        let shift = DISPLACEMENTS[event.direction];
         let vacancy_id = state.atom_at[v];
         let atom_id = state.atom_at[target];
+        let mut next_vac_disp = [0_i64; 3];
+        let mut next_atom_disp = [0_i64; 3];
         for axis in 0..3 {
-            state.disp[vacancy_id][axis] += shift[axis];
-            state.disp[atom_id][axis] -= shift[axis];
+            next_vac_disp[axis] = state.disp[vacancy_id][axis]
+                .checked_add(shift[axis])
+                .ok_or(FeCrError::DisplacementOverflow)?;
+            next_atom_disp[axis] = state.disp[atom_id][axis]
+                .checked_sub(shift[axis])
+                .ok_or(FeCrError::DisplacementOverflow)?;
         }
+        state.disp[vacancy_id] = next_vac_disp;
+        state.disp[atom_id] = next_atom_disp;
         state.occupancy.swap(v, target);
         state.atom_at.swap(v, target);
         state.vacancy = target;
@@ -712,12 +781,14 @@ pub enum FeCrError {
     VacancyMismatch,
     TooManyAtoms,
     DisplacementSum,
+    DisplacementOverflow,
+    InvalidDirection(usize),
     UnwrappedMismatch { site: usize },
     LatticeTooSmall { min_cells: usize },
     TemperatureMismatch { model: f64, energetics: f64 },
     BarrierTable(String),
     UnsupportedEquilibration(&'static str),
-    AnnealerModelMismatch,
+    SweepAllocation(u64),
 }
 
 impl fmt::Display for FeCrError {
@@ -743,6 +814,10 @@ impl fmt::Display for FeCrError {
             Self::VacancyMismatch => write!(f, "vacancy field does not point to the vacancy"),
             Self::TooManyAtoms => write!(f, "more Cr atoms and vacancies than sites"),
             Self::DisplacementSum => write!(f, "displacements do not sum to zero"),
+            Self::DisplacementOverflow => write!(f, "entity unwrapped displacement overflowed i64"),
+            Self::InvalidDirection(dir) => {
+                write!(f, "Fe-Cr jump direction {dir} is out of 0..8")
+            }
             Self::UnwrappedMismatch { site } => write!(
                 f,
                 "entity on site {site} has an unwrapped displacement inconsistent with its site"
@@ -759,11 +834,8 @@ impl fmt::Display for FeCrError {
             ),
             Self::BarrierTable(msg) => write!(f, "invalid barrier table: {msg}"),
             Self::UnsupportedEquilibration(msg) => write!(f, "equilibration unsupported: {msg}"),
-            Self::AnnealerModelMismatch => {
-                write!(
-                    f,
-                    "annealer model differs from model used at initialization"
-                )
+            Self::SweepAllocation(sweeps) => {
+                write!(f, "cannot allocate anneal trace for {sweeps} sweeps")
             }
         }
     }
@@ -773,9 +845,31 @@ impl Error for FeCrError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{FeCrError, FeCrJump, FeCrModel, PairEnergetics, Species};
+    use super::{Energetics, FeCrError, FeCrJump, FeCrModel, PairEnergetics, Species};
     use crate::bcc::BccLattice;
-    use okrates_core::ReversibleModel;
+    use crate::fecr_martinez::Martinez2012;
+    use okrates_core::{Model, ReversibleModel};
+
+    #[derive(Clone, Debug)]
+    struct ZeroAttemptEnergetics(PairEnergetics);
+
+    impl Energetics for ZeroAttemptEnergetics {
+        fn total_energy(&self, l: &BccLattice, occ: &[Species]) -> f64 {
+            self.0.total_energy(l, occ)
+        }
+        fn exchange_delta(&self, l: &BccLattice, occ: &[Species], v: usize, a: usize) -> f64 {
+            self.0.exchange_delta(l, occ, v, a)
+        }
+        fn barrier(&self, l: &BccLattice, occ: &[Species], v: usize, a: usize) -> f64 {
+            self.0.barrier(l, occ, v, a)
+        }
+        fn attempt_frequency(&self, atom: Species) -> Option<f64> {
+            match atom {
+                Species::Cr => Some(0.0),
+                _ => Some(1e13),
+            }
+        }
+    }
 
     #[test]
     fn illustrative_passes_new() {
@@ -828,5 +922,103 @@ mod tests {
         assert_ne!(state, before);
         model.undo(&mut state, undo);
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn zero_attempt_frequency_disables_species_jumps_with_zero_rate() {
+        let lattice = BccLattice::new([3, 3, 3]).unwrap();
+        let frozen_cr = FeCrModel::new(
+            lattice.clone(),
+            ZeroAttemptEnergetics(PairEnergetics::illustrative()),
+            1e13,
+            800.0,
+        )
+        .unwrap();
+        let mut occ = vec![Species::Fe; lattice.site_count()];
+        occ[0] = Species::Vacancy;
+        occ[lattice.neighbor(0, 0)] = Species::Cr;
+        let st = frozen_cr.state(occ).unwrap();
+        assert_eq!(frozen_cr.rate(&st, 0), 0.0);
+        assert!(frozen_cr.rate(&st, 1) > 0.0);
+        assert!(frozen_cr.rate(&st, 8).is_nan());
+        assert!(frozen_cr.barrier(&st, 8).is_nan());
+    }
+
+    #[test]
+    fn short_occupancy_slices_return_nan_across_energetics() {
+        let lattice = BccLattice::new([3, 3, 3]).unwrap();
+        let short = [Species::Vacancy, Species::Fe];
+        let m2012 = Martinez2012::new(800.0).unwrap();
+        let default_swap = ZeroAttemptEnergetics(PairEnergetics::illustrative());
+        for e in [
+            PairEnergetics::illustrative().total_energy(&lattice, &short),
+            PairEnergetics::illustrative().exchange_delta(&lattice, &short, 0, 1),
+            PairEnergetics::illustrative().swap_delta(&lattice, &short, 0, 1),
+            PairEnergetics::illustrative().barrier(&lattice, &short, 0, 1),
+            default_swap.swap_delta(&lattice, &short, 0, 1),
+            m2012.total_energy(&lattice, &short),
+            m2012.exchange_delta(&lattice, &short, 0, 1),
+            m2012.swap_delta(&lattice, &short, 0, 1),
+            m2012.barrier(&lattice, &short, 0, 1),
+        ] {
+            assert!(e.is_nan());
+        }
+    }
+
+    #[test]
+    fn check_invariants_rejects_duplicate_origins() {
+        let lattice = BccLattice::new([3, 3, 3]).unwrap();
+        let model = FeCrModel::new(lattice, PairEnergetics::illustrative(), 1e13, 800.0).unwrap();
+        let mut sneaky = model.random_state(0, 9).unwrap();
+        sneaky.origin[1] = 0;
+        sneaky.origin[2] = 0;
+        sneaky.disp[1] = [0, 0, 2];
+        sneaky.disp[2] = [0, 0, -2];
+        assert!(matches!(
+            model.check_invariants(&sneaky),
+            Err(FeCrError::UnwrappedMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_rejects_invalid_direction_and_displacement_overflow_atomically() {
+        let lattice = BccLattice::new([3, 3, 3]).unwrap();
+        let model =
+            FeCrModel::new(lattice.clone(), PairEnergetics::illustrative(), 1e13, 800.0).unwrap();
+        let n = lattice.site_count();
+        let mut occ = vec![Species::Fe; n];
+        occ[0] = Species::Vacancy;
+        let mut state = model.state(occ).unwrap();
+        let base = state.clone();
+        assert_eq!(
+            model.apply(&mut state, &FeCrJump { direction: 8 }),
+            Err(FeCrError::InvalidDirection(8))
+        );
+        assert_eq!(state, base);
+
+        let mult6 = i64::MAX - (i64::MAX % 6);
+        state.disp[0] = [mult6, 0, 0];
+        state.disp[1] = [-mult6, 0, 0];
+        assert_eq!(model.check_invariants(&state), Ok(()));
+        assert!(state.tracer_squared_sum(Species::Fe).is_finite());
+        while state.disp[0][0] < i64::MAX {
+            model.apply(&mut state, &FeCrJump { direction: 7 }).unwrap();
+        }
+        let snap = state.clone();
+        assert_eq!(
+            model.apply(&mut state, &FeCrJump { direction: 7 }),
+            Err(FeCrError::DisplacementOverflow)
+        );
+        assert_eq!(state, snap);
+    }
+
+    #[test]
+    fn random_state_rejects_oversized_cr_count() {
+        let lattice = BccLattice::new([3, 3, 3]).unwrap();
+        let model = FeCrModel::new(lattice, PairEnergetics::illustrative(), 1e13, 800.0).unwrap();
+        assert_eq!(
+            model.random_state(usize::MAX, 1),
+            Err(FeCrError::TooManyAtoms)
+        );
     }
 }

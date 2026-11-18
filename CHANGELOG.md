@@ -7,8 +7,8 @@ All notable changes to `okrates` are documented in this file.
 ### Added
 - **`okrates-core` 3-seam architecture**: `TransitionTopology` (`apply` + `undo`), `EnumeratedTopology`, `SlottedTopology`, `RateModel<T>`, `CoupledModel<T, R>`, and unified transactional `Engine<M, C: CatalogBackend<M>>` (`DirectCatalog`, `SumTreeCatalog`).
 - **Compensated time integration**: Error-free TwoSum `Clock` preserving sub-ULP residence-time increments in long trajectories and surfacing `ClockError::Stagnation` instead of silently stalling.
-- **Lazy piecewise-constant trajectory sampling**: `SampleGrid` (`windowed` and `from_origin`) and `sample_trajectory` evaluating observables only when crossing sample times with error-atomic per-step transitions and zero panic paths.
-- **Domain-separated RNG streams**: `StreamRole` (`Dynamics`, `InitialState`, `Equilibration`, `Diagnostic`), `KmcRng::for_replica`, `ReplicaContext`, and `run_ensemble` supporting every `u64` base seed (`0..=u64::MAX`).
+- **Lazy piecewise-constant trajectory sampling**: `SampleGrid` (`windowed` and `from_origin`) and `sample_trajectory` evaluating observables only when crossing sample times with error-atomic per-step transitions (mid-trajectory errors leave `sim` at the last completed step without rolling back earlier steps) and zero panic paths.
+- **Domain-separated RNG streams**: `StreamRole` (`Dynamics`, `InitialState`, `Equilibration`, `Custom(u16)`), `KmcRng::for_replica`, `ReplicaContext`, and `run_ensemble` supporting every `u64` base seed (`0..=u64::MAX`).
 - **`okrates-schema` crate**: `RunManifest` v1 (SHA-256 parameter, barrier-table, and checkpoint lineage + build-time git SHA), `BarrierRecord` / `BarrierSet` forward-reverse detailed-balance validator, and JSON adapters for `pymatgen`/`atomate2` (VASP NEB) and `AiiDA-QuantumESPRESSO`.
 - **`okrates-models` physics & estimators**:
   - `TabulatedEnergetics` for DFT/NEB Fe–Cr barrier sets with automatic reverse-environment detailed balance.
@@ -20,9 +20,9 @@ All notable changes to `okrates` are documented in this file.
 - **Repository standards**: `REPRODUCIBILITY.md` and `.coderabbit.yaml`.
 
 ### Changed (Breaking)
-- **Checkpoint schema bumped to v2 (`SCHEMA_VERSION = 2`)**: Persists TwoSum clock compensation bits alongside `time`. v1 checkpoints fail cleanly with `CheckpointError::UnsupportedSchema(1)`.
+- **Checkpoint schema bumped to v2 (`SCHEMA_VERSION = 2`)**: Persists TwoSum clock compensation bits alongside `time`. v1 checkpoints fail cleanly with `CheckpointError::UnsupportedVersion(1)`.
 - **Ensemble RNG seeding**: `run_transport` / `run_composition` now draw from `ChaCha12` substreams keyed by `(replica_id, StreamRole)` instead of `seed + 1_000_000_000` arithmetic offsets.
-- **Correlation factor $f$ estimator**: `summarize` now computes $f = N_{\mathrm{atoms}} \overline{D^*_{\mathrm{all}}} / \overline{D_v}$ via `jackknife_ratio_mean_se` instead of averaging noisy per-replica ratios $\overline{D^*_r / D_{v,r}}$ (eliminating the $O(1)$ per-replica ratio Jensen bias).
+- **Correlation factor $f$ estimator**: `summarize` now computes $f = N_{\mathrm{atoms}} \overline{D^*_{\mathrm{all}}} / \overline{D_v}$ via `jackknife_ratio_mean_se` instead of averaging noisy per-replica ratios $\overline{D^*_r / D_{v,r}}$ (avoiding noisy per-replica ratio averaging).
 - **Fallible lazy `sample_run` & Python error mapping**: `sample_run` returns `Result<..., TransportError>` instead of panicking; Python bindings map invalid inputs to `ValueError` and runtime simulation failures to `RuntimeError` with zero `PanicException` paths.
 
 ## [0.0.1] - Initial Prototype

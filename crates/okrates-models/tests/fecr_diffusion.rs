@@ -73,12 +73,12 @@ fn tracking_invariants_hold_after_every_event() {
             .atom_displacements()
             .fold([0; 3], |acc, (_, d)| add(acc, d));
         assert_eq!(total, neg(vac));
+        let vac_wide = vac.map(i128::from);
+        let c_fe = state.collective_displacement(Species::Fe);
+        let c_cr = state.collective_displacement(Species::Cr);
         assert_eq!(
-            add(
-                state.collective_displacement(Species::Fe),
-                state.collective_displacement(Species::Cr)
-            ),
-            neg(vac)
+            std::array::from_fn::<i128, 3, _>(|axis| c_fe[axis] + c_cr[axis]),
+            vac_wide.map(|c| -c)
         );
     }
 }
@@ -255,4 +255,61 @@ fn windowed_ols_transport_handles_u64_max_seed_and_builds_manifest() {
     let json = manifest.to_json_pretty().unwrap();
     let decoded = okrates_schema::RunManifest::from_json(&json).unwrap();
     assert_eq!(decoded, manifest);
+}
+
+#[test]
+fn transport_rejects_oversized_cr_count_and_handles_extreme_displacements() {
+    use okrates_core::Checkpointable;
+    use okrates_models::fecr::FeCrError;
+    use okrates_models::fecr_diffusion::{ReplicaRun, TransportError, observables, ols_slope};
+
+    let model = equal_energy_model();
+    let cfg = TransportConfig::windowed(5.0, 25.0, 8, 1.0);
+    assert!(matches!(
+        run_transport(&model, usize::MAX, 1, 2, &cfg, 0),
+        Err(TransportError::Model(FeCrError::TooManyAtoms))
+    ));
+    assert!(origin_slope(&[], &[]).is_nan());
+    assert!(ols_slope(&[1.0], &[2.0]).is_nan());
+    assert!(mean_se(&[]).0.is_nan());
+
+    let init = model.random_state(0, 7).unwrap();
+    let mut raw = Vec::new();
+    model.encode_state(&init, &mut raw);
+    let n = model.lattice().site_count();
+    let disp_offset = 16 + n + 8 * n + 8 * n;
+    let mult8 = i64::MAX - (i64::MAX % 8);
+    raw[disp_offset..disp_offset + 8].copy_from_slice(&mult8.to_le_bytes());
+    raw[disp_offset + 24..disp_offset + 32].copy_from_slice(&(-mult8).to_le_bytes());
+    let extreme = model.decode_state(&raw).unwrap();
+    let obs = observables(&extreme, 1.0);
+    assert!(obs.tracer[0].is_finite() && obs.collective[0].is_finite() && obs.vacancy.is_finite());
+
+    let dummy_est = ReplicaEstimate {
+        tracer: [1.0, 1.0],
+        tracer_all: 1.0,
+        collective: [1.0, 0.0, 1.0],
+        s: 1.0,
+        vacancy: 1.0,
+    };
+    let big_runs = vec![
+        ReplicaRun {
+            estimate: dummy_est,
+            early_tracer_all: None,
+            late_tracer_all: None,
+            fired: u64::MAX,
+            anneal_energy: Vec::new(),
+            final_sro_alpha1: None,
+        },
+        ReplicaRun {
+            estimate: dummy_est,
+            early_tracer_all: None,
+            late_tracer_all: None,
+            fired: u64::MAX,
+            anneal_energy: Vec::new(),
+            final_sro_alpha1: None,
+        },
+    ];
+    let s = summarize(&big_runs, 1, 2);
+    assert!((s.mean_jumps - u64::MAX as f64).abs() <= 4096.0);
 }

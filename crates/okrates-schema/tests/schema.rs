@@ -40,6 +40,7 @@ fn run_manifest_round_trips_and_tracks_checkpoint_lineage() {
     let json = manifest.to_json_pretty().unwrap();
     let decoded = RunManifest::from_json(&json).unwrap();
     assert_eq!(manifest, decoded);
+    assert_eq!(manifest.reproducibility_tier, "bitwise_same_crate_same_fp");
     assert_eq!(manifest.params_sha256, sha256_hex(b"encoded-params-bytes"));
     assert_eq!(
         manifest.parent_checkpoint_sha256.as_deref(),
@@ -146,11 +147,14 @@ fn pymatgen_vasp_and_aiida_qe_adapters_round_trip_and_reject_unphysical_paths() 
     assert!((set.records[0].forward_barrier_ev - 0.65).abs() < 1e-12);
     assert!((set.records[0].delta_energy_ev - 0.02).abs() < 1e-12);
     assert_eq!(set.records[0].temp_range_k, Some([500.0, 1100.0]));
+    assert_eq!(set.records[1].temp_range_k, None);
 
     let reexported = export_pymatgen_vasp_json(&set).unwrap();
+    assert!(!reexported.contains("\"temp_range_k\": null"));
     let reimported = import_pymatgen_vasp_json(&reexported).unwrap();
     assert_eq!(reimported.records.len(), 2);
     assert_eq!(reimported.records[0].temp_range_k, Some([500.0, 1100.0]));
+    assert_eq!(reimported.records[1].temp_range_k, None);
 
     // Interior NEB image lower than endpoint produces negative barrier and is rejected.
     let bad_vasp = r#"{
@@ -172,13 +176,34 @@ fn pymatgen_vasp_and_aiida_qe_adapters_round_trip_and_reject_unphysical_paths() 
         ))
     ));
 
-    // AiiDA-QuantumESPRESSO round-trip + THz/uncertainty/temp_range_k preservation.
+    let mut bad_vasp_temp: serde_json::Value = serde_json::from_str(&reexported).unwrap();
+    bad_vasp_temp["tasks"][0]["temp_range_k"] = serde_json::json!([900.0, 400.0]);
+    assert!(matches!(
+        import_pymatgen_vasp_json(&bad_vasp_temp.to_string()),
+        Err(AdapterError::Validation(
+            BarrierValidationError::InvalidTemperatureBounds {
+                id,
+                min_k: 900.0,
+                max_k: 400.0,
+            }
+        )) if id == "mp-neb-01"
+    ));
+
     set.records[1].barrier_std_ev = Some(0.02);
+    let vasp_with_std = export_pymatgen_vasp_json(&set).unwrap();
+    assert!(!vasp_with_std.contains("\"barrier_std_ev\": null"));
+    assert_eq!(
+        import_pymatgen_vasp_json(&vasp_with_std).unwrap().records[1].barrier_std_ev,
+        Some(0.02)
+    );
+
     let aiida_json = export_aiida_qe_json(&set, "3e4a-uuid").unwrap();
+    assert!(!aiida_json.contains("\"temp_range_k\": null"));
     let raw_aiida: AiidaQeNebExport = serde_json::from_str(&aiida_json).unwrap();
     assert!((raw_aiida.paths[1].attempt_frequency_thz - 10.5).abs() < 1e-12);
     assert_eq!(raw_aiida.paths[1].barrier_uncertainty_ev, Some(0.02));
     assert_eq!(raw_aiida.paths[0].temp_range_k, Some([500.0, 1100.0]));
+    assert_eq!(raw_aiida.paths[1].temp_range_k, None);
 
     let aiida_set = import_aiida_qe_json(&aiida_json).unwrap();
     assert_eq!(aiida_set.records.len(), 2);
@@ -189,6 +214,30 @@ fn pymatgen_vasp_and_aiida_qe_adapters_round_trip_and_reject_unphysical_paths() 
     );
     assert_eq!(aiida_set.records[1].barrier_std_ev, Some(0.02));
     assert_eq!(aiida_set.records[0].temp_range_k, Some([500.0, 1100.0]));
+    assert_eq!(aiida_set.records[1].temp_range_k, None);
+    assert!(aiida_set.validate_at_temperature(773.0).is_ok());
+    assert!(matches!(
+        aiida_set.validate_at_temperature(300.0),
+        Err(BarrierValidationError::TemperatureOutOfRange {
+            id,
+            temperature_k: 300.0,
+            min_k: 500.0,
+            max_k: 1100.0,
+        }) if id == "mp-neb-01"
+    ));
+
+    let mut bad_aiida_temp: serde_json::Value = serde_json::from_str(&aiida_json).unwrap();
+    bad_aiida_temp["paths"][0]["temp_range_k"] = serde_json::json!([0.0, 500.0]);
+    assert!(matches!(
+        import_aiida_qe_json(&bad_aiida_temp.to_string()),
+        Err(AdapterError::Validation(
+            BarrierValidationError::InvalidTemperatureBounds {
+                id,
+                min_k: 0.0,
+                max_k: 500.0,
+            }
+        )) if id == "mp-neb-01"
+    ));
 
     let bad_aiida = r#"{
         "workchain_uuid": "uuid-1",

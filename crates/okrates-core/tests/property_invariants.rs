@@ -1,12 +1,17 @@
 //! Deterministic property and hostile-input fuzz invariants for SumTree, CloneRollback, and checkpoints.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use okrates_core::reference::{GraphRandomWalk, Hop};
+use okrates_core::reference::{
+    CoupledGraphWalk, EdgeRateTable, GraphRandomWalk, GraphTopology, Hop,
+};
 use okrates_core::{
-    CheckpointError, Checkpointable, CloneRollback, IncrementalSimulation, KmcRng, Model,
-    ReversibleModel, Simulation, Step, SumTree,
+    AbsorptionPolicy, CatalogBackend, CheckpointError, Checkpointable, CloneRollback,
+    DirectCatalog, IncrementalModel, IncrementalSimulation, IndependentSnapshot, KmcRng, Model,
+    ReversibleModel, SampleGrid, SamplingError, SimError, Simulation, Step, SumTree,
+    sample_trajectory,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,7 +33,7 @@ impl Model for PartialMutatingModel {
     type Error = PartialMutError;
 
     fn enumerate_events(&self, _state: &Self::State, emit: &mut dyn FnMut(Self::Event, f64)) {
-        emit(true, 1.0);
+        emit(false, 1.0);
     }
 
     fn apply(&self, state: &mut Self::State, &succeed: &Self::Event) -> Result<(), Self::Error> {
@@ -81,8 +86,57 @@ fn sum_tree_property_invariants_across_sizes_and_random_mutations() {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct StepOneFailModel;
+
+impl Model for StepOneFailModel {
+    type State = u64;
+    type Event = u64;
+    type Error = PartialMutError;
+
+    fn enumerate_events(&self, state: &u64, emit: &mut dyn FnMut(u64, f64)) {
+        emit(*state + 1, 2.0);
+        emit(*state + 2, 3.0);
+    }
+
+    fn apply(&self, state: &mut u64, &next: &u64) -> Result<(), PartialMutError> {
+        if *state >= 1 {
+            return Err(PartialMutError);
+        }
+        *state = next;
+        Ok(())
+    }
+}
+
+impl Checkpointable for StepOneFailModel {
+    const MODEL_ID: &'static str = "test.step_one_fail";
+
+    fn encode_params(&self, _out: &mut Vec<u8>) {}
+
+    fn encode_state(&self, state: &u64, out: &mut Vec<u8>) {
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+
+    fn decode_state(&self, bytes: &[u8]) -> Result<u64, Box<dyn Error + Send + Sync>> {
+        let arr: [u8; 8] = bytes.try_into()?;
+        Ok(u64::from_le_bytes(arr))
+    }
+}
+
 #[test]
-fn clone_rollback_adapter_preserves_trajectories_and_restores_on_undo_or_err() {
+fn independent_snapshot_and_clone_rollback_preserve_trajectories_and_error_atomicity() {
+    let mut map = BTreeMap::from([(String::from("a"), vec![1_u64, 2])]);
+    let mut set = BTreeSet::from([10_i64, 20]);
+    let mut boxed: Box<[u64]> = vec![7, 8].into_boxed_slice();
+    let composite = (Some([true, false]), map.clone(), set.clone(), boxed.clone());
+    let snap = composite.snapshot();
+    map.get_mut("a").unwrap().push(3);
+    set.insert(30);
+    boxed[0] = 99;
+    assert_eq!(snap.1["a"], vec![1, 2]);
+    assert_eq!(snap.2.len(), 2);
+    assert_eq!(&*snap.3, &[7, 8]);
+
     let walk = GraphRandomWalk::new(vec![
         vec![(1, 1.5), (2, 0.5)],
         vec![(2, 2.0), (0, 0.7)],
@@ -106,13 +160,120 @@ fn clone_rollback_adapter_preserves_trajectories_and_restores_on_undo_or_err() {
     );
     assert_eq!(buf, vec![1, 2, 3]);
 
-    let mut a = Simulation::new(walk, 0, 55);
-    let mut b = Simulation::new(wrapped, 0, 55);
+    let mut direct: DirectCatalog<bool> = DirectCatalog::build(&fallible, &buf).unwrap();
+    assert_eq!(direct.prepare_total(&fallible, &buf).unwrap(), Some(1.0));
+    assert!(matches!(
+        direct.apply_and_update(&fallible, &mut buf, 99),
+        Err(SimError::InvalidSlot {
+            slot: 99,
+            slot_count: 1
+        })
+    ));
+    assert_eq!(buf, vec![1, 2, 3]);
+    assert!(matches!(
+        direct.apply_and_update(&fallible, &mut buf, 0),
+        Err(SimError::Model(PartialMutError))
+    ));
+    assert_eq!(buf, vec![1, 2, 3]);
+    assert_eq!(
+        <DirectCatalog<bool> as CatalogBackend<CloneRollback<PartialMutatingModel>>>::select(
+            &direct, 0.5, 1.0
+        ),
+        0
+    );
+
+    let mut a = Simulation::new(walk.clone(), 0, 55);
+    let mut b = Simulation::new(wrapped.clone(), 0, 55);
     for _ in 0..100 {
         assert_eq!(a.step().unwrap(), b.step().unwrap());
         assert_eq!(a.state(), b.state());
         assert_eq!(a.time().to_bits(), b.time().to_bits());
     }
+
+    let mut inc_ref = IncrementalSimulation::new(walk.clone(), 0, 77).unwrap();
+    let mut inc_clone = IncrementalSimulation::new(wrapped.clone(), 0, 77).unwrap();
+    for _ in 0..25 {
+        assert_eq!(inc_ref.step().unwrap(), inc_clone.step().unwrap());
+    }
+    let ckpt = inc_clone.checkpoint();
+    let mut resumed = IncrementalSimulation::resume(wrapped, &ckpt).unwrap();
+    for _ in 0..25 {
+        assert_eq!(inc_ref.step().unwrap(), resumed.step().unwrap());
+    }
+    assert_eq!(inc_ref.time().to_bits(), resumed.time().to_bits());
+
+    assert!(walk.slot_rate(&0, 99).is_nan());
+    let topo = GraphTopology::new(vec![vec![1], vec![0]]).unwrap();
+    let table = EdgeRateTable::new(&topo, vec![1.0, 2.0]).unwrap();
+    let coupled = CoupledGraphWalk::new(topo, table);
+    assert!(coupled.slot_rate(&0, 2).is_nan());
+}
+
+#[test]
+fn direct_step_apply_error_and_step_counter_overflow_roll_back_atomically() {
+    let mut sim = Simulation::new(StepOneFailModel, 0, 19);
+    assert!(matches!(sim.step().unwrap(), Step::Fired { .. }));
+    let state_after_first = *sim.state();
+    let clock_after_first = sim.clock();
+    let ckpt_after_first = sim.checkpoint();
+    assert!(matches!(sim.step(), Err(SimError::Model(PartialMutError))));
+    assert_eq!(*sim.state(), state_after_first);
+    assert_eq!(sim.steps(), 1);
+    assert_eq!(sim.clock(), clock_after_first);
+    assert_eq!(sim.checkpoint(), ckpt_after_first);
+    assert!(sim.engine().catalog().allocated_bytes() > 0);
+
+    let walk = GraphRandomWalk::new(vec![vec![(1, 2.0)], vec![(0, 2.0)]]).unwrap();
+    let mut max_ckpt = Simulation::new(walk.clone(), 0, 7).checkpoint();
+    max_ckpt[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
+
+    let mut direct_max = Simulation::resume(walk.clone(), &max_ckpt).unwrap();
+    assert_eq!(direct_max.steps(), u64::MAX);
+    let before_direct = direct_max.checkpoint();
+    assert!(matches!(
+        direct_max.step(),
+        Err(SimError::StepCounterOverflow)
+    ));
+    assert_eq!(direct_max.steps(), u64::MAX);
+    assert_eq!(*direct_max.state(), 0);
+    assert_eq!(direct_max.checkpoint(), before_direct);
+
+    let mut observe_calls = 0_usize;
+    let grid = SampleGrid::from_origin(10.0, 1).unwrap();
+    assert!(matches!(
+        sample_trajectory(
+            &mut direct_max,
+            &grid,
+            None,
+            AbsorptionPolicy::Error,
+            |_, &s| {
+                observe_calls += 1;
+                s
+            }
+        ),
+        Err(SamplingError::Sim {
+            steps: 0,
+            source: SimError::StepCounterOverflow,
+            ..
+        })
+    ));
+    assert_eq!(observe_calls, 0);
+    assert_eq!(direct_max.checkpoint(), before_direct);
+
+    let mut inc_max = IncrementalSimulation::resume(walk, &max_ckpt).unwrap();
+    let before_inc = inc_max.checkpoint();
+    let tree_before = inc_max.tree().clone();
+    assert!(matches!(inc_max.step(), Err(SimError::StepCounterOverflow)));
+    assert_eq!(inc_max.steps(), u64::MAX);
+    assert_eq!(*inc_max.tree(), tree_before);
+    assert_eq!(inc_max.checkpoint(), before_inc);
+
+    let absorbed_walk = GraphRandomWalk::new(vec![vec![]]).unwrap();
+    let mut abs_ckpt = Simulation::new(absorbed_walk.clone(), 0, 7).checkpoint();
+    abs_ckpt[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
+    let mut abs_max = Simulation::resume(absorbed_walk, &abs_ckpt).unwrap();
+    assert_eq!(abs_max.step().unwrap(), Step::Absorbed);
+    assert_eq!(abs_max.steps(), u64::MAX);
 }
 
 #[test]

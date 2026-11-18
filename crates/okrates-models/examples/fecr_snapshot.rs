@@ -106,7 +106,7 @@ fn main() -> io::Result<()> {
     let mut done = 0;
     while done < sweeps {
         let n = per_frame.min(sweeps - done);
-        annealer.run_sweeps(&model, n).unwrap_or_else(|e| fail(e));
+        annealer.run_sweeps(n).unwrap_or_else(|e| fail(e));
         done += n;
         frame(
             &mut out,

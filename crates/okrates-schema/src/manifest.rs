@@ -107,7 +107,7 @@ impl RunManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
             crate_version: env!("CARGO_PKG_VERSION").to_string(),
             git_sha: env!("OKRATES_GIT_SHA").to_string(),
-            reproducibility_tier: "bitwise".to_string(),
+            reproducibility_tier: "bitwise_same_crate_same_fp".to_string(),
             model_id: model_id.into(),
             params_sha256: sha256_hex(encoded_params),
             barrier_set_sha256: None,

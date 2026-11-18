@@ -30,29 +30,58 @@ fn model(cells: [usize; 3]) -> FeCrModel<PairEnergetics> {
 }
 
 #[test]
-fn chunked_annealer_matches_single_call_bitwise_and_rejects_mismatched_models() {
+fn chunked_annealer_matches_single_call_bitwise_and_guards_sweep_allocation() {
     let m = model([4, 4, 4]);
     let init = m.random_state(32, 42).unwrap().occupancy().to_vec();
     let one_shot = anneal(&m, init.clone(), 24, 99).unwrap();
 
     let mut chunked = KawasakiAnnealer::new(&m, init.clone(), KmcRng::from_seed(99)).unwrap();
     for step in [5, 7, 12] {
-        chunked.run_sweeps(&m, step).unwrap();
+        chunked.run_sweeps(step).unwrap();
     }
     assert_eq!(chunked.sweeps_completed(), 24);
     assert_eq!(chunked.finish(), one_shot);
 
-    let m_hot = FeCrModel::new(
-        BccLattice::new([4, 4, 4]).unwrap(),
-        PairEnergetics::illustrative(),
+    let mut guard_check = KawasakiAnnealer::new(&m, init.clone(), KmcRng::from_seed(5)).unwrap();
+    let e0 = guard_check.current_energy();
+    assert_eq!(
+        guard_check.run_sweeps(u64::MAX),
+        Err(FeCrError::SweepAllocation(u64::MAX))
+    );
+    assert_eq!(guard_check.sweeps_completed(), 0);
+    assert_eq!(guard_check.occupancy(), init.as_slice());
+    assert_eq!(guard_check.current_energy(), e0);
+}
+
+#[test]
+fn kawasaki_annealer_preserves_energy_across_large_penalty_drop() {
+    let mut pair = [[0.0_f64; 3]; 3];
+    pair[0][0] = -0.60;
+    pair[1][1] = 1.0e15;
+    pair[0][1] = -0.56;
+    pair[1][0] = -0.56;
+    let energetics = PairEnergetics::new(pair, 1.0e16, 1.0e16).unwrap();
+    let lattice = BccLattice::new([3, 3, 3]).unwrap();
+    let m = FeCrModel::new(
+        lattice.clone(),
+        energetics,
         ATTEMPT_FREQUENCY,
-        950.0,
+        TEMPERATURE_K,
     )
     .unwrap();
-    let mut guard_check = KawasakiAnnealer::new(&m, init, KmcRng::from_seed(5)).unwrap();
-    assert_eq!(
-        guard_check.run_sweeps(&m_hot, 1),
-        Err(FeCrError::AnnealerModelMismatch)
+    let mut occ = vec![Species::Fe; lattice.site_count()];
+    occ[0] = Species::Vacancy;
+    let s1 = lattice.site_at([2, 2, 2]).unwrap();
+    let s2 = lattice.neighbor(s1, 0);
+    occ[s1] = Species::Cr;
+    occ[s2] = Species::Cr;
+    let res = anneal(&m, occ, 30, 17).unwrap();
+    let direct = m.energetics().total_energy(m.lattice(), &res.occupancy);
+    let tracked = *res.energy.last().unwrap();
+    assert!(res.accepted > 0);
+    assert!(
+        (tracked - direct).abs() <= 1e-12,
+        "tracked={tracked} direct={direct}"
     );
 }
 
@@ -91,6 +120,42 @@ fn tabulated_energetics_rejects_annealing_malformed_keys_and_inconsistent_prefac
         TEMPERATURE_K,
     )
     .unwrap();
+    let lat = tab.lattice();
+    let vac = 0;
+    let atom = lat.neighbor(vac, 0);
+    let vac_only: Vec<usize> = lat
+        .neighbors(vac)
+        .iter()
+        .copied()
+        .filter(|&k| k != atom)
+        .collect();
+    let atom_only: Vec<usize> = lat
+        .neighbors(atom)
+        .iter()
+        .copied()
+        .filter(|&k| k != vac)
+        .collect();
+    let mut fwd_occ = vec![Species::Fe; lat.site_count()];
+    fwd_occ[vac] = Species::Vacancy;
+    fwd_occ[atom_only[0]] = Species::Cr;
+    fwd_occ[vac_only[0]] = Species::Cr;
+    fwd_occ[vac_only[1]] = Species::Cr;
+    let fwd_state = tab.state(fwd_occ).unwrap();
+    assert!((tab.barrier(&fwd_state, 0) - 0.67).abs() < 1e-12);
+
+    let mut rev_occ = vec![Species::Fe; lat.site_count()];
+    rev_occ[vac] = Species::Vacancy;
+    rev_occ[atom_only[0]] = Species::Cr;
+    rev_occ[atom_only[1]] = Species::Cr;
+    rev_occ[vac_only[0]] = Species::Cr;
+    let rev_state = tab.state(rev_occ).unwrap();
+    assert!((tab.barrier(&rev_state, 0) - 0.64).abs() < 1e-12);
+
+    let mut pure_occ = vec![Species::Fe; lat.site_count()];
+    pure_occ[vac] = Species::Vacancy;
+    let pure_state = tab.state(pure_occ).unwrap();
+    assert!((tab.barrier(&pure_state, 0) - 0.65).abs() < 1e-12);
+
     let occ = tab.random_state(8, 12).unwrap().occupancy().to_vec();
     assert!(matches!(
         KawasakiAnnealer::new(&tab, occ, KmcRng::from_seed(1)),
@@ -122,19 +187,32 @@ fn tabulated_energetics_rejects_annealing_malformed_keys_and_inconsistent_prefac
         Err(FeCrError::BarrierTable(_))
     ));
 
-    // Symmetric key with distinct reverse_attempt_frequency_hz violates symmetry.
-    let mut bad_sym = rec("sym", "Fe", "*", 0.65, 0.65, 0.0);
-    bad_sym.reverse_attempt_frequency_hz = Some(2e13);
-    let sym_set = BarrierSet::new("sym", 1e-6, vec![bad_sym]).unwrap();
+    for key in ["*", "cr_atom=1,cr_vac=2"] {
+        let mut bad_freq = rec("freq", "Fe", key, 0.65, 0.65, 0.0);
+        bad_freq.reverse_attempt_frequency_hz = Some(2e13);
+        let freq_set = BarrierSet::new("freq", 1e-6, vec![bad_freq]).unwrap();
+        assert!(matches!(
+            TabulatedEnergetics::new(freq_set),
+            Err(FeCrError::BarrierTable(msg)) if msg.contains("unequal forward/reverse attempt frequencies")
+        ));
+    }
+
+    let asym_barriers = rec("sym_bar", "Fe", "*", 0.65, 0.62, 0.015);
+    let sym_bar_set = BarrierSet::new("sym_bar", 0.02, vec![asym_barriers]).unwrap();
     assert!(matches!(
-        TabulatedEnergetics::new(sym_set),
-        Err(FeCrError::BarrierTable(_))
+        TabulatedEnergetics::new(sym_bar_set),
+        Err(FeCrError::BarrierTable(msg)) if msg.contains("symmetric environment key")
     ));
 }
 
 #[test]
-fn warren_cowley_alpha1_distinguishes_ordering_and_clustering() {
+fn warren_cowley_alpha1_distinguishes_ordering_clustering_and_bad_lengths() {
     let lattice = BccLattice::new([4, 4, 4]).unwrap();
+    assert!(matches!(
+        warren_cowley_alpha1(&lattice, &[Species::Fe]),
+        Err(FeCrError::SiteCount { .. })
+    ));
+
     // B2 ordered alloy (corner sites Fe, body-centre sites Cr, one vacancy at 0):
     // every 1NN of Fe is on the Cr sublattice -> P(Cr | Fe) = 1 > x_Cr -> alpha_1 < 0.
     let mut b2 = vec![Species::Fe; lattice.site_count()];
@@ -144,7 +222,7 @@ fn warren_cowley_alpha1_distinguishes_ordering_and_clustering() {
         }
     }
     b2[0] = Species::Vacancy;
-    assert!(warren_cowley_alpha1(&lattice, &b2) < -0.8);
+    assert!(warren_cowley_alpha1(&lattice, &b2).unwrap() < -0.8);
 
     // Phase-separated slab (x < 4 Fe, x >= 4 Cr): few Fe-Cr bonds -> alpha_1 > 0.
     let mut slab = vec![Species::Fe; lattice.site_count()];
@@ -154,7 +232,7 @@ fn warren_cowley_alpha1_distinguishes_ordering_and_clustering() {
         }
     }
     slab[0] = Species::Vacancy;
-    assert!(warren_cowley_alpha1(&lattice, &slab) > 0.5);
+    assert!(warren_cowley_alpha1(&lattice, &slab).unwrap() > 0.5);
 }
 #[test]
 fn swap_delta_matches_total_energy() {

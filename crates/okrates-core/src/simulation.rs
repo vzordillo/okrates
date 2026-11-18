@@ -22,6 +22,7 @@ pub enum SimError<ME> {
     TotalRateNotFinite,
     InvalidSlot { slot: usize, slot_count: usize },
     SlotCountChanged { expected: usize, found: usize },
+    StepCounterOverflow,
     Clock(ClockError),
     Model(ME),
 }
@@ -39,6 +40,7 @@ impl<ME: Error> fmt::Display for SimError<ME> {
             Self::SlotCountChanged { expected, found } => {
                 write!(f, "slot count changed from {expected} to {found}")
             }
+            Self::StepCounterOverflow => write!(f, "step counter overflowed u64::MAX"),
             Self::Clock(source) => write!(f, "clock error: {source}"),
             Self::Model(source) => write!(f, "model error: {source}"),
         }
@@ -49,9 +51,10 @@ impl<ME: Error + 'static> Error for SimError<ME> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidRate { source, .. } => Some(source),
-            Self::TotalRateNotFinite | Self::InvalidSlot { .. } | Self::SlotCountChanged { .. } => {
-                None
-            }
+            Self::TotalRateNotFinite
+            | Self::InvalidSlot { .. }
+            | Self::SlotCountChanged { .. }
+            | Self::StepCounterOverflow => None,
             Self::Clock(source) => Some(source),
             Self::Model(source) => Some(source),
         }
@@ -105,11 +108,18 @@ impl<M: Model> Simulation<M> {
         self.engine.steps()
     }
 
+    /// Validates active rates without advancing RNG, clock, or step count; returns `Ok(true)` if absorbed.
+    pub fn is_absorbed(&mut self) -> Result<bool, SimError<M::Error>> {
+        self.engine.is_absorbed()
+    }
+
+    /// Fires one transition atomically; on `Err`, simulation state, catalog, clock, steps, and RNG are unchanged.
     pub fn step(&mut self) -> Result<Step<M::Event>, SimError<M::Error>> {
         self.engine.step()
     }
 
-    /// Fires one step, calling `before_apply(&model, &state_before, next_clock)` before applying the jump.
+    /// Invokes `before_apply(&model, &state_before, next_clock)` after clock validation and before
+    /// transition application; external side effects in `before_apply` are not rolled back on `Err`.
     pub fn step_observing<F>(
         &mut self,
         before_apply: F,

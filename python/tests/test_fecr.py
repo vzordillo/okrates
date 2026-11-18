@@ -1,14 +1,18 @@
 """Rust/Python parity, typed object-model, provenance, and error tests for Fe–Cr bindings."""
 
+import dataclasses
+import inspect
 import json
 import math
 import subprocess
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 import pytest
 
 import okrates
+from okrates import _okrates
 
 ROOT = Path(__file__).resolve().parents[2]
 CELLS, NU, T, K_COUNT, LATTICE_PARAMETER = (6, 6, 6), 1e13, 800.0, 10, 1.0
@@ -182,9 +186,17 @@ def test_typed_diffusion_manifest_and_u64_max_seed():
     assert result.mean_final_sro_alpha1 is not None
     manifest = result.manifest
     assert manifest.schema_version == 1
+    assert manifest.reproducibility_tier == "bitwise_same_crate_same_fp"
     assert manifest.model_id == "okrates.fecr_pair"
     assert len(manifest.params_sha256) == 64
-    assert manifest.estimator["fit_method"] == "windowed_ols"
+    assert isinstance(manifest.rng, okrates.RngPolicy)
+    assert manifest.rng.base_seed == 2**64 - 1
+    assert isinstance(manifest.conditions, okrates.ManifestConditions)
+    assert manifest.conditions.cells == (3, 3, 3)
+    assert isinstance(manifest.conditions.composition, MappingProxyType)
+    assert manifest.conditions.composition["Cr"] == 8
+    assert isinstance(manifest.estimator, okrates.EstimatorSpec)
+    assert manifest.estimator.fit_method == "windowed_ols"
     assert json.loads(manifest.to_json())["params_sha256"] == manifest.params_sha256
 
 
@@ -375,3 +387,340 @@ def test_barrier_floor_activations_is_an_int():
     assert isinstance(martinez["barrier_floor_activations"], int)
     assert martinez["barrier_floor_activations"] >= 0
     assert okrates.fecr_diffusion(**SMALL)["barrier_floor_activations"] == 0
+
+
+def test_run_manifest_immutability_and_schema_validation():
+    res = okrates.run_fecr_diffusion(
+        lattice=okrates.LatticeConfig(cells=(3, 3, 3), lattice_parameter_m=2.8665e-10),
+        energetics=okrates.PairEnergeticsConfig(attempt_frequency_hz=1e13),
+        cr_count=5,
+        temperature_k=800.0,
+        sampling=okrates.SamplingConfig(t_end=1e-8, sample_count=4),
+        runs=2,
+        seed=7,
+    )
+    manifest = res.manifest
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        manifest.rng.base_seed = 0
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        manifest.conditions.temperature_k = 0.0
+    with pytest.raises(TypeError):
+        manifest.conditions.composition["Fe"] = 999
+    assert manifest.estimator is not None
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        manifest.estimator.fit_method = "origin_slope"
+
+    backing = {"Fe": 48, "Cr": 5, "Vacancy": 1}
+    cond = okrates.ManifestConditions(
+        cells=(3, 3, 3),
+        lattice_parameter=2.8665e-10,
+        temperature_k=800.0,
+        composition=backing,
+    )
+    backing["Fe"] = 0
+    assert cond.composition["Fe"] == 48
+
+    base_doc = json.loads(manifest.to_json())
+    no_est_doc = {**base_doc, "estimator": None}
+    assert okrates.RunManifest.from_json(json.dumps(no_est_doc)).estimator is None
+
+    for bad_ver in (0, 2, -1, 999, True, "1"):
+        with pytest.raises(ValueError, match="schema"):
+            okrates.RunManifest.from_json(
+                json.dumps({**base_doc, "schema_version": bad_ver})
+            )
+    for bad_raw in (
+        "[]",
+        "123",
+        "null",
+        "{}",
+        json.dumps({**base_doc, "rng": "bad"}),
+        json.dumps(
+            {**base_doc, "conditions": {**base_doc["conditions"], "cells": [3, 3]}}
+        ),
+        json.dumps({**base_doc, "estimator": "bad"}),
+    ):
+        with pytest.raises(ValueError):
+            okrates.RunManifest.from_json(bad_raw)
+
+
+def test_tabulated_dead_knob_removed_and_each_invalid_kwarg_rejected_independently():
+    assert [f.name for f in dataclasses.fields(okrates.BarrierTableConfig)] == [
+        "barrier_set_json"
+    ]
+    assert (
+        "default_attempt_frequency_hz"
+        not in inspect.signature(okrates.import_pymatgen_vasp_barriers).parameters
+    )
+    assert (
+        "default_attempt_frequency_hz"
+        not in inspect.signature(okrates.import_aiida_qe_barriers).parameters
+    )
+
+    with pytest.raises(ValueError, match="not valid for pair energetics"):
+        _okrates.run_fecr_transport(
+            cells=(3, 3, 3),
+            cr_count=5,
+            temperature_k=800.0,
+            t_equil=0.0,
+            t_end=1e-8,
+            sample_count=4,
+            lattice_parameter_m=2.8665e-10,
+            seed=1,
+            runs=2,
+            energetics="pair",
+            attempt_frequency=1e13,
+            barrier_policy="strict",
+        )
+
+    vasp_payload = json.dumps(
+        {
+            "name": "vasp-policy-check",
+            "tolerance_ev": 1e-3,
+            "tasks": [
+                {
+                    "task_id": "fe_star",
+                    "migrating_specie": "Fe",
+                    "env_key": "*",
+                    "image_energies_ev": [-10.0, -9.35, -10.0],
+                    "v0_hz": 1.0e13,
+                }
+            ],
+        }
+    )
+    table_cfg = okrates.import_pymatgen_vasp_barriers(vasp_payload)
+
+    with pytest.raises(
+        ValueError,
+        match="pair and martinez2012 parameters do not apply to tabulated",
+    ):
+        _okrates.run_fecr_transport(
+            cells=(3, 3, 3),
+            cr_count=0,
+            temperature_k=800.0,
+            t_equil=0.0,
+            t_end=1e-8,
+            sample_count=4,
+            lattice_parameter_m=2.8665e-10,
+            seed=1,
+            runs=2,
+            energetics="tabulated",
+            barrier_set_json=table_cfg.barrier_set_json,
+            barrier_policy="unfloored",
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="attempt_frequency does not apply to tabulated",
+    ):
+        _okrates.run_fecr_transport(
+            cells=(3, 3, 3),
+            cr_count=0,
+            temperature_k=800.0,
+            t_equil=0.0,
+            t_end=1e-8,
+            sample_count=4,
+            lattice_parameter_m=2.8665e-10,
+            seed=1,
+            runs=2,
+            energetics="tabulated",
+            attempt_frequency=1e13,
+            barrier_set_json=table_cfg.barrier_set_json,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="attempt_frequency does not apply to tabulated",
+    ):
+        _okrates.run_kawasaki_anneal(
+            cells=(3, 3, 3),
+            cr_count=0,
+            temperature_k=800.0,
+            sweeps=1,
+            seed=1,
+            energetics="tabulated",
+            attempt_frequency=1e13,
+            barrier_set_json=table_cfg.barrier_set_json,
+        )
+
+
+def test_pre_lattice_validation_order_and_u64_max_overflow_guards():
+    lattice = okrates.LatticeConfig(cells=(3, 3, 3), lattice_parameter_m=2.8665e-10)
+    energetics = okrates.PairEnergeticsConfig(attempt_frequency_hz=1e13)
+    sampling = okrates.SamplingConfig(t_end=1e-8, sample_count=4)
+
+    with pytest.raises(ValueError, match="cr_count"):
+        okrates.run_fecr_diffusion(
+            lattice=lattice,
+            energetics=energetics,
+            cr_count=2**64 - 1,
+            temperature_k=800.0,
+            sampling=sampling,
+            runs=2,
+            seed=1,
+        )
+    with pytest.raises(ValueError, match="cr_count"):
+        okrates.run_anneal(
+            cells=(3, 3, 3),
+            energetics=energetics,
+            cr_count=2**64 - 1,
+            temperature_k=800.0,
+            sweeps=1,
+            seed=1,
+        )
+    with pytest.raises(ValueError, match="cannot allocate anneal trace"):
+        okrates.run_anneal(
+            cells=(3, 3, 3),
+            energetics=energetics,
+            cr_count=5,
+            temperature_k=800.0,
+            sweeps=2**64 - 1,
+            seed=1,
+        )
+
+    huge_base = dict(
+        cells=(2**57, 2, 2),
+        cr_count=0,
+        temperature_k=800.0,
+        t_equil=0.0,
+        t_end=1e-8,
+        sample_count=4,
+        fit_method="windowed_ols",
+        lattice_parameter_m=2.8665e-10,
+        seed=1,
+        runs=2,
+        energetics="illustrative",
+        attempt_frequency=1e13,
+    )
+    with pytest.raises(ValueError, match="at least 2 replicas"):
+        _okrates.run_fecr_transport(**{**huge_base, "runs": 1})
+    with pytest.raises(ValueError, match="lattice_parameter"):
+        _okrates.run_fecr_transport(**{**huge_base, "lattice_parameter_m": -1.0})
+    with pytest.raises(ValueError, match="fit_method"):
+        _okrates.run_fecr_transport(**{**huge_base, "fit_method": "bogus"})
+    with pytest.raises(ValueError, match="requires more samples"):
+        _okrates.run_fecr_transport(**{**huge_base, "sample_count": 1})
+    with pytest.raises(ValueError, match="sample window"):
+        _okrates.run_fecr_transport(**{**huge_base, "t_equil": 5.0, "t_end": 1.0})
+    with pytest.raises(ValueError, match="cannot allocate sample grid"):
+        _okrates.run_fecr_transport(**{**huge_base, "sample_count": 2**62})
+    with pytest.raises(ValueError, match="exceed addressable capacity"):
+        _okrates.run_fecr_transport(**huge_base)
+
+    with pytest.raises(ValueError, match="trajectory"):
+        okrates.vacancy_trajectory(
+            cells=(2**57, 2, 2),
+            jump_rate=1.0,
+            lattice_parameter_m=2.8665e-10,
+            seed=1,
+            steps=2**62,
+        )
+
+
+def test_imported_dft_temp_range_k_enforced_in_diffusion():
+    qe_payload = json.dumps(
+        {
+            "workchain_uuid": "00000000-0000-0000-0000-000000000002",
+            "name": "qe-temp-window",
+            "dft_functional": "PBE",
+            "tolerance_ev": 1e-3,
+            "paths": [
+                {
+                    "label": "qe-fe-star",
+                    "species": "Fe",
+                    "env_key": "*",
+                    "forward_barrier_ev": 0.65,
+                    "reverse_barrier_ev": 0.65,
+                    "reaction_energy_ev": 0.0,
+                    "attempt_frequency_thz": 10.0,
+                    "barrier_uncertainty_ev": 0.01,
+                    "temp_range_k": [500.0, 1100.0],
+                },
+                {
+                    "label": "qe-cr-star",
+                    "species": "Cr",
+                    "env_key": "*",
+                    "forward_barrier_ev": 0.58,
+                    "reverse_barrier_ev": 0.58,
+                    "reaction_energy_ev": 0.0,
+                    "attempt_frequency_thz": 12.0,
+                    "barrier_uncertainty_ev": 0.01,
+                    "temp_range_k": [500.0, 1100.0],
+                },
+            ],
+        }
+    )
+    qe_cfg = okrates.import_aiida_qe_barriers(qe_payload)
+    lattice = okrates.LatticeConfig(cells=(3, 3, 3), lattice_parameter_m=2.8665e-10)
+    sampling = okrates.SamplingConfig(t_end=1e-6, sample_count=4)
+
+    with pytest.raises(ValueError, match=r"outside \[500, 1100\] K"):
+        okrates.run_fecr_diffusion(
+            lattice=lattice,
+            energetics=qe_cfg,
+            cr_count=5,
+            temperature_k=300.0,
+            sampling=sampling,
+            runs=2,
+            seed=11,
+        )
+    for temp_k in (500.0, 773.0):
+        ok_qe = okrates.run_fecr_diffusion(
+            lattice=lattice,
+            energetics=qe_cfg,
+            cr_count=5,
+            temperature_k=temp_k,
+            sampling=sampling,
+            runs=2,
+            seed=11,
+        )
+        assert math.isfinite(ok_qe.D_v) and ok_qe.D_v >= 0.0
+
+    vasp_payload = json.dumps(
+        {
+            "name": "vasp-temp-window",
+            "tolerance_ev": 1e-3,
+            "tasks": [
+                {
+                    "task_id": "vasp-fe-star",
+                    "migrating_specie": "Fe",
+                    "env_key": "*",
+                    "image_energies_ev": [-100.0, -99.35, -100.0],
+                    "v0_hz": 1.0e13,
+                    "temp_range_k": [500.0, 1100.0],
+                },
+                {
+                    "task_id": "vasp-cr-star",
+                    "migrating_specie": "Cr",
+                    "env_key": "*",
+                    "image_energies_ev": [-98.0, -97.42, -98.0],
+                    "v0_hz": 1.2e13,
+                    "temp_range_k": [500.0, 1100.0],
+                },
+            ],
+        }
+    )
+    vasp_cfg = okrates.import_pymatgen_vasp_barriers(vasp_payload)
+    with pytest.raises(ValueError, match=r"outside \[500, 1100\] K"):
+        okrates.run_fecr_diffusion(
+            lattice=lattice,
+            energetics=vasp_cfg,
+            cr_count=5,
+            temperature_k=300.0,
+            sampling=sampling,
+            runs=2,
+            seed=13,
+        )
+    for temp_k in (500.0, 773.0):
+        ok_vasp = okrates.run_fecr_diffusion(
+            lattice=lattice,
+            energetics=vasp_cfg,
+            cr_count=5,
+            temperature_k=temp_k,
+            sampling=sampling,
+            runs=2,
+            seed=13,
+        )
+        assert math.isfinite(ok_vasp.D_v) and ok_vasp.D_v >= 0.0
+
+

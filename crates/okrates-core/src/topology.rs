@@ -30,6 +30,7 @@ pub trait TransitionTopology {
     type Undo;
     type Error: Error;
 
+    /// On `Err`, `state` must be unchanged.
     fn apply(
         &self,
         state: &mut Self::State,
@@ -67,6 +68,8 @@ pub trait RateModel<T: TransitionTopology> {
 }
 
 /// Composes a [`TransitionTopology`] with a [`RateModel`] into a full KMC model.
+///
+/// Incremental updates require `T::affected_slots` to cover every slot whose `R::rate` or `T::is_slot_active` depends on state modified by `event`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CoupledModel<T, R> {
     pub topology: T,
@@ -130,6 +133,9 @@ where
     }
 
     fn slot_rate(&self, state: &Self::State, slot: usize) -> f64 {
+        if slot >= self.topology.slot_count(state) {
+            return f64::NAN;
+        }
         if self.topology.is_slot_active(state, slot) {
             let event = self.topology.slot_event(state, slot);
             self.rates.rate(&self.topology, state, &event)

@@ -692,3 +692,20 @@ fn validate_rejects() {
     );
     assert!(Martinez2012::new(0.0).is_ok());
 }
+
+#[test]
+fn invalid_occupancy_lengths_return_nan_across_martinez2012() {
+    let lattice = BccLattice::new([3, 3, 3]).unwrap();
+    let energetics = Martinez2012::new(800.0).unwrap();
+    let atom = lattice.neighbor(0, 0);
+    let short = [Species::Vacancy, Species::Fe];
+    let mut oversized = vec![Species::Fe; lattice.site_count() + 1];
+    oversized[0] = Species::Vacancy;
+    for bad in [&short[..], &oversized[..]] {
+        assert!(energetics.raw_barrier(&lattice, bad, 0, atom).is_nan());
+        assert!(energetics.barrier(&lattice, bad, 0, atom).is_nan());
+        assert!(energetics.exchange_delta(&lattice, bad, 0, atom).is_nan());
+        assert!(energetics.swap_delta(&lattice, bad, 0, atom).is_nan());
+        assert!(energetics.total_energy(&lattice, bad).is_nan());
+    }
+}

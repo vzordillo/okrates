@@ -12,19 +12,19 @@
 
 ## 2. Deterministic RNG Substreams
 
-`KmcRng` wraps `rand_chacha::ChaCha12Rng` (`seed_from_u64(base_seed)`), partitioning its $2^{64}$ stream selector across `(replica_id, StreamRole)` via SplitMix64 mixing:
+`KmcRng::for_replica(base_seed, replica_id, role)` constructs `rand_chacha::ChaCha12Rng` (stream `0`) from a 32-byte little-endian key (`key[0..8] = base_seed`, `key[8..16] = replica_id`, `key[16..24] = role.tag()`, `key[24..32] = 0`):
 
-- `StreamRole::Dynamics` (`0`) — kMC event selection ($u_1$) and exponential waiting times ($-\ln u_2 / R_{\text{tot}}$), with $u \in (0, 1)$ strictly open.
-- `StreamRole::InitialState` (`1`) — random alloy/defect placement (`random_state_with_rng`).
-- `StreamRole::Equilibration` (`2`) — Kawasaki Metropolis swap proposals and acceptance draws (`KawasakiAnnealer`).
-- `StreamRole::Diagnostic` (`3`) — auxiliary sampling or bootstrap/jackknife checks.
+- `StreamRole::Dynamics` (`1`) — kMC event selection ($u_1$) and exponential waiting times ($-\ln u_2 / R_{\text{tot}}$), with $u \in (0, 1)$ strictly open.
+- `StreamRole::InitialState` (`2`) — random alloy/defect placement (`random_state_with_rng`).
+- `StreamRole::Equilibration` (`3`) — Kawasaki Metropolis swap proposals and acceptance draws (`KawasakiAnnealer`).
+- `StreamRole::Custom(id)` (`0x1_0000 | u64::from(id)`) — caller-defined auxiliary domain-separated substreams.
 
-Because `replica_id` and `StreamRole` map to orthogonal `ChaCha12` streams rather than `seed + offset` arithmetic, any `base_seed` in `0..=u64::MAX` is valid without overflow or inter-role stream collision, and Rayon scheduling order never affects per-replica results.
+Because `base_seed`, `replica_id`, and `StreamRole` occupy disjoint little-endian slices of the 256-bit `ChaCha12` key rather than `seed + offset` arithmetic, any `base_seed` in `0..=u64::MAX` is valid without overflow or inter-role key collision, and Rayon scheduling order never affects per-replica results.
 
 ## 3. Clock & Checkpoint v2
 
-- **Compensated Clock**: `Clock` accumulates residence times using error-free Knuth TwoSum (`time + compensation`), preventing deep-run $\Delta t \ll t$ mantissa truncation, and returns `ClockError::Stagnation` if `time` fails to advance at finite `dt`.
-- **Checkpoint Schema v2**: Binary checkpoints (`OKRATES\0`, `SCHEMA_VERSION = 2`) persist model `MODEL_ID`, encoded model parameters, `steps`, `time`, TwoSum `compensation` bits, serialized `ChaCha12` RNG word index/seed, and model state. On the same target/toolchain/`libm` environment, resuming from a v2 checkpoint reproduces the uninterrupted trajectory bit-for-bit.
+- **Compensated Clock**: `Clock` accumulates residence times using error-free Knuth TwoSum (`time + compensation`), preventing deep-run $\Delta t \ll t$ mantissa truncation, and returns `ClockError::Stagnation` if a finite `dt > 0` leaves both `time` and `compensation` unchanged.
+- **Checkpoint Schema v2**: Binary checkpoints (`OKRCKPT\0`, `SCHEMA_VERSION = 2`) persist model `MODEL_ID`, encoded model parameters, `steps`, `time`, TwoSum `compensation` bits, serialized `ChaCha12` RNG state (32-byte `seed` key, `stream`, and `word_pos`), and model state. On the same target/toolchain/`libm` environment, resuming from a v2 checkpoint reproduces the uninterrupted trajectory bit-for-bit.
 
 ## 4. Provenance Manifests (`okrates-schema`)
 

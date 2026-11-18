@@ -1,4 +1,5 @@
-//! JSON data-contract adapters for `pymatgen`/`atomate2` (VASP NEB) and `AiiDA-QuantumESPRESSO`.
+//! JSON data-contract adapters for `pymatgen`/`atomate2` (VASP NEB) and `AiiDA-QuantumESPRESSO`,
+//! preserving optional `temp_range_k` validity windows and barrier uncertainties across import and export.
 
 use std::error::Error;
 use std::fmt;
@@ -64,6 +65,8 @@ pub struct PymatgenNebTask {
     pub v0_hz: f64,
     pub functional: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub barrier_std_ev: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temp_range_k: Option<[f64; 2]>,
 }
 
@@ -105,7 +108,7 @@ pub fn import_pymatgen_vasp_json(json: &str) -> Result<BarrierSet, AdapterError>
             delta_energy_ev: e_final - e_init,
             attempt_frequency_hz: task.v0_hz,
             reverse_attempt_frequency_hz: None,
-            barrier_std_ev: None,
+            barrier_std_ev: task.barrier_std_ev,
             temp_range_k: task.temp_range_k,
             provenance: Some(BarrierProvenance {
                 source_code: "VASP (pymatgen/atomate2)".to_string(),
@@ -129,6 +132,7 @@ pub fn export_pymatgen_vasp_json(set: &BarrierSet) -> Result<String, AdapterErro
             image_energies_ev: vec![0.0, rec.forward_barrier_ev, rec.delta_energy_ev],
             v0_hz: rec.attempt_frequency_hz,
             functional: rec.provenance.as_ref().and_then(|p| p.functional.clone()),
+            barrier_std_ev: rec.barrier_std_ev,
             temp_range_k: rec.temp_range_k,
         })
         .collect();

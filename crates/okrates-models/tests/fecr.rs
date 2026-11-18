@@ -219,12 +219,36 @@ fn tabulated_energetics_detailed_balance_and_missing_env_error() {
     .unwrap();
     let kt = m.kt();
     let state = m.random_state(5, 77).unwrap();
+    let nb0 = m.lattice().neighbor(state.vacancy(), 0);
+    assert!(
+        m.energetics()
+            .total_energy(m.lattice(), state.occupancy())
+            .is_nan()
+    );
+    assert!(
+        m.energetics()
+            .exchange_delta(m.lattice(), state.occupancy(), state.vacancy(), nb0)
+            .is_nan()
+    );
+    assert!(
+        m.energetics()
+            .swap_delta(m.lattice(), state.occupancy(), 0, 1)
+            .is_nan()
+    );
+    assert!(
+        m.energetics()
+            .swap_delta(m.lattice(), &[Species::Vacancy], 0, 1)
+            .is_nan()
+    );
     for d in 0..8 {
         let kf = m.rate(&state, d);
         let target = m.lattice().neighbor(state.vacancy(), d);
-        let de =
-            m.energetics()
-                .exchange_delta(m.lattice(), state.occupancy(), state.vacancy(), target);
+        let de = m.energetics().transition_delta_ev(
+            m.lattice(),
+            state.occupancy(),
+            state.vacancy(),
+            target,
+        );
         let mut after = state.clone();
         m.apply(&mut after, &FeCrJump { direction: d }).unwrap();
         let kr = m.rate(&after, 7 - d);
@@ -396,4 +420,81 @@ fn equilibrium_boltzmann_smoke() {
 #[ignore = "full tier: statistical"]
 fn equilibrium_matches_boltzmann() {
     equilibrium_chi2(BASE, R);
+}
+
+#[test]
+fn imported_dft_temp_range_is_enforced_by_fecr_model() {
+    use okrates_models::tabulated::TabulatedEnergetics;
+    use okrates_schema::{import_aiida_qe_json, import_pymatgen_vasp_json};
+
+    let vasp_json = r#"{
+        "name": "vasp-fecr-window",
+        "tolerance_ev": 1e-9,
+        "tasks": [
+            {
+                "task_id": "fe-wildcard",
+                "migrating_specie": "Fe",
+                "env_key": "*",
+                "image_energies_ev": [-10.0, -9.35, -10.0],
+                "v0_hz": 1.0e13,
+                "functional": "PBE",
+                "temp_range_k": [500.0, 1100.0]
+            },
+            {
+                "task_id": "cr-wildcard",
+                "migrating_specie": "Cr",
+                "env_key": "*",
+                "image_energies_ev": [-10.0, -9.42, -10.0],
+                "v0_hz": 1.05e13,
+                "functional": "PBE"
+            }
+        ]
+    }"#;
+    let vasp_set = import_pymatgen_vasp_json(vasp_json).unwrap();
+    let vasp_tab = TabulatedEnergetics::new(vasp_set).unwrap();
+    let lattice = BccLattice::new([3, 3, 3]).unwrap();
+    assert!(FeCrModel::new(lattice.clone(), vasp_tab.clone(), ATTEMPT_FREQUENCY, 500.0).is_ok());
+    assert!(FeCrModel::new(lattice.clone(), vasp_tab.clone(), ATTEMPT_FREQUENCY, 773.0).is_ok());
+    assert!(matches!(
+        FeCrModel::new(lattice.clone(), vasp_tab, ATTEMPT_FREQUENCY, 300.0),
+        Err(FeCrError::BarrierTable(msg)) if msg.contains("outside [500, 1100] K")
+    ));
+
+    let aiida_json = r#"{
+        "workchain_uuid": "uuid-fecr",
+        "name": "qe-fecr-window",
+        "dft_functional": "PBEsol",
+        "tolerance_ev": 1e-9,
+        "paths": [
+            {
+                "label": "fe-wildcard",
+                "species": "Fe",
+                "env_key": "*",
+                "forward_barrier_ev": 0.65,
+                "reverse_barrier_ev": 0.65,
+                "reaction_energy_ev": 0.0,
+                "attempt_frequency_thz": 10.0,
+                "barrier_uncertainty_ev": 0.01,
+                "temp_range_k": [500.0, 1100.0]
+            },
+            {
+                "label": "cr-wildcard",
+                "species": "Cr",
+                "env_key": "*",
+                "forward_barrier_ev": 0.58,
+                "reverse_barrier_ev": 0.58,
+                "reaction_energy_ev": 0.0,
+                "attempt_frequency_thz": 10.5,
+                "barrier_uncertainty_ev": null
+            }
+        ]
+    }"#;
+    let aiida_set = import_aiida_qe_json(aiida_json).unwrap();
+    let aiida_tab = TabulatedEnergetics::new(aiida_set).unwrap();
+    assert!(FeCrModel::new(lattice.clone(), aiida_tab.clone(), ATTEMPT_FREQUENCY, 500.0).is_ok());
+    assert!(FeCrModel::new(lattice.clone(), aiida_tab.clone(), ATTEMPT_FREQUENCY, 773.0).is_ok());
+    assert!(matches!(
+        FeCrModel::new(lattice, aiida_tab, ATTEMPT_FREQUENCY, 300.0),
+        Err(FeCrError::BarrierTable(msg)) if msg.contains("outside [500, 1100] K")
+    ));
 }

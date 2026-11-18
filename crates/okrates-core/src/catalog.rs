@@ -7,6 +7,7 @@ use crate::model::Model;
 use crate::rate::Rate;
 use crate::rng::KmcRng;
 use crate::simulation::{RunSummary, SimError, Step};
+use crate::topology::SlotError;
 
 /// Event-catalog strategy backing [`Engine`].
 pub trait CatalogBackend<M: Model>: Sized {
@@ -52,6 +53,11 @@ impl<E> DirectCatalog<E> {
             events: Vec::new(),
             rates: Vec::new(),
         }
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        self.events.capacity() * std::mem::size_of::<E>()
+            + self.rates.capacity() * std::mem::size_of::<Rate>()
     }
 }
 
@@ -132,9 +138,14 @@ impl<M: Model> CatalogBackend<M> for DirectCatalog<M::Event> {
         state: &mut M::State,
         selection: Self::Selection,
     ) -> Result<M::Event, SimError<M::Error>> {
-        let event = self.events.swap_remove(selection);
-        model.apply(state, &event).map_err(SimError::Model)?;
-        Ok(event)
+        let slot_count = self.events.len();
+        let event_ref = self.events.get(selection).ok_or(SimError::InvalidSlot {
+            slot: selection,
+            slot_count,
+        })?;
+        model.apply(state, event_ref).map_err(SimError::Model)?;
+        self.rates.swap_remove(selection);
+        Ok(self.events.swap_remove(selection))
     }
 }
 
@@ -143,12 +154,16 @@ impl<M: Model> CatalogBackend<M> for DirectCatalog<M::Event> {
 pub struct SumTreeCatalog {
     tree: SumTree,
     scratch: Vec<usize>,
-    staged: Vec<(usize, f64)>,
+    staged: Vec<(usize, f64, f64)>,
 }
 
 impl SumTreeCatalog {
     pub fn tree(&self) -> &SumTree {
         &self.tree
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        std::mem::size_of_val(self.tree.nodes())
     }
 }
 
@@ -224,15 +239,15 @@ impl<M: IncrementalModel> CatalogBackend<M> for SumTreeCatalog {
         self.staged.clear();
         model.affected_slots(state, &event, &mut self.scratch);
         for &affected in &self.scratch {
-            if affected >= expected_slots {
-                model.undo(state, undo);
-                return Err(SimError::InvalidSlot {
-                    slot: affected,
-                    slot_count: expected_slots,
-                });
-            }
+            let prev = match self.tree.try_rate(affected) {
+                Ok(prev) => prev,
+                Err(SlotError::OutOfRange { slot, slot_count }) => {
+                    model.undo(state, undo);
+                    return Err(SimError::InvalidSlot { slot, slot_count });
+                }
+            };
             match Rate::new(model.slot_rate(state, affected)) {
-                Ok(rate) => self.staged.push((affected, rate.get())),
+                Ok(rate) => self.staged.push((affected, prev, rate.get())),
                 Err(source) => {
                     model.undo(state, undo);
                     return Err(SimError::InvalidRate {
@@ -243,8 +258,16 @@ impl<M: IncrementalModel> CatalogBackend<M> for SumTreeCatalog {
             }
         }
 
-        for &(affected, rate) in &self.staged {
-            let _ = self.tree.try_set(affected, rate);
+        for (applied, &(affected, _, rate)) in self.staged.iter().enumerate() {
+            if let Err(SlotError::OutOfRange { slot, slot_count }) =
+                self.tree.try_set(affected, rate)
+            {
+                for &(prev_slot, prev_rate, _) in self.staged[..applied].iter().rev() {
+                    let _ = self.tree.try_set(prev_slot, prev_rate);
+                }
+                model.undo(state, undo);
+                return Err(SimError::InvalidSlot { slot, slot_count });
+            }
         }
         Ok(event)
     }
@@ -319,13 +342,21 @@ impl<M: Model, C: CatalogBackend<M>> Engine<M, C> {
         &self.catalog
     }
 
+    /// Validates active rates without advancing RNG, clock, or step count; returns `Ok(true)` if absorbed.
+    pub fn is_absorbed(&mut self) -> Result<bool, SimError<M::Error>> {
+        Ok(self
+            .catalog
+            .prepare_total(&self.model, &self.state)?
+            .is_none())
+    }
+
     /// Fires one transition atomically; on `Err`, `state`, `catalog`, `clock`, `steps`, and `rng` are unchanged.
     pub fn step(&mut self) -> Result<Step<M::Event>, SimError<M::Error>> {
         self.step_observing(|_, _, _| {})
     }
 
-    /// Like [`Engine::step`], invoking `before_apply(&model, &state_before, next_clock)` once `dt` is validated
-    /// and before applying the transition (if `apply_and_update` later errors, engine state still rolls back).
+    /// Invokes `before_apply(&model, &state_before, next_clock)` after clock validation and before
+    /// transition application; external side effects in `before_apply` are not rolled back on `Err`.
     pub fn step_observing<F>(
         &mut self,
         before_apply: F,
@@ -336,6 +367,10 @@ impl<M: Model, C: CatalogBackend<M>> Engine<M, C> {
         let Some(total) = self.catalog.prepare_total(&self.model, &self.state)? else {
             return Ok(Step::Absorbed);
         };
+        let next_steps = self
+            .steps
+            .checked_add(1)
+            .ok_or(SimError::StepCounterOverflow)?;
 
         let mut next_rng = self.rng.clone();
         let u1 = next_rng.open01();
@@ -353,7 +388,7 @@ impl<M: Model, C: CatalogBackend<M>> Engine<M, C> {
 
         self.rng = next_rng;
         self.clock = next_clock;
-        self.steps += 1;
+        self.steps = next_steps;
         Ok(Step::Fired { event, dt })
     }
 

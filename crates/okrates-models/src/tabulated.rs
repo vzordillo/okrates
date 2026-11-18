@@ -27,248 +27,47 @@ struct ResolvedJump {
     attempt_hz: f64,
 }
 
-/// Rate-table Fe–Cr energetics backed by a validated [`BarrierSet`].
-///
-/// Defines local transition barriers and attempt frequencies rather than a global lattice
-/// Hamiltonian (`total_energy` returns `0.0`, `exchange_delta` returns the matched record's
-/// local `delta_energy_ev`, and [`Energetics::supports_equilibrium_swaps`] is `false`).
-#[derive(Clone, Debug)]
-pub struct TabulatedEnergetics {
-    barrier_set: BarrierSet,
-    sha256: String,
-    index: HashMap<(Species, String), usize>,
-    uses_saddle_shell: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EnvKey {
+    Wildcard,
+    Saddle { cs: u8 },
+    Pair { ca: u8, cv: u8 },
+    Full { cs: u8, ca: u8, cv: u8 },
 }
 
-impl TabulatedEnergetics {
-    pub fn new(barrier_set: BarrierSet) -> Result<Self, FeCrError> {
-        barrier_set
-            .validate()
-            .map_err(|err| FeCrError::BarrierTable(err.to_string()))?;
-        let sha256 = barrier_set
-            .content_sha256()
-            .map_err(|err| FeCrError::BarrierTable(err.to_string()))?;
-
-        let mut index = HashMap::with_capacity(barrier_set.records.len());
-        let mut canonical_keys = Vec::with_capacity(barrier_set.records.len());
-        let mut uses_saddle_shell = false;
-        for (idx, rec) in barrier_set.records.iter().enumerate() {
-            let sp = match rec.migrating_species.as_str() {
-                "Fe" => Species::Fe,
-                "Cr" => Species::Cr,
-                other => {
-                    return Err(FeCrError::BarrierTable(format!(
-                        "unsupported migrating_species {other:?} in record {:?}; expected \"Fe\" or \"Cr\"",
-                        rec.id
-                    )));
-                }
-            };
-            let canonical_key = canonicalize_env_key(&rec.env_key).map_err(|reason| {
-                FeCrError::BarrierTable(format!(
-                    "invalid env_key {:?} in record {:?}: {reason}",
-                    rec.env_key, rec.id
-                ))
-            })?;
-            if canonical_key.contains("cr_saddle=") {
-                uses_saddle_shell = true;
-            }
-            if is_symmetric_key(&canonical_key) {
-                if rec.delta_energy_ev.abs() > barrier_set.tolerance_ev {
-                    return Err(FeCrError::BarrierTable(format!(
-                        "symmetric environment key {:?} in record {:?} requires |delta_energy_ev| <= {}, got {}",
-                        rec.env_key, rec.id, barrier_set.tolerance_ev, rec.delta_energy_ev
-                    )));
-                }
-                if let Some(rev_hz) = rec.reverse_attempt_frequency_hz
-                    && (rev_hz - rec.attempt_frequency_hz).abs() > 1e-12 * rec.attempt_frequency_hz
-                {
-                    return Err(FeCrError::BarrierTable(format!(
-                        "symmetric environment key {:?} in record {:?} requires matching forward/reverse attempt frequencies ({} vs {} Hz)",
-                        rec.env_key, rec.id, rec.attempt_frequency_hz, rev_hz
-                    )));
-                }
-            }
-            if index.insert((sp, canonical_key.clone()), idx).is_some() {
-                return Err(FeCrError::BarrierTable(format!(
-                    "duplicate canonical environment key ({}, {canonical_key:?}) in record {:?}",
-                    sp.name(),
-                    rec.id
-                )));
-            }
-            canonical_keys.push((sp, canonical_key));
-        }
-
-        // Verify cross-record consistency if both forward and reverse asymmetric keys exist.
-        for (idx, ((sp, canonical_key), rec)) in
-            canonical_keys.iter().zip(&barrier_set.records).enumerate()
-        {
-            if let Some(rev_key) = reverse_env_key(canonical_key)
-                && rev_key != *canonical_key
-                && let Some(&other_idx) = index.get(&(*sp, rev_key))
-                && other_idx > idx
-            {
-                let other = &barrier_set.records[other_idx];
-                let tol = barrier_set.tolerance_ev;
-                if (rec.forward_barrier_ev - other.reverse_barrier_ev).abs() > tol
-                    || (rec.reverse_barrier_ev - other.forward_barrier_ev).abs() > tol
-                    || (rec.delta_energy_ev + other.delta_energy_ev).abs() > tol
-                {
-                    return Err(FeCrError::BarrierTable(format!(
-                        "complementary records {:?} and {:?} disagree beyond tolerance {tol} eV",
-                        rec.id, other.id
-                    )));
-                }
-                let rec_rev_hz = rec
-                    .reverse_attempt_frequency_hz
-                    .unwrap_or(rec.attempt_frequency_hz);
-                let other_rev_hz = other
-                    .reverse_attempt_frequency_hz
-                    .unwrap_or(other.attempt_frequency_hz);
-                if (rec.attempt_frequency_hz - other_rev_hz).abs()
-                    > 1e-12 * rec.attempt_frequency_hz
-                    || (rec_rev_hz - other.attempt_frequency_hz).abs()
-                        > 1e-12 * other.attempt_frequency_hz
-                {
-                    return Err(FeCrError::BarrierTable(format!(
-                        "complementary records {:?} and {:?} disagree in attempt frequency",
-                        rec.id, other.id
-                    )));
-                }
-            }
-        }
-
-        Ok(Self {
-            barrier_set,
-            sha256,
-            index,
-            uses_saddle_shell,
-        })
+impl EnvKey {
+    fn uses_saddle(self) -> bool {
+        matches!(self, Self::Saddle { .. } | Self::Full { .. })
     }
 
-    pub fn barrier_set(&self) -> &BarrierSet {
-        &self.barrier_set
-    }
-
-    pub fn barrier_set_sha256(&self) -> &str {
-        &self.sha256
-    }
-
-    fn record_forward(&self, rec: &BarrierRecord) -> ResolvedJump {
-        ResolvedJump {
-            barrier_ev: rec.forward_barrier_ev,
-            delta_ev: rec.delta_energy_ev,
-            attempt_hz: rec.attempt_frequency_hz,
+    fn reverse(self) -> Self {
+        match self {
+            Self::Wildcard => Self::Wildcard,
+            Self::Saddle { cs } => Self::Saddle { cs },
+            Self::Pair { ca, cv } => Self::Pair { ca: cv, cv: ca },
+            Self::Full { cs, ca, cv } => Self::Full { cs, ca: cv, cv: ca },
         }
     }
 
-    fn record_reverse(&self, rec: &BarrierRecord) -> ResolvedJump {
-        ResolvedJump {
-            barrier_ev: rec.reverse_barrier_ev,
-            delta_ev: -rec.delta_energy_ev,
-            attempt_hz: rec
-                .reverse_attempt_frequency_hz
-                .unwrap_or(rec.attempt_frequency_hz),
-        }
-    }
-
-    fn resolve(
-        &self,
-        lattice: &BccLattice,
-        occupancy: &[Species],
-        vacancy_site: usize,
-        atom_site: usize,
-    ) -> Option<ResolvedJump> {
-        if vacancy_site >= occupancy.len()
-            || atom_site >= occupancy.len()
-            || occupancy[vacancy_site] != Species::Vacancy
-        {
-            return None;
-        }
-        let sp = occupancy[atom_site];
-        if sp == Species::Vacancy {
-            return None;
-        }
-
-        let ca = lattice
-            .neighbors(atom_site)
-            .iter()
-            .filter(|&&k| k != vacancy_site && occupancy[k] == Species::Cr)
-            .count();
-        let cv = lattice
-            .neighbors(vacancy_site)
-            .iter()
-            .filter(|&&k| k != atom_site && occupancy[k] == Species::Cr)
-            .count();
-        let cs = if self.uses_saddle_shell {
-            let mut count = 0_usize;
-            for &k in lattice
-                .neighbors(atom_site)
-                .iter()
-                .filter(|k| lattice.second_neighbors(vacancy_site).contains(k))
-                .chain(
-                    lattice
-                        .second_neighbors(atom_site)
-                        .iter()
-                        .filter(|k| lattice.neighbors(vacancy_site).contains(k)),
-                )
-            {
-                if k != atom_site && k != vacancy_site && occupancy[k] == Species::Cr {
-                    count += 1;
-                }
-            }
-            count
-        } else {
-            0
-        };
-
-        if self.uses_saddle_shell {
-            let fwd = format!("cr_saddle={cs},cr_atom={ca},cr_vac={cv}");
-            if let Some(&idx) = self.index.get(&(sp, fwd)) {
-                return Some(self.record_forward(&self.barrier_set.records[idx]));
-            }
-            let rev = format!("cr_saddle={cs},cr_atom={cv},cr_vac={ca}");
-            if let Some(&idx) = self.index.get(&(sp, rev)) {
-                return Some(self.record_reverse(&self.barrier_set.records[idx]));
-            }
-        }
-
-        let pair_fwd = format!("cr_atom={ca},cr_vac={cv}");
-        if let Some(&idx) = self.index.get(&(sp, pair_fwd)) {
-            return Some(self.record_forward(&self.barrier_set.records[idx]));
-        }
-        let pair_rev = format!("cr_atom={cv},cr_vac={ca}");
-        if let Some(&idx) = self.index.get(&(sp, pair_rev)) {
-            return Some(self.record_reverse(&self.barrier_set.records[idx]));
-        }
-
-        if self.uses_saddle_shell {
-            let saddle_key = format!("cr_saddle={cs}");
-            if let Some(&idx) = self.index.get(&(sp, saddle_key)) {
-                return Some(self.record_forward(&self.barrier_set.records[idx]));
-            }
-        }
-
-        if let Some(&idx) = self.index.get(&(sp, "*".to_string())) {
-            return Some(self.record_forward(&self.barrier_set.records[idx]));
-        }
-        None
+    fn is_symmetric(self) -> bool {
+        self.reverse() == self
     }
 }
 
-fn canonicalize_env_key(env_key: &str) -> Result<String, String> {
+fn parse_env_key(env_key: &str) -> Result<EnvKey, String> {
     if env_key == "*" {
-        return Ok("*".to_string());
+        return Ok(EnvKey::Wildcard);
     }
-    let mut cs: Option<usize> = None;
-    let mut ca: Option<usize> = None;
-    let mut cv: Option<usize> = None;
+    let mut cs: Option<u8> = None;
+    let mut ca: Option<u8> = None;
+    let mut cv: Option<u8> = None;
     for part in env_key.split(',') {
         let Some((k, raw_v)) = part.split_once('=') else {
             return Err("expected \"*\" or comma-separated key=value clauses".to_string());
         };
-        let parse_bounded = |limit: usize, label: &str| -> Result<usize, String> {
+        let parse_bounded = |limit: u8, label: &str| -> Result<u8, String> {
             let val = raw_v
-                .parse::<usize>()
+                .parse::<u8>()
                 .map_err(|_| format!("{label} count {raw_v:?} must be a non-negative integer"))?;
             if val > limit {
                 return Err(format!(
@@ -301,48 +100,142 @@ fn canonicalize_env_key(env_key: &str) -> Result<String, String> {
         }
     }
     match (cs, ca, cv) {
-        (Some(s), None, None) => Ok(format!("cr_saddle={s}")),
-        (None, Some(a), Some(v)) => Ok(format!("cr_atom={a},cr_vac={v}")),
-        (Some(s), Some(a), Some(v)) => Ok(format!("cr_saddle={s},cr_atom={a},cr_vac={v}")),
+        (Some(cs), None, None) => Ok(EnvKey::Saddle { cs }),
+        (None, Some(ca), Some(cv)) => Ok(EnvKey::Pair { ca, cv }),
+        (Some(cs), Some(ca), Some(cv)) => Ok(EnvKey::Full { cs, ca, cv }),
         _ => Err("cr_atom and cr_vac must be specified together".to_string()),
     }
 }
 
-fn reverse_env_key(canonical_key: &str) -> Option<String> {
-    let mut cs: Option<&str> = None;
-    let mut ca: Option<&str> = None;
-    let mut cv: Option<&str> = None;
-    for part in canonical_key.split(',') {
-        let (k, v) = part.split_once('=')?;
-        match k {
-            "cr_saddle" => cs = Some(v),
-            "cr_atom" => ca = Some(v),
-            "cr_vac" => cv = Some(v),
-            _ => return None,
+/// Rate-table Fe–Cr energetics backed by a validated [`BarrierSet`].
+///
+/// Defines local transition barriers, attempt frequencies, and [`Self::transition_delta_ev`] rather
+/// than a global Hamiltonian (`total_energy`, `exchange_delta`, and `swap_delta` return `NaN`, and
+/// [`Energetics::supports_equilibrium_swaps`] is `false`).
+#[derive(Clone, Debug)]
+pub struct TabulatedEnergetics {
+    barrier_set: BarrierSet,
+    sha256: String,
+    index: HashMap<(Species, EnvKey), usize>,
+    uses_saddle_shell: bool,
+}
+
+impl TabulatedEnergetics {
+    pub fn new(barrier_set: BarrierSet) -> Result<Self, FeCrError> {
+        barrier_set
+            .validate()
+            .map_err(|err| FeCrError::BarrierTable(err.to_string()))?;
+        let sha256 = barrier_set
+            .content_sha256()
+            .map_err(|err| FeCrError::BarrierTable(err.to_string()))?;
+
+        let mut index = HashMap::with_capacity(barrier_set.records.len());
+        let mut parsed_keys = Vec::with_capacity(barrier_set.records.len());
+        let mut uses_saddle_shell = false;
+        for (idx, rec) in barrier_set.records.iter().enumerate() {
+            let sp = match rec.migrating_species.as_str() {
+                "Fe" => Species::Fe,
+                "Cr" => Species::Cr,
+                other => {
+                    return Err(FeCrError::BarrierTable(format!(
+                        "unsupported migrating_species {other:?} in record {:?}; expected \"Fe\" or \"Cr\"",
+                        rec.id
+                    )));
+                }
+            };
+            let key = parse_env_key(&rec.env_key).map_err(|reason| {
+                FeCrError::BarrierTable(format!(
+                    "invalid env_key {:?} in record {:?}: {reason}",
+                    rec.env_key, rec.id
+                ))
+            })?;
+            if key.uses_saddle() {
+                uses_saddle_shell = true;
+            }
+            if key.is_symmetric()
+                && (rec.delta_energy_ev.abs() > barrier_set.tolerance_ev
+                    || (rec.forward_barrier_ev - rec.reverse_barrier_ev).abs()
+                        > barrier_set.tolerance_ev)
+            {
+                return Err(FeCrError::BarrierTable(format!(
+                    "symmetric environment key {:?} in record {:?} requires |delta_energy_ev| <= {} and |forward - reverse| <= {}",
+                    rec.env_key, rec.id, barrier_set.tolerance_ev, barrier_set.tolerance_ev
+                )));
+            }
+            if let Some(rev_hz) = rec.reverse_attempt_frequency_hz
+                && (rev_hz - rec.attempt_frequency_hz).abs()
+                    > 1e-12 * rec.attempt_frequency_hz.min(rev_hz)
+            {
+                return Err(FeCrError::BarrierTable(format!(
+                    "record {:?} specifies unequal forward/reverse attempt frequencies ({} vs {} Hz) incompatible with energy-only detailed balance",
+                    rec.id, rec.attempt_frequency_hz, rev_hz
+                )));
+            }
+            if index.insert((sp, key), idx).is_some() {
+                return Err(FeCrError::BarrierTable(format!(
+                    "duplicate canonical environment key ({}, {:?}) in record {:?}",
+                    sp.name(),
+                    rec.env_key,
+                    rec.id
+                )));
+            }
+            parsed_keys.push((sp, key));
         }
-    }
-    match (cs, ca, cv) {
-        (Some(s), Some(a), Some(v)) => Some(format!("cr_saddle={s},cr_atom={v},cr_vac={a}")),
-        (None, Some(a), Some(v)) => Some(format!("cr_atom={v},cr_vac={a}")),
-        _ => None,
-    }
-}
 
-fn is_symmetric_key(canonical_key: &str) -> bool {
-    if canonical_key == "*"
-        || (canonical_key.starts_with("cr_saddle=") && !canonical_key.contains(','))
-    {
-        return true;
-    }
-    reverse_env_key(canonical_key).is_some_and(|rev| rev == canonical_key)
-}
+        for (idx, (&(sp, key), rec)) in parsed_keys.iter().zip(&barrier_set.records).enumerate() {
+            let rev_key = key.reverse();
+            if rev_key != key
+                && let Some(&other_idx) = index.get(&(sp, rev_key))
+                && other_idx > idx
+            {
+                let other = &barrier_set.records[other_idx];
+                let tol = barrier_set.tolerance_ev;
+                if (rec.forward_barrier_ev - other.reverse_barrier_ev).abs() > tol
+                    || (rec.reverse_barrier_ev - other.forward_barrier_ev).abs() > tol
+                    || (rec.delta_energy_ev + other.delta_energy_ev).abs() > tol
+                {
+                    return Err(FeCrError::BarrierTable(format!(
+                        "complementary records {:?} and {:?} disagree beyond tolerance {tol} eV",
+                        rec.id, other.id
+                    )));
+                }
+                let rec_rev_hz = rec
+                    .reverse_attempt_frequency_hz
+                    .unwrap_or(rec.attempt_frequency_hz);
+                let other_rev_hz = other
+                    .reverse_attempt_frequency_hz
+                    .unwrap_or(other.attempt_frequency_hz);
+                if (rec.attempt_frequency_hz - other_rev_hz).abs()
+                    > 1e-12 * rec.attempt_frequency_hz.min(other_rev_hz)
+                    || (rec_rev_hz - other.attempt_frequency_hz).abs()
+                        > 1e-12 * rec_rev_hz.min(other.attempt_frequency_hz)
+                {
+                    return Err(FeCrError::BarrierTable(format!(
+                        "complementary records {:?} and {:?} disagree in attempt frequency",
+                        rec.id, other.id
+                    )));
+                }
+            }
+        }
 
-impl Energetics for TabulatedEnergetics {
-    fn total_energy(&self, _lattice: &BccLattice, _occupancy: &[Species]) -> f64 {
-        0.0
+        Ok(Self {
+            barrier_set,
+            sha256,
+            index,
+            uses_saddle_shell,
+        })
     }
 
-    fn exchange_delta(
+    pub fn barrier_set(&self) -> &BarrierSet {
+        &self.barrier_set
+    }
+
+    pub fn barrier_set_sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Local reaction-energy difference `E_after - E_before` in eV from the matched barrier record (`NaN` if unresolved).
+    pub fn transition_delta_ev(
         &self,
         lattice: &BccLattice,
         occupancy: &[Species],
@@ -351,6 +244,133 @@ impl Energetics for TabulatedEnergetics {
     ) -> f64 {
         self.resolve(lattice, occupancy, vacancy_site, atom_site)
             .map_or(f64::NAN, |j| j.delta_ev)
+    }
+
+    fn record_forward(&self, rec: &BarrierRecord) -> ResolvedJump {
+        ResolvedJump {
+            barrier_ev: rec.forward_barrier_ev,
+            delta_ev: rec.delta_energy_ev,
+            attempt_hz: rec.attempt_frequency_hz,
+        }
+    }
+
+    fn record_reverse(&self, rec: &BarrierRecord) -> ResolvedJump {
+        ResolvedJump {
+            barrier_ev: rec.reverse_barrier_ev,
+            delta_ev: -rec.delta_energy_ev,
+            attempt_hz: rec
+                .reverse_attempt_frequency_hz
+                .unwrap_or(rec.attempt_frequency_hz),
+        }
+    }
+
+    fn resolve(
+        &self,
+        lattice: &BccLattice,
+        occupancy: &[Species],
+        vacancy_site: usize,
+        atom_site: usize,
+    ) -> Option<ResolvedJump> {
+        if occupancy.len() != lattice.site_count()
+            || vacancy_site >= occupancy.len()
+            || atom_site >= occupancy.len()
+            || occupancy[vacancy_site] != Species::Vacancy
+        {
+            return None;
+        }
+        let sp = occupancy[atom_site];
+        if sp == Species::Vacancy {
+            return None;
+        }
+
+        let ca = lattice
+            .neighbors(atom_site)
+            .iter()
+            .filter(|&&k| k != vacancy_site && occupancy[k] == Species::Cr)
+            .count() as u8;
+        let cv = lattice
+            .neighbors(vacancy_site)
+            .iter()
+            .filter(|&&k| k != atom_site && occupancy[k] == Species::Cr)
+            .count() as u8;
+        let cs = if self.uses_saddle_shell {
+            let mut count = 0_u8;
+            for &k in lattice
+                .neighbors(atom_site)
+                .iter()
+                .filter(|k| lattice.second_neighbors(vacancy_site).contains(k))
+                .chain(
+                    lattice
+                        .second_neighbors(atom_site)
+                        .iter()
+                        .filter(|k| lattice.neighbors(vacancy_site).contains(k)),
+                )
+            {
+                if k != atom_site && k != vacancy_site && occupancy[k] == Species::Cr {
+                    count += 1;
+                }
+            }
+            count
+        } else {
+            0
+        };
+
+        if self.uses_saddle_shell {
+            if let Some(&idx) = self.index.get(&(sp, EnvKey::Full { cs, ca, cv })) {
+                return Some(self.record_forward(&self.barrier_set.records[idx]));
+            }
+            if ca != cv
+                && let Some(&idx) = self.index.get(&(sp, EnvKey::Full { cs, ca: cv, cv: ca }))
+            {
+                return Some(self.record_reverse(&self.barrier_set.records[idx]));
+            }
+        }
+
+        if let Some(&idx) = self.index.get(&(sp, EnvKey::Pair { ca, cv })) {
+            return Some(self.record_forward(&self.barrier_set.records[idx]));
+        }
+        if ca != cv
+            && let Some(&idx) = self.index.get(&(sp, EnvKey::Pair { ca: cv, cv: ca }))
+        {
+            return Some(self.record_reverse(&self.barrier_set.records[idx]));
+        }
+
+        if self.uses_saddle_shell
+            && let Some(&idx) = self.index.get(&(sp, EnvKey::Saddle { cs }))
+        {
+            return Some(self.record_forward(&self.barrier_set.records[idx]));
+        }
+
+        if let Some(&idx) = self.index.get(&(sp, EnvKey::Wildcard)) {
+            return Some(self.record_forward(&self.barrier_set.records[idx]));
+        }
+        None
+    }
+}
+
+impl Energetics for TabulatedEnergetics {
+    fn total_energy(&self, _lattice: &BccLattice, _occupancy: &[Species]) -> f64 {
+        f64::NAN
+    }
+
+    fn exchange_delta(
+        &self,
+        _lattice: &BccLattice,
+        _occupancy: &[Species],
+        _vacancy_site: usize,
+        _atom_site: usize,
+    ) -> f64 {
+        f64::NAN
+    }
+
+    fn swap_delta(
+        &self,
+        _lattice: &BccLattice,
+        _occupancy: &[Species],
+        _i: usize,
+        _j: usize,
+    ) -> f64 {
+        f64::NAN
     }
 
     fn barrier(
@@ -373,6 +393,17 @@ impl Energetics for TabulatedEnergetics {
     ) -> Option<f64> {
         self.resolve(lattice, occupancy, vacancy_site, atom_site)
             .map(|j| j.attempt_hz)
+    }
+
+    fn jump_parameters(
+        &self,
+        lattice: &BccLattice,
+        occupancy: &[Species],
+        vacancy_site: usize,
+        atom_site: usize,
+    ) -> (f64, Option<f64>) {
+        self.resolve(lattice, occupancy, vacancy_site, atom_site)
+            .map_or((f64::NAN, None), |j| (j.barrier_ev, Some(j.attempt_hz)))
     }
 
     fn supports_equilibrium_swaps(&self) -> bool {

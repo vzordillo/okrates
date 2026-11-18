@@ -1,10 +1,9 @@
 //! Single-vacancy nearest-neighbour diffusion on a periodic BCC lattice (`D_v = r a^2`).
 
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
-use okrates_core::{Checkpointable, IncrementalModel, Model, ReversibleModel};
+use okrates_core::{Checkpointable, IncrementalModel, IndependentSnapshot, Model, ReversibleModel};
 
 use crate::bcc::{BccLattice, DISPLACEMENTS};
 
@@ -87,6 +86,12 @@ pub struct VacancyState {
     displacement: [i64; 3],
 }
 
+impl IndependentSnapshot for VacancyState {
+    fn snapshot(&self) -> Self {
+        self.clone()
+    }
+}
+
 impl VacancyState {
     pub fn occupancy(&self) -> &[Species] {
         &self.occupancy
@@ -107,12 +112,12 @@ impl VacancyState {
 
     /// Squared displacement in the squared length units of `lattice_parameter`.
     pub fn squared_displacement(&self, lattice_parameter: f64) -> f64 {
-        let integer_squared = self
+        let sq_sum = self
             .displacement
             .iter()
-            .map(|&component| component * component)
-            .sum::<i64>();
-        integer_squared as f64 * lattice_parameter * lattice_parameter / 4.0
+            .map(|&component| (component as f64) * (component as f64))
+            .sum::<f64>();
+        sq_sum * lattice_parameter * lattice_parameter / 4.0
     }
 }
 
@@ -211,7 +216,7 @@ impl VacancyDiffusion {
 impl Model for VacancyDiffusion {
     type State = VacancyState;
     type Event = VacancyJump;
-    type Error = Infallible;
+    type Error = InvariantViolation;
 
     fn enumerate_events(&self, _state: &Self::State, emit: &mut dyn FnMut(Self::Event, f64)) {
         for direction in 0..8 {
@@ -220,12 +225,19 @@ impl Model for VacancyDiffusion {
     }
 
     fn apply(&self, state: &mut Self::State, event: &Self::Event) -> Result<(), Self::Error> {
+        let Some(&shift) = DISPLACEMENTS.get(event.direction) else {
+            return Err(InvariantViolation::InvalidDirection(event.direction));
+        };
+        let mut next_disp = [0_i64; 3];
+        for axis in 0..3 {
+            next_disp[axis] = state.displacement[axis]
+                .checked_add(shift[axis])
+                .ok_or(InvariantViolation::DisplacementOverflow)?;
+        }
         let target = self.lattice.neighbor(state.vacancy, event.direction);
         state.occupancy.swap(state.vacancy, target);
         state.vacancy = target;
-        for axis in 0..3 {
-            state.displacement[axis] += DISPLACEMENTS[event.direction][axis];
-        }
+        state.displacement = next_disp;
         Ok(())
     }
 }
@@ -257,8 +269,8 @@ impl IncrementalModel for VacancyDiffusion {
         8
     }
 
-    fn slot_rate(&self, _state: &Self::State, _slot: usize) -> f64 {
-        self.jump_rate
+    fn slot_rate(&self, _state: &Self::State, slot: usize) -> f64 {
+        if slot < 8 { self.jump_rate } else { f64::NAN }
     }
 
     fn slot_event(&self, _state: &Self::State, slot: usize) -> Self::Event {
@@ -321,6 +333,8 @@ pub enum InvariantViolation {
     SiteOutOfRange { site: usize, sites: usize },
     VacancyMismatch { site: usize },
     UnwrappedMismatch,
+    DisplacementOverflow,
+    InvalidDirection(usize),
 }
 
 impl fmt::Display for InvariantViolation {
@@ -339,6 +353,12 @@ impl fmt::Display for InvariantViolation {
             Self::UnwrappedMismatch => {
                 write!(f, "unwrapped displacement does not match vacancy site")
             }
+            Self::DisplacementOverflow => {
+                write!(f, "vacancy unwrapped displacement overflowed i64")
+            }
+            Self::InvalidDirection(dir) => {
+                write!(f, "vacancy jump direction {dir} is out of 0..8")
+            }
         }
     }
 }
@@ -352,7 +372,7 @@ mod tests {
         VacancyJump, jump_rate,
     };
     use crate::bcc::BccLattice;
-    use okrates_core::{Model, ReversibleModel};
+    use okrates_core::{Checkpointable, Model, ReversibleModel};
 
     #[test]
     fn jump_rate_value() {
@@ -442,5 +462,33 @@ mod tests {
                 .enumerate()
                 .all(|(i, &(d, r))| d == i && r == 2.5)
         );
+    }
+
+    #[test]
+    fn displacement_overflow_is_atomic_and_large_squared_displacement_stays_finite() {
+        let model = VacancyDiffusion::new(BccLattice::new([2, 2, 2]).unwrap(), 1.0);
+        let near_max = i64::MAX - 3;
+        let mut raw = Vec::new();
+        model.encode_state(&model.initial_state(0).unwrap(), &mut raw);
+        raw[16..24].copy_from_slice(&near_max.to_le_bytes());
+        let mut state = model.decode_state(&raw).unwrap();
+        assert!(state.squared_displacement(1.0).is_finite());
+
+        for _ in 0..3 {
+            model
+                .apply(&mut state, &VacancyJump { direction: 7 })
+                .unwrap();
+        }
+        let snapshot = state.clone();
+        assert_eq!(
+            model.apply(&mut state, &VacancyJump { direction: 7 }),
+            Err(InvariantViolation::DisplacementOverflow)
+        );
+        assert_eq!(state, snapshot);
+        assert_eq!(
+            model.apply(&mut state, &VacancyJump { direction: 8 }),
+            Err(InvariantViolation::InvalidDirection(8))
+        );
+        assert_eq!(state, snapshot);
     }
 }

@@ -7,7 +7,6 @@
 //! of ensemble means with delete-1 jackknife standard error.
 
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
@@ -79,7 +78,7 @@ pub enum TransportError {
         sample_count: usize,
     },
     InsufficientReplicas(u64),
-    Sampling(SamplingError<Infallible>),
+    Sampling(SamplingError<FeCrError>),
 }
 
 impl fmt::Display for TransportError {
@@ -126,8 +125,8 @@ impl From<FeCrError> for TransportError {
     }
 }
 
-impl From<SamplingError<Infallible>> for TransportError {
-    fn from(err: SamplingError<Infallible>) -> Self {
+impl From<SamplingError<FeCrError>> for TransportError {
+    fn from(err: SamplingError<FeCrError>) -> Self {
         Self::Sampling(err)
     }
 }
@@ -149,8 +148,8 @@ pub struct Observables {
     pub vacancy: f64,
 }
 
-fn dot(a: [i64; 3], b: [i64; 3]) -> i64 {
-    (0..3).map(|axis| a[axis] * b[axis]).sum()
+fn dot(a: [i128; 3], b: [i128; 3]) -> f64 {
+    (0..3).map(|axis| (a[axis] as f64) * (b[axis] as f64)).sum()
 }
 
 pub fn observables(state: &FeCrState, lattice_parameter: f64) -> Observables {
@@ -158,26 +157,27 @@ pub fn observables(state: &FeCrState, lattice_parameter: f64) -> Observables {
     let [n_fe, n_cr, _] = state.counts();
     let sum_fe = state.tracer_squared_sum(Species::Fe);
     let sum_cr = state.tracer_squared_sum(Species::Cr);
-    let per_atom = |sum: i64, count: usize| {
+    let per_atom = |sum: f64, count: usize| {
         if count == 0 {
             0.0
         } else {
-            sum as f64 / count as f64 * scale
+            sum / count as f64 * scale
         }
     };
     let n_atoms = n_fe + n_cr;
     let r_fe = state.collective_displacement(Species::Fe);
     let r_cr = state.collective_displacement(Species::Cr);
+    let vac = state.vacancy_displacement().map(i128::from);
     Observables {
         tracer: [per_atom(sum_fe, n_fe), per_atom(sum_cr, n_cr)],
         tracer_all: per_atom(sum_fe + sum_cr, n_atoms),
         collective: [
-            dot(r_fe, r_fe) as f64 * scale,
-            dot(r_fe, r_cr) as f64 * scale,
-            dot(r_cr, r_cr) as f64 * scale,
+            dot(r_fe, r_fe) * scale,
+            dot(r_fe, r_cr) * scale,
+            dot(r_cr, r_cr) * scale,
         ],
-        s: (sum_fe + sum_cr) as f64 * scale,
-        vacancy: dot(state.vacancy_displacement(), state.vacancy_displacement()) as f64 * scale,
+        s: (sum_fe + sum_cr) * scale,
+        vacancy: dot(vac, vac) * scale,
     }
 }
 
@@ -216,15 +216,21 @@ pub fn sample_run<E: Energetics>(
     Ok((traj.times, traj.values, traj.fired_steps))
 }
 
-/// Through-origin slope `Sum(t_i v_i) / Sum(t_i^2)`.
+/// Through-origin slope `Sum(t_i v_i) / Sum(t_i^2)` (`NaN` on empty or mismatched slices).
 pub fn origin_slope(times: &[f64], values: &[f64]) -> f64 {
+    if times.is_empty() || times.len() != values.len() {
+        return f64::NAN;
+    }
     let num: f64 = times.iter().zip(values).map(|(t, v)| t * v).sum();
     let den: f64 = times.iter().map(|t| t * t).sum();
     num / den
 }
 
-/// Ordinary least-squares slope with free intercept.
+/// Ordinary least-squares slope with free intercept (`NaN` if `< 2` points or mismatched slices).
 pub fn ols_slope(times: &[f64], values: &[f64]) -> f64 {
+    if times.len() < 2 || times.len() != values.len() {
+        return f64::NAN;
+    }
     let n = times.len() as f64;
     let mean_t = times.iter().sum::<f64>() / n;
     let mean_v = values.iter().sum::<f64>() / n;
@@ -239,6 +245,9 @@ pub fn ols_slope(times: &[f64], values: &[f64]) -> f64 {
 
 /// Sample mean and standard error `s / sqrt(n)` with Bessel correction `n - 1`.
 pub fn mean_se(values: &[f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (f64::NAN, f64::NAN);
+    }
     let n = values.len() as f64;
     let mean = values.iter().sum::<f64>() / n;
     let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
@@ -340,7 +349,7 @@ pub fn run_transport<E: Energetics + Clone + Sync>(
             sample_count: config.sample_count,
         });
     }
-    if cr_count + 1 > model.lattice().site_count() {
+    if cr_count >= model.lattice().site_count() {
         return Err(TransportError::Model(FeCrError::TooManyAtoms));
     }
     let grid = SampleGrid::windowed(config.t_equil, config.t_end, config.sample_count)?;
@@ -363,7 +372,7 @@ pub fn run_transport<E: Energetics + Clone + Sync>(
                     state.occupancy().to_vec(),
                     ctx.rng(StreamRole::Equilibration),
                 )?;
-                annealer.run_sweeps(model, anneal_sweeps)?;
+                annealer.run_sweeps(anneal_sweeps)?;
                 let a = annealer.finish();
                 final_sro_alpha1 = Some(a.diagnostics.final_sro_alpha1);
                 anneal_energy = a.energy;
@@ -466,7 +475,8 @@ pub fn summarize(runs: &[ReplicaRun], n_cr: usize, n_atoms: usize) -> Summary {
             column(&|e| e.collective[2]),
         ],
         f: jackknife_ratio_mean_se(&numerators, &denominators, n_atoms as f64),
-        mean_jumps: runs.iter().map(|r| r.fired).sum::<u64>() as f64 / runs.len() as f64,
+        mean_jumps: runs.iter().map(|r| u128::from(r.fired)).sum::<u128>() as f64
+            / runs.len() as f64,
         window_drift_ratio,
     }
 }
@@ -486,8 +496,11 @@ pub fn build_fecr_manifest<M: Checkpointable>(
 ) -> RunManifest {
     let mut encoded_params = Vec::new();
     model.encode_params(&mut encoded_params);
-    let n_sites = 2 * cells[0] * cells[1] * cells[2];
-    let n_fe = n_sites.saturating_sub(cr_count + 1);
+    let n_sites = 2_usize
+        .saturating_mul(cells[0])
+        .saturating_mul(cells[1])
+        .saturating_mul(cells[2]);
+    let n_fe = n_sites.saturating_sub(cr_count).saturating_sub(1);
     let mut composition = BTreeMap::new();
     composition.insert("Fe".to_string(), n_fe);
     composition.insert("Cr".to_string(), cr_count);

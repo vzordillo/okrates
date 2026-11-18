@@ -21,7 +21,7 @@ pub use checkpoint::{CheckpointError, Checkpointable, SCHEMA_VERSION};
 pub use clock::{Clock, ClockError};
 pub use ensemble::{EnsembleError, Replica, ReplicaContext, run_ensemble, run_replicas};
 pub use incremental::{IncrementalModel, IncrementalSimulation, SumTree};
-pub use model::{CloneRollback, Model, ReversibleModel};
+pub use model::{CloneRollback, IndependentSnapshot, Model, ReversibleModel};
 pub use rate::{Rate, RateError};
 pub use rng::{KmcRng, StreamRole};
 pub use sampler::{

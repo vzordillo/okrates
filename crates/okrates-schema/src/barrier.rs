@@ -19,8 +19,9 @@ pub struct BarrierProvenance {
 
 /// Elementary transition barrier record with forward/reverse consistency and optional UQ (`barrier_std_ev`).
 ///
-/// Sign convention: `delta_energy_ev = E_final - E_initial`, so energy-level detailed balance
-/// checks `(forward_barrier_ev - reverse_barrier_ev) == delta_energy_ev` (equal forward/reverse prefactors).
+/// Sign convention: `delta_energy_ev = E_final - E_initial`. [`BarrierSet::validate`] enforces
+/// `|(forward_barrier_ev - reverse_barrier_ev) - delta_energy_ev| <= tolerance_ev`; under equal
+/// forward and reverse attempt frequencies, this implies rate-level detailed balance within `tolerance_ev`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BarrierRecord {
     pub id: String,
@@ -175,6 +176,7 @@ impl BarrierSet {
         Ok(set)
     }
 
+    /// Checks schema version, key uniqueness, bounds, and `|(Ef - Er) - dE| <= tolerance_ev` (prefactor equality is not checked here).
     pub fn validate(&self) -> Result<(), BarrierValidationError> {
         if self.schema_version != BARRIER_SCHEMA_VERSION {
             return Err(BarrierValidationError::UnsupportedSchema(

@@ -1,6 +1,8 @@
 //! PyO3 extension module backing the `okrates` Python package.
 
-use okrates_core::{Checkpointable, KmcRng, SamplingError, Simulation, Step, StreamRole};
+use okrates_core::{
+    Checkpointable, KmcRng, SampleGrid, SamplingError, Simulation, Step, StreamRole,
+};
 use okrates_models::bcc::BccLattice;
 use okrates_models::fecr::{Energetics, FeCrModel, PairEnergetics, Species};
 use okrates_models::fecr_anneal::KawasakiAnnealer;
@@ -90,6 +92,7 @@ fn build_pair_model(
     if args.attempt_frequencies_hz.is_some()
         || args.barrier_set_json.is_some()
         || args.saddle_shift_ev != 0.0
+        || args.barrier_policy != "symmetric_floor"
     {
         return Err(value_error(
             "martinez2012/tabulated options are not valid for pair energetics",
@@ -152,10 +155,16 @@ fn build_tabulated_model(
     temperature_k: f64,
     args: &EnergeticsArgs<'_>,
 ) -> PyResult<(FeCrModel<TabulatedEnergetics>, String)> {
+    if args.attempt_frequency.is_some() {
+        return Err(value_error(
+            "attempt_frequency does not apply to tabulated energetics; each barrier record defines attempt_frequency_hz",
+        ));
+    }
     if args.pair_energies_ev.is_some()
         || args.kra_ev.is_some()
         || args.attempt_frequencies_hz.is_some()
         || args.saddle_shift_ev != 0.0
+        || args.barrier_policy != "symmetric_floor"
     {
         return Err(value_error(
             "pair and martinez2012 parameters do not apply to tabulated energetics",
@@ -170,10 +179,42 @@ fn build_tabulated_model(
     let energetics = TabulatedEnergetics::new(set).map_err(|e| value_error(e.to_string()))?;
     let sha = energetics.barrier_set_sha256().to_string();
     let lattice = BccLattice::new(cells).map_err(|e| value_error(e.to_string()))?;
-    let nu = args.attempt_frequency.unwrap_or(1e13);
-    let model = FeCrModel::new(lattice, energetics, nu, temperature_k)
+    let model = FeCrModel::new(lattice, energetics, 1e13, temperature_k)
         .map_err(|e| value_error(e.to_string()))?;
     Ok((model, sha))
+}
+
+fn validate_transport_config(config: &TransportConfig, runs: u64) -> PyResult<()> {
+    if runs < 2 {
+        return Err(transport_error_to_py(TransportError::InsufficientReplicas(
+            runs,
+        )));
+    }
+    if !config.lattice_parameter.is_finite() || config.lattice_parameter <= 0.0 {
+        return Err(transport_error_to_py(
+            TransportError::InvalidLatticeParameter(config.lattice_parameter),
+        ));
+    }
+    let min_samples = match config.fit_method {
+        FitMethod::WindowedOls => 2,
+        FitMethod::OriginSlope => 1,
+    };
+    if config.sample_count < min_samples {
+        return Err(transport_error_to_py(TransportError::InsufficientSamples {
+            fit_method: config.fit_method,
+            sample_count: config.sample_count,
+        }));
+    }
+    SampleGrid::windowed(config.t_equil, config.t_end, config.sample_count.min(2))
+        .map_err(|e| transport_error_to_py(TransportError::Sampling(SamplingError::Grid(e))))?;
+    let mut grid_buf = Vec::<f64>::new();
+    if grid_buf.try_reserve_exact(config.sample_count).is_err() {
+        return Err(value_error(format!(
+            "cannot allocate sample grid for {} samples",
+            config.sample_count
+        )));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -200,7 +241,7 @@ where
         )));
     }
     let n_sites = model.lattice().site_count();
-    if cr_count + 1 > n_sites {
+    if cr_count >= n_sites {
         return Err(value_error(format!(
             "cr_count {cr_count} plus one vacancy exceeds the {n_sites} lattice sites"
         )));
@@ -263,7 +304,7 @@ fn execute_anneal<E: Energetics + Send + Sync>(
     seed: u64,
 ) -> PyResult<AnnealRaw> {
     let n_sites = model.lattice().site_count();
-    if cr_count + 1 > n_sites {
+    if cr_count >= n_sites {
         return Err(value_error(format!(
             "cr_count {cr_count} plus one vacancy exceeds the {n_sites} lattice sites"
         )));
@@ -277,7 +318,7 @@ fn execute_anneal<E: Energetics + Send + Sync>(
                 state.occupancy().to_vec(),
                 KmcRng::for_replica(seed, 0, StreamRole::Equilibration),
             )?;
-            annealer.run_sweeps(&model, sweeps)?;
+            annealer.run_sweeps(sweeps)?;
             Ok(annealer.finish())
         })
         .map_err(|e: okrates_models::fecr::FeCrError| value_error(e.to_string()))?;
@@ -323,14 +364,29 @@ fn vacancy_trajectory(
             "lattice_parameter_m must be finite and positive, got {lattice_parameter_m}"
         )));
     }
+    let cap = usize::try_from(steps)
+        .ok()
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| {
+            value_error(format!(
+                "steps {steps} exceeds addressable trajectory length"
+            ))
+        })?;
+    let mut times = Vec::new();
+    let mut sq = Vec::new();
+    if times.try_reserve_exact(cap).is_err() || sq.try_reserve_exact(cap).is_err() {
+        return Err(value_error(format!(
+            "cannot allocate trajectory buffers for {steps} steps"
+        )));
+    }
     let lattice = BccLattice::new(cells).map_err(|err| value_error(err.to_string()))?;
 
     let result = py.detach(move || -> Result<(Vec<f64>, Vec<f64>), String> {
         let model = VacancyDiffusion::new(lattice, jump_rate);
         let state = model.initial_state(0).map_err(|err| err.to_string())?;
         let mut sim = Simulation::new(model, state, seed);
-        let mut times = vec![sim.time()];
-        let mut sq = vec![sim.state().squared_displacement(lattice_parameter_m)];
+        times.push(sim.time());
+        sq.push(sim.state().squared_displacement(lattice_parameter_m));
         for _ in 0..steps {
             match sim.step() {
                 Ok(Step::Fired { .. }) => {
@@ -408,6 +464,7 @@ fn run_fecr_transport(
         fit_method: parse_fit_method(fit_method)?,
         max_steps,
     };
+    validate_transport_config(&config, runs)?;
     let args = EnergeticsArgs {
         attempt_frequency,
         pair_energies_ev,

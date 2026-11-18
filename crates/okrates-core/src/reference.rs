@@ -3,6 +3,7 @@
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::checkpoint::Checkpointable;
 use crate::incremental::IncrementalModel;
@@ -56,7 +57,7 @@ impl Error for GraphError {}
 /// Directed multi-graph topology supporting parallel edges and self-loops.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GraphTopology {
-    targets: Vec<Vec<usize>>,
+    targets: Arc<Vec<Vec<usize>>>,
     offsets: Vec<usize>,
     slot_source: Vec<usize>,
 }
@@ -79,7 +80,7 @@ impl GraphTopology {
             offsets.push(slot_source.len());
         }
         Ok(Self {
-            targets,
+            targets: Arc::new(targets),
             offsets,
             slot_source,
         })
@@ -117,8 +118,11 @@ impl TransitionTopology for GraphTopology {
 
 impl EnumeratedTopology for GraphTopology {
     fn enumerate_candidates(&self, state: &Self::State, emit: &mut dyn FnMut(Self::Event)) {
+        let Some(edges) = self.targets.get(*state) else {
+            return;
+        };
         let base = self.offsets[*state];
-        for (local, &to) in self.targets[*state].iter().enumerate() {
+        for (local, &to) in edges.iter().enumerate() {
             emit(IndexedHop {
                 edge: base + local,
                 from: *state,
@@ -134,7 +138,13 @@ impl SlottedTopology for GraphTopology {
     }
 
     fn slot_event(&self, _state: &Self::State, slot: usize) -> Self::Event {
-        let from = self.slot_source[slot];
+        let Some(&from) = self.slot_source.get(slot) else {
+            return IndexedHop {
+                edge: slot,
+                from: usize::MAX,
+                to: usize::MAX,
+            };
+        };
         IndexedHop {
             edge: slot,
             from,
@@ -143,12 +153,14 @@ impl SlottedTopology for GraphTopology {
     }
 
     fn is_slot_active(&self, state: &Self::State, slot: usize) -> bool {
-        self.slot_source[slot] == *state
+        self.slot_source.get(slot) == Some(state)
     }
 
     fn affected_slots(&self, _state: &Self::State, event: &Self::Event, out: &mut Vec<usize>) {
         for node in [event.from, event.to] {
-            out.extend(self.offsets[node]..self.offsets[node + 1]);
+            if node < self.targets.len() {
+                out.extend(self.offsets[node]..self.offsets[node + 1]);
+            }
         }
     }
 }
@@ -156,6 +168,7 @@ impl SlottedTopology for GraphTopology {
 /// Per-edge rate table pairing with [`GraphTopology`] via [`CoupledModel`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct EdgeRateTable {
+    targets: Arc<Vec<Vec<usize>>>,
     rates: Vec<f64>,
 }
 
@@ -167,13 +180,26 @@ impl EdgeRateTable {
                 found: rates.len(),
             });
         }
-        Ok(Self { rates })
+        Ok(Self {
+            targets: Arc::clone(&topology.targets),
+            rates,
+        })
     }
 }
 
 impl RateModel<GraphTopology> for EdgeRateTable {
-    fn rate(&self, _topology: &GraphTopology, _state: &usize, event: &IndexedHop) -> f64 {
-        self.rates[event.edge]
+    fn rate(&self, topology: &GraphTopology, _state: &usize, event: &IndexedHop) -> f64 {
+        if self.targets != topology.targets {
+            return f64::NAN;
+        }
+        let Some(&from) = topology.slot_source.get(event.edge) else {
+            return f64::NAN;
+        };
+        let to = topology.targets[from][event.edge - topology.offsets[from]];
+        if from != event.from || to != event.to {
+            return f64::NAN;
+        }
+        self.rates.get(event.edge).copied().unwrap_or(f64::NAN)
     }
 }
 
@@ -224,8 +250,10 @@ impl Model for GraphRandomWalk {
     type Error = Infallible;
 
     fn enumerate_events(&self, state: &Self::State, emit: &mut dyn FnMut(Self::Event, f64)) {
-        for &(to, rate) in &self.adjacency[*state] {
-            emit(Hop { from: *state, to }, rate);
+        if let Some(edges) = self.adjacency.get(*state) {
+            for &(to, rate) in edges {
+                emit(Hop { from: *state, to }, rate);
+            }
         }
     }
 
@@ -259,7 +287,9 @@ impl IncrementalModel for GraphRandomWalk {
     }
 
     fn slot_rate(&self, state: &Self::State, slot: usize) -> f64 {
-        let from = self.slot_source[slot];
+        let Some(&from) = self.slot_source.get(slot) else {
+            return f64::NAN;
+        };
         if from == *state {
             self.adjacency[from][slot - self.offsets[from]].1
         } else {
@@ -268,7 +298,12 @@ impl IncrementalModel for GraphRandomWalk {
     }
 
     fn slot_event(&self, _state: &Self::State, slot: usize) -> Self::Event {
-        let from = self.slot_source[slot];
+        let Some(&from) = self.slot_source.get(slot) else {
+            return Hop {
+                from: usize::MAX,
+                to: usize::MAX,
+            };
+        };
         Hop {
             from,
             to: self.adjacency[from][slot - self.offsets[from]].0,
@@ -277,7 +312,9 @@ impl IncrementalModel for GraphRandomWalk {
 
     fn affected_slots(&self, _state: &Self::State, event: &Self::Event, out: &mut Vec<usize>) {
         for node in [event.from, event.to] {
-            out.extend(self.offsets[node]..self.offsets[node + 1]);
+            if node < self.adjacency.len() {
+                out.extend(self.offsets[node]..self.offsets[node + 1]);
+            }
         }
     }
 }

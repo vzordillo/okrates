@@ -165,10 +165,18 @@ impl<M: IncrementalModel> IncrementalSimulation<M> {
         self.engine.catalog().tree()
     }
 
+    /// Validates active rates without advancing RNG, clock, or step count; returns `Ok(true)` if absorbed.
+    pub fn is_absorbed(&mut self) -> Result<bool, SimError<M::Error>> {
+        self.engine.is_absorbed()
+    }
+
+    /// Fires one transition atomically; on `Err`, simulation state, sum-tree, clock, steps, and RNG are unchanged.
     pub fn step(&mut self) -> Result<Step<M::Event>, SimError<M::Error>> {
         self.engine.step()
     }
 
+    /// Invokes `before_apply(&model, &state_before, next_clock)` after clock validation and before
+    /// transition application; external side effects in `before_apply` are not rolled back on `Err`.
     pub fn step_observing<F>(
         &mut self,
         before_apply: F,
