@@ -56,7 +56,7 @@ flowchart LR
     subgraph out["📈 Results"]
         direction TB
         traj[/"Trajectories"/]
-        transport[/"Diffusivities, correlation<br>factors, segregation"/]
+        transport[/"Diffusivities, correlation<br>factors, defect counts"/]
         prov[/"Provenance records"/]
     end
     lang -.-> model ==> engine ==> out
