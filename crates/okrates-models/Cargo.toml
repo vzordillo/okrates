@@ -1,6 +1,6 @@
 [package]
 name = "okrates-models"
-description = "Concrete kinetic Monte Carlo models for okrates: BCC topology and single-vacancy diffusion."
+description = "Periodic BCC lattices, vacancy diffusion, Fe-Cr alloy energetics, annealing, and transport estimators"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,4 +8,5 @@ license.workspace = true
 
 [dependencies]
 okrates-core = { path = "../okrates-core" }
+okrates-schema = { path = "../okrates-schema" }
 rand_chacha.workspace = true

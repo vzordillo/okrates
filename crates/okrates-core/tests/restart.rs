@@ -1,4 +1,4 @@
-//! Checkpoint and restart tests for schema version 1.
+//! Checkpoint and restart tests for schema version 2.
 
 use okrates_core::reference::{GraphRandomWalk, Hop};
 use okrates_core::{CheckpointError, Simulation, Step};
@@ -46,6 +46,10 @@ fn resumed_trajectory_matches_uninterrupted() {
         assert_eq!(recorded, expected, "split {k}");
         assert_eq!(resumed.state(), reference.state(), "split {k}");
         assert_eq!(resumed.time().to_bits(), reference.time().to_bits());
+        assert_eq!(
+            resumed.clock().compensation().to_bits(),
+            reference.clock().compensation().to_bits()
+        );
         assert_eq!(resumed.steps(), reference.steps());
         assert_eq!(resumed.checkpoint(), reference.checkpoint(), "split {k}");
     }
@@ -67,18 +71,18 @@ fn golden_checkpoint_bytes() {
     let model = GraphRandomWalk::new(vec![vec![(1, 1.0)], vec![(0, 3.0)]]).unwrap();
     let mut sim = Simulation::new(model, 0, 1);
     advance(&mut sim, 3);
-    // Regression snapshot of schema 1, not a correctness oracle.
     assert_eq!(sim.checkpoint(), GOLDEN);
 }
 
-const GOLDEN: [u8; 193] = [
-    79, 75, 82, 67, 75, 80, 84, 0, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 71, 44, 54, 205, 29, 195,
-    16, 64, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 25, 0, 0, 0,
-    111, 107, 114, 97, 116, 101, 115, 46, 103, 114, 97, 112, 104, 95, 114, 97, 110, 100, 111, 109,
-    95, 119, 97, 108, 107, 56, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 8, 64, 8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+const GOLDEN: [u8; 201] = [
+    79, 75, 82, 67, 75, 80, 84, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 71, 44, 54, 205, 29, 195,
+    16, 64, 0, 0, 0, 0, 0, 32, 178, 60, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 25, 0, 0, 0, 111, 107, 114, 97, 116, 101, 115, 46, 103, 114, 97, 112, 104, 95,
+    114, 97, 110, 100, 111, 109, 95, 119, 97, 108, 107, 56, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0,
+    0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 1, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 64, 8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+    0, 0, 0, 0,
 ];
 
 fn good_bytes() -> Vec<u8> {
@@ -96,6 +100,7 @@ fn resume_err(bytes: &[u8]) -> CheckpointError {
 
 const VERSION_AT: usize = 8;
 const TIME_AT: usize = 8 + 4 + 8;
+const COMP_AT: usize = TIME_AT + 8;
 
 #[test]
 fn bad_magic_is_rejected() {
@@ -106,12 +111,14 @@ fn bad_magic_is_rejected() {
 
 #[test]
 fn other_version_is_rejected() {
-    let mut bytes = good_bytes();
-    bytes[VERSION_AT..VERSION_AT + 4].copy_from_slice(&2_u32.to_le_bytes());
-    assert!(matches!(
-        resume_err(&bytes),
-        CheckpointError::UnsupportedVersion(2)
-    ));
+    for bad_version in [1_u32, 3_u32] {
+        let mut bytes = good_bytes();
+        bytes[VERSION_AT..VERSION_AT + 4].copy_from_slice(&bad_version.to_le_bytes());
+        assert!(matches!(
+            resume_err(&bytes),
+            CheckpointError::UnsupportedVersion(v) if v == bad_version
+        ));
+    }
 }
 
 #[test]
@@ -129,8 +136,8 @@ fn trailing_bytes_are_rejected() {
 }
 
 #[test]
-fn invalid_time_is_rejected() {
-    for time in [-1.0_f64, f64::NAN] {
+fn invalid_time_and_compensation_are_rejected() {
+    for time in [-1.0_f64, -0.0_f64, f64::NAN, f64::INFINITY] {
         let mut bytes = good_bytes();
         bytes[TIME_AT..TIME_AT + 8].copy_from_slice(&time.to_bits().to_le_bytes());
         match resume_err(&bytes) {
@@ -139,6 +146,16 @@ fn invalid_time_is_rejected() {
             }
             other => panic!("expected InvalidTime, got {other:?}"),
         }
+    }
+
+    // Unnormalized or non-finite compensation (e.g. comp = -100.0 or NaN) must be rejected.
+    for comp in [-100.0_f64, 1.0_f64, f64::NAN, f64::INFINITY] {
+        let mut bytes = good_bytes();
+        bytes[COMP_AT..COMP_AT + 8].copy_from_slice(&comp.to_bits().to_le_bytes());
+        assert!(matches!(
+            resume_err(&bytes),
+            CheckpointError::InvalidCompensation { .. }
+        ));
     }
 }
 

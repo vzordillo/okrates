@@ -1,30 +1,71 @@
-//! Seeded random numbers for event and waiting-time sampling.
+//! Seeded ChaCha12 streams with domain-separated replica substreams.
 
 use rand_chacha::ChaCha12Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 
-/// A reproducible random stream for kinetic Monte Carlo sampling.
+/// Sub-stream domain tag encoded into bytes `16..24` of the 256-bit ChaCha12 key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StreamRole {
+    Dynamics,
+    InitialState,
+    Equilibration,
+    Custom(u16),
+}
+
+impl StreamRole {
+    fn tag(self) -> u64 {
+        match self {
+            Self::Dynamics => 1,
+            Self::InitialState => 2,
+            Self::Equilibration => 3,
+            Self::Custom(id) => 0x1_0000 | u64::from(id),
+        }
+    }
+}
+
+/// Deterministic `ChaCha12Rng` wrapper emitting samples strictly inside `(0, 1)`.
 #[derive(Clone, Debug)]
 pub struct KmcRng {
     inner: ChaCha12Rng,
 }
 
 impl KmcRng {
-    /// Creates a random stream from a 64-bit seed.
+    /// Stream `0` with `seed` in key bytes `0..8` and zeros in `8..32`.
     pub fn from_seed(seed: u64) -> Self {
+        Self::with_stream(seed, 0)
+    }
+
+    /// Selects an independent 64-bit ChaCha12 stream under `seed`.
+    pub fn with_stream(seed: u64, stream: u64) -> Self {
         let mut bytes = [0_u8; 32];
         bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        let mut inner = ChaCha12Rng::from_seed(bytes);
+        inner.set_stream(stream);
+        Self { inner }
+    }
+
+    /// Collision-free stream for `(base_seed, replica_id, role)` with no `u64` addition overflow.
+    pub fn for_replica(base_seed: u64, replica_id: u64, role: StreamRole) -> Self {
+        let mut bytes = [0_u8; 32];
+        bytes[..8].copy_from_slice(&base_seed.to_le_bytes());
+        bytes[8..16].copy_from_slice(&replica_id.to_le_bytes());
+        bytes[16..24].copy_from_slice(&role.tag().to_le_bytes());
         Self {
             inner: ChaCha12Rng::from_seed(bytes),
         }
     }
 
-    /// Samples a floating-point value strictly between zero and one.
+    /// Uniform sample strictly inside `(0, 1)`.
     pub fn open01(&mut self) -> f64 {
         open01_from_bits(self.inner.next_u64())
     }
 
-    /// Exports the seed, stream and word position that determine all later output.
+    /// Uniform index in `0..len`. Panics if `len == 0`.
+    pub fn index(&mut self, len: usize) -> usize {
+        assert!(len > 0, "cannot sample index from empty range");
+        ((self.open01() * len as f64) as usize).min(len - 1)
+    }
+
     pub(crate) fn export_state(&self) -> ([u8; 32], u64, u128) {
         (
             self.inner.get_seed(),
@@ -33,7 +74,6 @@ impl KmcRng {
         )
     }
 
-    /// Rebuilds a stream from the output of [`KmcRng::export_state`].
     pub(crate) fn from_state(seed: [u8; 32], stream: u64, word_pos: u128) -> Self {
         let mut inner = ChaCha12Rng::from_seed(seed);
         inner.set_stream(stream);
@@ -43,17 +83,17 @@ impl KmcRng {
 }
 
 fn open01_from_bits(bits: u64) -> f64 {
-    // The result lies strictly inside (0,1); both extremes are exactly
-    // representable, while a 53-bit variant can round to 1.0.
+    // 52-bit mantissa grid shifted by 0.5 ulp stays strictly inside (0, 1),
+    // whereas a 53-bit variant rounds `u64::MAX` to 1.0.
     ((bits >> 12) as f64 + 0.5) * f64::EPSILON
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{KmcRng, open01_from_bits};
+    use super::{KmcRng, StreamRole, open01_from_bits};
 
     #[test]
-    fn maps_bit_extremes_inside_the_open_unit_interval() {
+    fn maps_bit_extremes_inside_open_unit_interval() {
         let low = open01_from_bits(0);
         assert_eq!(low, 0.5 * f64::EPSILON);
         assert!(low > 0.0);
@@ -65,8 +105,6 @@ mod tests {
 
     #[test]
     fn golden_stream_seed_42() {
-        // Regression snapshot of the ChaCha12 stream under rand_chacha 0.10.0,
-        // not a correctness oracle.
         let mut rng = KmcRng::from_seed(42);
         let bits = [
             rng.open01().to_bits(),
@@ -80,10 +118,27 @@ mod tests {
     }
 
     #[test]
+    fn replica_roles_and_max_seeds_are_distinct_and_round_trip() {
+        let mut a = KmcRng::for_replica(u64::MAX, u64::MAX, StreamRole::Dynamics);
+        let mut b = KmcRng::for_replica(u64::MAX, u64::MAX, StreamRole::InitialState);
+        let mut c = KmcRng::for_replica(u64::MAX, u64::MAX - 1, StreamRole::Dynamics);
+        let (va, vb, vc) = (
+            a.open01().to_bits(),
+            b.open01().to_bits(),
+            c.open01().to_bits(),
+        );
+        assert_ne!(va, vb);
+        assert_ne!(va, vc);
+
+        let (seed, stream, pos) = a.export_state();
+        let mut rebuilt = KmcRng::from_state(seed, stream, pos);
+        assert_eq!(a.open01().to_bits(), rebuilt.open01().to_bits());
+    }
+
+    #[test]
     fn state_round_trip_at_many_positions() {
         for n in 0..=70 {
-            let mut original = KmcRng::from_seed(42);
-            original.inner.set_stream(5);
+            let mut original = KmcRng::with_stream(42, 5);
             for _ in 0..n {
                 original.open01();
             }

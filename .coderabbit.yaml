@@ -10,5 +10,18 @@ reviews:
     drafts: false
   path_filters:
     - "!crates/*/tests/data/**"
+  path_instructions:
+    - path: "crates/**/*.rs"
+      instructions: |
+        Enforce strict documentation and comment brevity:
+        - Never request doc comments on self-explanatory getters, struct fields, enum variants, or trait impl methods.
+        - Flag redundant comments that restate identifier/type names, narrate obvious code, duplicate module/struct docs, or reference untracked notes (ADR-*, R-000*, local paths).
+        - Require comments/docs only for physical units, sign conventions, mathematical/numerical invariants, and non-obvious failure contracts.
+        - Reject any runtime `panic!`/`unwrap`/`expect` on fallible simulation, model, or FFI paths.
+    - path: "python/**/*.py"
+      instructions: |
+        Enforce concise docstrings and type-driven schemas:
+        - Prefer typed frozen dataclasses and explicit type annotations over prose descriptions of dict keys, argument types, or standard ValueError/OverflowError behavior.
+        - Keep docstrings to 1-3 lines focused on physical meaning, units, and non-obvious invariants; avoid duplicating Rust internal comments.
 chat:
   auto_reply: true

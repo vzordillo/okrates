@@ -1,7 +1,6 @@
-//! Tests of the Fe–Cr RIS model, part 1: R1 parity (T1), detailed balance (T2),
-//! jump geometry (T3), vacancy parity with M12 (T14b), the barrier floor (T15a),
-//! defects inside each other's saddle sets (I3), the saddle refit at T (T16) and state
-//! validation.
+//! Integration tests for the Fe–Cr RIS model: energetics parity, detailed balance,
+//! jump and creation geometry, recombination, sink absorption, catalog equivalence,
+//! checkpoints, and the dumbbell saddle refit at T (T16).
 
 use std::collections::HashMap;
 use std::fs;
@@ -93,8 +92,6 @@ fn site_of(d: Defect) -> usize {
         Defect::Vacancy { site } | Defect::Dumbbell { site, .. } => site,
     }
 }
-
-// ------------------------------------------------------------------ T1
 
 fn data(name: &str) -> String {
     let path = format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -273,8 +270,6 @@ fn t1_r1_parity() {
     println!("T1 max |deviation| = {max_dev:.3e} eV");
 }
 
-// ------------------------------------------------------------------ detailed balance
-
 /// Runs the forward/reverse comparison for one jump; returns (k_f / k_r, exp(-ΔE/kT), ΔE).
 fn ratio_check(m: &FeCrRis, s: &FeCrRisState, rec: usize, jump: usize) -> (f64, f64, f64) {
     let (new, left) = m.jump_result(s, rec, jump).expect("jump must be possible");
@@ -380,8 +375,6 @@ fn t15a_floor_geometry() {
     assert!(floored_up > 0, "no floored jump with positive dE");
 }
 
-// ------------------------------------------------------------------ T16
-
 /// Raw barriers of the four defining pure-Fe jumps of r2-spec §2.5 (FeFe / Fe, mixed / Cr,
 /// mixed / Fe, CrCr / Cr), from one dumbbell at site `site` with axis 3.
 fn defining_barriers(m: &FeCrRis, site: usize) -> [f64; 4] {
@@ -428,8 +421,6 @@ fn t16_defining_barriers_hold_at_t() {
         }
     }
 }
-
-// ------------------------------------------------------------------ T3
 
 #[test]
 fn t3_geometry() {
@@ -498,8 +489,6 @@ fn t3_geometry() {
     }
 }
 
-// ------------------------------------------------------------------ T14b
-
 #[test]
 fn t14b_vacancy_parity_with_m12() {
     let m = model([8, 8, 8], 650.0, 3);
@@ -564,8 +553,6 @@ fn t14b_vacancy_parity_with_m12() {
     }
     assert_eq!(compared, 5 * 3 * 8);
 }
-
-// ------------------------------------------------------------------ I3
 
 fn saddle_sites(lattice: &BccLattice, a: usize, b: usize) -> Vec<usize> {
     let mut out: Vec<usize> = lattice
@@ -669,8 +656,6 @@ fn i3_dumbbell_inside_the_saddle_set_of_another() {
     }
     assert_eq!(checked, 8 * 2 * 6);
 }
-
-// ------------------------------------------------------------------ validation
 
 #[test]
 fn state_validation() {
@@ -776,8 +761,6 @@ fn constructor_validation() {
     assert!(bad(&|p| p.dumbbell.e[2][2][1] = 0.1));
 }
 
-// ------------------------------------------------------------------ part 2: events
-
 fn ris_model(
     cells: [usize; 3],
     temperature_k: f64,
@@ -840,8 +823,6 @@ fn species_totals(s: &FeCrRisState) -> [i64; 2] {
         (c[1] + c[3] + c[5]) as i64,
     ]
 }
-
-// ------------------------------------------------------------------ T5
 
 /// T5a: no creation; six defects, atom totals conserved and invariants held after every step.
 fn t5a_run(steps: usize) {
@@ -947,8 +928,6 @@ fn t5b_defect_bookkeeping_with_creation() {
     t5b_run(64, FULL_K0, 2000, true);
 }
 
-// ------------------------------------------------------------------ T6
-
 #[test]
 fn t6_pool_exhaustion() {
     let m = ris_model([8, 8, 8], 650.0, 1.0e5, 3, &[]);
@@ -986,8 +965,6 @@ fn t6_pool_exhaustion() {
     assert_eq!(snapshot, after);
 }
 
-// ------------------------------------------------------------------ T8
-
 #[test]
 fn t8_run_seed_changes_creation_site() {
     let m = ris_model([8, 8, 8], 650.0, 1.0e5, 4, &[]);
@@ -1002,8 +979,6 @@ fn t8_run_seed_changes_creation_site() {
     assert_ne!(vacancy_site(1), vacancy_site(2));
     assert_eq!(vacancy_site(1), vacancy_site(1));
 }
-
-// ------------------------------------------------------------------ T9
 
 /// The chain of a creation on `s` (vacancy record 0 or the first new vacancy `v_rec`, dumbbell `d_rec`),
 /// re-derived from the result: (s_0..s_10, t).
@@ -1136,8 +1111,6 @@ fn t9_creation_chain_geometry() {
     ms.check_invariants(&s).unwrap();
 }
 
-// ------------------------------------------------------------------ T10
-
 /// Fe matrix with a mixed dumbbell (plus Cr, minus Fe, axis 0) at [8,8,8] and a vacancy at
 /// `[8,8,8] + offset - d`; the vacancy then jumps by `d` to `[8,8,8] + offset`.
 fn recombination_fixture(offset: [i64; 3], d: [i64; 3]) -> (FeCrRis, FeCrRisState, usize, usize) {
@@ -1209,8 +1182,6 @@ fn t10_recombination_shells_and_fill_rule() {
     assert_eq!(free_records(&s), 0);
     m.check_invariants(&s).unwrap();
 }
-
-// ------------------------------------------------------------------ T11
 
 #[test]
 fn t11_sink_absorption() {
@@ -1297,8 +1268,6 @@ fn t11_sink_absorption() {
     assert_eq!(species_totals(&s), totals);
 }
 
-// ------------------------------------------------------------------ T15b
-
 #[test]
 fn t15b_floored_dumbbell_jumps_are_counted() {
     let m = ris_model([8, 8, 8], 650.0, 0.0, 1, &[]).with_dumbbell_saddle_shift(-1.0);
@@ -1320,8 +1289,6 @@ fn t15b_floored_dumbbell_jumps_are_counted() {
     assert!(s.floored_dumbbell_jumps() > 0);
     assert_eq!(s.floored_vacancy_jumps(), 0);
 }
-
-// ------------------------------------------------------------------ T4
 
 /// Compares the tree's slot rates bitwise with a rebuild by `slot_rate`, and, if `enumerate`,
 /// the nonzero slots with `enumerate_events`.
@@ -1402,8 +1369,6 @@ fn t4_catalog_matches_rebuild_smoke() {
 fn t4_catalog_matches_rebuild() {
     t4_run(64, T4_K0, 2000, true);
 }
-
-// ------------------------------------------------------------------ T7
 
 const T7_SEED: u64 = 0x5eed_0007;
 
@@ -1487,8 +1452,6 @@ fn t7_bitwise_restart_smoke() {
 fn t7_bitwise_restart() {
     t7_run(SMOKE_K0, 150);
 }
-
-// ------------------------------------------------------------------ T12
 
 /// A model and a state with two vacancies and two dumbbells far apart: records 0, 2 vacancies, 1, 3 dumbbells.
 fn t12_fixture() -> (FeCrRis, FeCrRisState, Vec<u8>) {

@@ -1,9 +1,9 @@
-//! Periodic body-centred cubic lattice topology.
+//! Periodic body-centred cubic lattice topology in half-lattice (`a/2`) integer coordinates.
 
 use std::error::Error;
 use std::fmt;
 
-/// Nearest-neighbour displacements in half-lattice units, in lexicographic order.
+/// Nearest-neighbour displacements in `a/2` units, ordered so `DISPLACEMENTS[7 - d] == -DISPLACEMENTS[d]`.
 pub const DISPLACEMENTS: [[i64; 3]; 8] = [
     [-1, -1, -1],
     [-1, -1, 1],
@@ -15,7 +15,7 @@ pub const DISPLACEMENTS: [[i64; 3]; 8] = [
     [1, 1, 1],
 ];
 
-/// Second-nearest-neighbour displacements in half-lattice units.
+/// Second-nearest-neighbour displacements in `a/2` units.
 pub const SECOND_DISPLACEMENTS: [[i64; 3]; 6] = [
     [-2, 0, 0],
     [2, 0, 0],
@@ -25,8 +25,8 @@ pub const SECOND_DISPLACEMENTS: [[i64; 3]; 6] = [
     [0, 0, 2],
 ];
 
-/// A periodic BCC lattice with precomputed first- and second-neighbour tables.
-#[derive(Clone, Debug)]
+/// Periodic BCC lattice with precomputed 1NN (`8`) and 2NN (`6`) neighbour tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BccLattice {
     cells: [usize; 3],
     neighbors: Vec<[usize; 8]>,
@@ -34,18 +34,35 @@ pub struct BccLattice {
 }
 
 impl BccLattice {
-    /// Creates a lattice with at least two conventional cells along each axis.
+    /// Requires at least 2 conventional cells per axis (`2 * lx * ly * lz` sites).
     pub fn new(cells: [usize; 3]) -> Result<Self, LatticeError> {
         if cells.iter().any(|&dimension| dimension < 2) {
             return Err(LatticeError::TooSmall { cells });
         }
+        let max_axis = (i64::MAX as usize) / 2;
+        let Some(site_count) = 2_usize
+            .checked_mul(cells[0])
+            .and_then(|n| n.checked_mul(cells[1]))
+            .and_then(|n| n.checked_mul(cells[2]))
+            .filter(|_| cells.iter().all(|&d| d <= max_axis))
+        else {
+            return Err(LatticeError::TooLarge { cells });
+        };
+
+        let mut neighbors = Vec::new();
+        let mut second_neighbors = Vec::new();
+        if neighbors.try_reserve_exact(site_count).is_err()
+            || second_neighbors.try_reserve_exact(site_count).is_err()
+        {
+            return Err(LatticeError::TooLarge { cells });
+        }
 
         let mut lattice = Self {
             cells,
-            neighbors: Vec::with_capacity(2 * cells[0] * cells[1] * cells[2]),
-            second_neighbors: Vec::with_capacity(2 * cells[0] * cells[1] * cells[2]),
+            neighbors,
+            second_neighbors,
         };
-        for site in 0..lattice.site_count() {
+        for site in 0..site_count {
             let position = lattice.position(site);
             let neighbors = std::array::from_fn(|direction| {
                 let target = std::array::from_fn(|axis| {
@@ -54,7 +71,7 @@ impl BccLattice {
                 });
                 lattice
                     .site_at(target)
-                    .expect("BCC neighbour positions share a parity")
+                    .expect("BCC neighbour positions share parity")
             });
             lattice.neighbors.push(neighbors);
             let second = std::array::from_fn(|direction| {
@@ -63,41 +80,35 @@ impl BccLattice {
                 });
                 lattice
                     .site_at(target)
-                    .expect("second-neighbour positions share a parity")
+                    .expect("second-neighbour positions share parity")
             });
             lattice.second_neighbors.push(second);
         }
         Ok(lattice)
     }
 
-    /// Returns the conventional cell dimensions.
     pub fn cells(&self) -> [usize; 3] {
         self.cells
     }
 
-    /// Returns the number of lattice sites.
     pub fn site_count(&self) -> usize {
         2 * self.cells[0] * self.cells[1] * self.cells[2]
     }
 
-    /// Returns the neighbour of `site` along `direction`.
     pub fn neighbor(&self, site: usize, direction: usize) -> usize {
         self.neighbors[site][direction]
     }
 
-    /// Returns the eight nearest neighbours of `site` in displacement order.
     pub fn neighbors(&self, site: usize) -> &[usize; 8] {
         &self.neighbors[site]
     }
 
-    /// Returns the six second-nearest neighbours of `site` in [`SECOND_DISPLACEMENTS`] order.
-    ///
-    /// With two cells along an axis the − and + entries on that axis coincide.
+    /// With `cells[axis] == 2`, the `-2` and `+2` second neighbours on that axis coincide.
     pub fn second_neighbors(&self, site: usize) -> &[usize; 6] {
         &self.second_neighbors[site]
     }
 
-    /// Returns a site's position in half-lattice units.
+    /// Site coordinates in `a/2` units.
     pub fn position(&self, site: usize) -> [i64; 3] {
         let [lx, ly, lz] = self.cells;
         let cells_per_sublattice = lx * ly * lz;
@@ -113,7 +124,7 @@ impl BccLattice {
         ]
     }
 
-    /// Wraps a position into the box and returns its site if its components share parity.
+    /// Wraps `position` (`a/2` units) into the periodic box; returns `None` if coordinates do not share parity.
     pub fn site_at(&self, position: [i64; 3]) -> Option<usize> {
         let wrapped: [i64; 3] =
             std::array::from_fn(|axis| position[axis].rem_euclid(2 * self.cells[axis] as i64));
@@ -130,14 +141,10 @@ impl BccLattice {
     }
 }
 
-/// An error constructing a BCC lattice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatticeError {
-    /// At least one conventional cell dimension was less than two.
-    TooSmall {
-        /// The rejected cell dimensions.
-        cells: [usize; 3],
-    },
+    TooSmall { cells: [usize; 3] },
+    TooLarge { cells: [usize; 3] },
 }
 
 impl fmt::Display for LatticeError {
@@ -147,6 +154,12 @@ impl fmt::Display for LatticeError {
                 write!(
                     f,
                     "BCC cell dimensions must all be at least 2, got {cells:?}"
+                )
+            }
+            Self::TooLarge { cells } => {
+                write!(
+                    f,
+                    "BCC cell dimensions exceed addressable capacity: {cells:?}"
                 )
             }
         }
@@ -160,11 +173,17 @@ mod tests {
     use super::{BccLattice, DISPLACEMENTS, LatticeError};
 
     #[test]
-    fn rejects_small_cells() {
+    fn rejects_small_or_overflowing_cells() {
         for cells in [[1, 2, 2], [2, 1, 2], [2, 2, 1], [2, 2, 0]] {
             assert_eq!(
                 BccLattice::new(cells).unwrap_err(),
                 LatticeError::TooSmall { cells }
+            );
+        }
+        for cells in [[usize::MAX, 2, 2], [1 << 30, 1 << 30, 2]] {
+            assert_eq!(
+                BccLattice::new(cells).unwrap_err(),
+                LatticeError::TooLarge { cells }
             );
         }
     }
@@ -197,13 +216,7 @@ mod tests {
                     });
                     assert_eq!(lattice.position(neighbor), expected_position);
 
-                    let opposite = DISPLACEMENTS
-                        .iter()
-                        .position(|candidate| {
-                            std::array::from_fn::<_, 3, _>(|axis| -DISPLACEMENTS[direction][axis])
-                                == *candidate
-                        })
-                        .unwrap();
+                    let opposite = 7 - direction;
                     assert_eq!(lattice.neighbor(neighbor, opposite), site);
                 }
             }
@@ -216,18 +229,10 @@ mod tests {
     fn explicit_wrap() {
         let lattice = BccLattice::new([2, 3, 4]).unwrap();
         let start = lattice.site_at([0, 0, 0]).unwrap();
-        let negative = DISPLACEMENTS
-            .iter()
-            .position(|&displacement| displacement == [-1, -1, -1])
-            .unwrap();
-        let positive = DISPLACEMENTS
-            .iter()
-            .position(|&displacement| displacement == [1, 1, 1])
-            .unwrap();
         let wrapped = lattice.site_at([3, 5, 7]).unwrap();
 
-        assert_eq!(lattice.neighbor(start, negative), wrapped);
-        assert_eq!(lattice.neighbor(wrapped, positive), start);
+        assert_eq!(lattice.neighbor(start, 0), wrapped);
+        assert_eq!(lattice.neighbor(wrapped, 7), start);
     }
 
     #[test]

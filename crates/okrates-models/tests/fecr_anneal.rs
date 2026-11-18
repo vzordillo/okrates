@@ -4,11 +4,15 @@
 
 use std::collections::HashMap;
 
+use okrates_core::KmcRng;
 use okrates_core::ensemble::run_replicas;
+use okrates_core::testing::chi2_upper_quantile;
 use okrates_models::bcc::BccLattice;
-use okrates_models::fecr::{Energetics, FeCrModel, PairEnergetics, Species};
-use okrates_models::fecr_anneal::anneal;
+use okrates_models::fecr::{Energetics, FeCrError, FeCrModel, PairEnergetics, Species};
+use okrates_models::fecr_anneal::{KawasakiAnnealer, anneal, warren_cowley_alpha1};
 use okrates_models::fecr_martinez::Martinez2012;
+use okrates_models::tabulated::TabulatedEnergetics;
+use okrates_schema::{BarrierRecord, BarrierSet};
 
 const ATTEMPT_FREQUENCY: f64 = 1e13;
 const TEMPERATURE_K: f64 = 800.0;
@@ -25,88 +29,234 @@ fn model(cells: [usize; 3]) -> FeCrModel<PairEnergetics> {
     .unwrap()
 }
 
-fn ln_gamma(z: f64) -> f64 {
-    const G: f64 = 7.0;
-    const C: [f64; 9] = [
-        0.999_999_999_999_809_9,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-    if z < 0.5 {
-        return (std::f64::consts::PI / (std::f64::consts::PI * z).sin()).ln() - ln_gamma(1.0 - z);
+#[test]
+fn chunked_annealer_matches_single_call_bitwise_and_guards_sweep_allocation() {
+    let m = model([4, 4, 4]);
+    let init = m.random_state(32, 42).unwrap().occupancy().to_vec();
+    let one_shot = anneal(&m, init.clone(), 24, 99).unwrap();
+
+    let mut chunked = KawasakiAnnealer::new(&m, init.clone(), KmcRng::from_seed(99)).unwrap();
+    for step in [5, 7, 12] {
+        chunked.run_sweeps(step).unwrap();
     }
-    let z = z - 1.0;
-    let mut sum = C[0];
-    for (i, c) in C.iter().enumerate().skip(1) {
-        sum += c / (z + i as f64);
-    }
-    let t = z + G + 0.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + sum.ln()
+    assert_eq!(chunked.sweeps_completed(), 24);
+    assert_eq!(chunked.finish(), one_shot);
+
+    let mut guard_check = KawasakiAnnealer::new(&m, init.clone(), KmcRng::from_seed(5)).unwrap();
+    let e0 = guard_check.current_energy();
+    assert_eq!(
+        guard_check.run_sweeps(u64::MAX),
+        Err(FeCrError::SweepAllocation(u64::MAX))
+    );
+    assert_eq!(guard_check.sweeps_completed(), 0);
+    assert_eq!(guard_check.occupancy(), init.as_slice());
+    assert_eq!(guard_check.current_energy(), e0);
 }
 
-/// Regularized upper incomplete gamma function Q(a, x).
-fn gamma_q(a: f64, x: f64) -> f64 {
-    if x <= 0.0 {
-        return 1.0;
-    }
-    if x < a + 1.0 {
-        let mut term = 1.0;
-        let mut sum = 1.0;
-        let mut n = 1.0;
-        while term > sum * 1e-17 {
-            term *= x / (a + n);
-            sum += term;
-            n += 1.0;
-        }
-        let p = (a * x.ln() - x - ln_gamma(a + 1.0) + sum.ln()).exp();
-        1.0 - p
-    } else {
-        const TINY: f64 = 1e-300;
-        let mut b = x + 1.0 - a;
-        let mut c = 1.0 / TINY;
-        let mut d = 1.0 / b;
-        let mut h = d;
-        for i in 1..1000 {
-            let an = -(i as f64) * (i as f64 - a);
-            b += 2.0;
-            d = an * d + b;
-            if d.abs() < TINY {
-                d = TINY;
-            }
-            c = b + an / c;
-            if c.abs() < TINY {
-                c = TINY;
-            }
-            d = 1.0 / d;
-            let delta = d * c;
-            h *= delta;
-            if (delta - 1.0).abs() < 1e-16 {
-                break;
-            }
-        }
-        (a * x.ln() - x - ln_gamma(a)).exp() * h
-    }
+#[test]
+fn kawasaki_annealer_preserves_energy_across_large_penalty_drop() {
+    let mut pair = [[0.0_f64; 3]; 3];
+    pair[0][0] = -0.60;
+    pair[1][1] = 1.0e15;
+    pair[0][1] = -0.56;
+    pair[1][0] = -0.56;
+    let energetics = PairEnergetics::new(pair, 1.0e16, 1.0e16).unwrap();
+    let lattice = BccLattice::new([3, 3, 3]).unwrap();
+    let m = FeCrModel::new(
+        lattice.clone(),
+        energetics,
+        ATTEMPT_FREQUENCY,
+        TEMPERATURE_K,
+    )
+    .unwrap();
+    let mut occ = vec![Species::Fe; lattice.site_count()];
+    occ[0] = Species::Vacancy;
+    let s1 = lattice.site_at([2, 2, 2]).unwrap();
+    let s2 = lattice.neighbor(s1, 0);
+    occ[s1] = Species::Cr;
+    occ[s2] = Species::Cr;
+    let res = anneal(&m, occ, 30, 17).unwrap();
+    let direct = m.energetics().total_energy(m.lattice(), &res.occupancy);
+    let tracked = *res.energy.last().unwrap();
+    assert!(res.accepted > 0);
+    assert!(
+        (tracked - direct).abs() <= 1e-12,
+        "tracked={tracked} direct={direct}"
+    );
 }
 
-/// Upper `alpha` quantile of the chi-square distribution with `df` degrees of freedom.
-fn chi2_upper_quantile(df: usize, alpha: f64) -> f64 {
-    let a = df as f64 / 2.0;
-    let (mut lo, mut hi) = (0.0, 1000.0);
-    for _ in 0..200 {
-        let mid = 0.5 * (lo + hi);
-        if gamma_q(a, mid / 2.0) > alpha {
-            lo = mid;
-        } else {
-            hi = mid;
+#[test]
+fn tabulated_energetics_rejects_annealing_malformed_keys_and_inconsistent_prefactors() {
+    let rec = |id: &str, sp: &str, key: &str, ef: f64, er: f64, de: f64| BarrierRecord {
+        id: id.to_string(),
+        migrating_species: sp.to_string(),
+        env_key: key.to_string(),
+        forward_barrier_ev: ef,
+        reverse_barrier_ev: er,
+        delta_energy_ev: de,
+        attempt_frequency_hz: 1e13,
+        reverse_attempt_frequency_hz: None,
+        barrier_std_ev: None,
+        temp_range_k: None,
+        provenance: None,
+    };
+
+    // Valid non-canonical key order (`cr_vac=2,cr_atom=1`) is canonicalized and accepted,
+    // while Kawasaki equilibration is explicitly rejected.
+    let set = BarrierSet::new(
+        "tab",
+        1e-9,
+        vec![
+            rec("fe_star", "Fe", "*", 0.65, 0.65, 0.0),
+            rec("cr_star", "Cr", "*", 0.58, 0.58, 0.0),
+            rec("fe_asym", "Fe", "cr_vac=2,cr_atom=1", 0.67, 0.64, 0.03),
+        ],
+    )
+    .unwrap();
+    let tab = FeCrModel::new(
+        BccLattice::new([3, 3, 3]).unwrap(),
+        TabulatedEnergetics::new(set).unwrap(),
+        ATTEMPT_FREQUENCY,
+        TEMPERATURE_K,
+    )
+    .unwrap();
+    let lat = tab.lattice();
+    let vac = 0;
+    let atom = lat.neighbor(vac, 0);
+    let vac_only: Vec<usize> = lat
+        .neighbors(vac)
+        .iter()
+        .copied()
+        .filter(|&k| k != atom)
+        .collect();
+    let atom_only: Vec<usize> = lat
+        .neighbors(atom)
+        .iter()
+        .copied()
+        .filter(|&k| k != vac)
+        .collect();
+    let mut fwd_occ = vec![Species::Fe; lat.site_count()];
+    fwd_occ[vac] = Species::Vacancy;
+    fwd_occ[atom_only[0]] = Species::Cr;
+    fwd_occ[vac_only[0]] = Species::Cr;
+    fwd_occ[vac_only[1]] = Species::Cr;
+    let fwd_state = tab.state(fwd_occ).unwrap();
+    assert!((tab.barrier(&fwd_state, 0) - 0.67).abs() < 1e-12);
+
+    let mut rev_occ = vec![Species::Fe; lat.site_count()];
+    rev_occ[vac] = Species::Vacancy;
+    rev_occ[atom_only[0]] = Species::Cr;
+    rev_occ[atom_only[1]] = Species::Cr;
+    rev_occ[vac_only[0]] = Species::Cr;
+    let rev_state = tab.state(rev_occ).unwrap();
+    assert!((tab.barrier(&rev_state, 0) - 0.64).abs() < 1e-12);
+
+    let mut pure_occ = vec![Species::Fe; lat.site_count()];
+    pure_occ[vac] = Species::Vacancy;
+    let pure_state = tab.state(pure_occ).unwrap();
+    assert!((tab.barrier(&pure_state, 0) - 0.65).abs() < 1e-12);
+
+    let occ = tab.random_state(8, 12).unwrap().occupancy().to_vec();
+    assert!(matches!(
+        KawasakiAnnealer::new(&tab, occ, KmcRng::from_seed(1)),
+        Err(FeCrError::UnsupportedEquilibration(_))
+    ));
+
+    // Malformed / out-of-range env_key strings are rejected instead of silently shadowed by "*".
+    for bad_key in ["cr=0", "cr_atom=1", "cr_atom=8,cr_vac=0", "cr_saddle=7"] {
+        let bad_set =
+            BarrierSet::new("bad", 1e-6, vec![rec("r", "Fe", bad_key, 0.6, 0.6, 0.0)]).unwrap();
+        assert!(matches!(
+            TabulatedEnergetics::new(bad_set),
+            Err(FeCrError::BarrierTable(_))
+        ));
+    }
+
+    // Duplicate after canonicalization (`cr_atom=1,cr_vac=2` vs `cr_vac=2,cr_atom=1`) is rejected.
+    let dup_set = BarrierSet::new(
+        "dup",
+        1e-6,
+        vec![
+            rec("r1", "Fe", "cr_atom=1,cr_vac=2", 0.67, 0.64, 0.03),
+            rec("r2", "Fe", "cr_vac=2,cr_atom=1", 0.67, 0.64, 0.03),
+        ],
+    )
+    .unwrap();
+    assert!(matches!(
+        TabulatedEnergetics::new(dup_set),
+        Err(FeCrError::BarrierTable(_))
+    ));
+
+    for key in ["*", "cr_atom=1,cr_vac=2"] {
+        let mut bad_freq = rec("freq", "Fe", key, 0.65, 0.65, 0.0);
+        bad_freq.reverse_attempt_frequency_hz = Some(2e13);
+        let freq_set = BarrierSet::new("freq", 1e-6, vec![bad_freq]).unwrap();
+        assert!(matches!(
+            TabulatedEnergetics::new(freq_set),
+            Err(FeCrError::BarrierTable(msg)) if msg.contains("unequal forward/reverse attempt frequencies")
+        ));
+    }
+
+    let asym_barriers = rec("sym_bar", "Fe", "*", 0.65, 0.62, 0.015);
+    let sym_bar_set = BarrierSet::new("sym_bar", 0.02, vec![asym_barriers]).unwrap();
+    assert!(matches!(
+        TabulatedEnergetics::new(sym_bar_set),
+        Err(FeCrError::BarrierTable(msg)) if msg.contains("symmetric environment key")
+    ));
+
+    // Complementary records that each match the other's reverse barrier but whose forward barriers
+    // contradict their delta energies (resolve uses forward barriers) are rejected.
+    let tol = 0.0078125;
+    let comp_set = BarrierSet::new(
+        "comp",
+        tol,
+        vec![
+            rec("a", "Fe", "cr_atom=1,cr_vac=0", 0.5, 0.5, -0.0078125),
+            rec(
+                "b",
+                "Fe",
+                "cr_atom=0,cr_vac=1",
+                0.4921875,
+                0.4921875,
+                0.0078125,
+            ),
+        ],
+    )
+    .unwrap();
+    assert!(matches!(
+        TabulatedEnergetics::new(comp_set),
+        Err(FeCrError::BarrierTable(msg)) if msg.contains("complementary records")
+    ));
+}
+
+#[test]
+fn warren_cowley_alpha1_distinguishes_ordering_clustering_and_bad_lengths() {
+    let lattice = BccLattice::new([4, 4, 4]).unwrap();
+    assert!(matches!(
+        warren_cowley_alpha1(&lattice, &[Species::Fe]),
+        Err(FeCrError::SiteCount { .. })
+    ));
+
+    // B2 ordered alloy (corner sites Fe, body-centre sites Cr, one vacancy at 0):
+    // every 1NN of Fe is on the Cr sublattice -> P(Cr | Fe) = 1 > x_Cr -> alpha_1 < 0.
+    let mut b2 = vec![Species::Fe; lattice.site_count()];
+    for (s, sp) in b2.iter_mut().enumerate() {
+        if lattice.position(s)[0] % 2 != 0 {
+            *sp = Species::Cr;
         }
     }
-    0.5 * (lo + hi)
+    b2[0] = Species::Vacancy;
+    assert!(warren_cowley_alpha1(&lattice, &b2).unwrap() < -0.8);
+
+    // Phase-separated slab (x < 4 Fe, x >= 4 Cr): few Fe-Cr bonds -> alpha_1 > 0.
+    let mut slab = vec![Species::Fe; lattice.site_count()];
+    for (s, sp) in slab.iter_mut().enumerate() {
+        if lattice.position(s)[0] >= 4 {
+            *sp = Species::Cr;
+        }
+    }
+    slab[0] = Species::Vacancy;
+    assert!(warren_cowley_alpha1(&lattice, &slab).unwrap() > 0.5);
 }
 #[test]
 fn swap_delta_matches_total_energy() {

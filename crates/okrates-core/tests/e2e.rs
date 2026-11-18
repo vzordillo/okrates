@@ -97,19 +97,28 @@ fn random_walk_bad_arguments() {
 #[test]
 fn catalog_scaling_small() {
     let (code, stdout, stderr) = run(example("catalog_scaling")
-        .env("MAX_M", "8")
+        .env("MAX_M", "32")
         .env("STEP_BUDGET", "1"));
     assert_eq!(code, 0, "stderr: {stderr}");
     let mut lines = stdout.lines();
     assert_eq!(
         lines.next(),
-        Some("M,steps,reps,median_ns_per_step,min_ns_per_step,max_ns_per_step")
+        Some(
+            "backend,M,rho_update,rate_skew,bytes_per_slot,steps,reps,median_ns_per_step,min_ns_per_step,max_ns_per_step"
+        )
     );
     let rows: Vec<Vec<&str>> = lines.map(|line| line.split(',').collect()).collect();
-    assert_eq!(rows.len(), 2);
-    for (row, m) in rows.iter().zip(["2", "8"]) {
-        assert_eq!(row[..3], [m, "1000", "5"]);
-        let ns: Vec<f64> = row[3..].iter().map(|v| v.parse().unwrap()).collect();
+    assert_eq!(rows.len(), 4);
+    for (row, (backend, m)) in rows.iter().zip([
+        ("direct", "8"),
+        ("sum_tree", "8"),
+        ("direct", "32"),
+        ("sum_tree", "32"),
+    ]) {
+        assert_eq!(row[0], backend);
+        assert_eq!(row[1], m);
+        assert_eq!(row[5..7], ["1000", "5"]);
+        let ns: Vec<f64> = row[7..].iter().map(|v| v.parse().unwrap()).collect();
         assert_eq!(ns.len(), 3);
         assert!(ns[1] <= ns[0] && ns[0] <= ns[2], "{row:?}");
     }

@@ -1,43 +1,29 @@
-//! Direct-method kinetic Monte Carlo simulation engine.
+//! Direct-method kinetic Monte Carlo simulation and shared step/error types.
 
 use std::error::Error;
 use std::fmt;
 
-use crate::checkpoint::{self, CheckpointError, Checkpointable};
+use crate::catalog::{DirectCatalog, Engine};
+use crate::checkpoint::{CheckpointError, Checkpointable};
 use crate::clock::{Clock, ClockError};
 use crate::model::Model;
-use crate::rate::{Rate, RateError};
+use crate::rate::RateError;
 use crate::rng::KmcRng;
 
-/// The result of one simulation step.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Step<E> {
-    /// An event fired after the stated waiting time.
-    Fired {
-        /// The event that fired.
-        event: E,
-        /// The elapsed time before the event fired.
-        dt: f64,
-    },
-    /// No positive-rate event was available.
+    Fired { event: E, dt: f64 },
     Absorbed,
 }
 
-/// An error while validating rates, advancing time, or applying an event.
 #[derive(Debug)]
 pub enum SimError<ME> {
-    /// An enumerated event had an invalid rate.
-    InvalidRate {
-        /// The event's zero-based position in enumeration order.
-        index: usize,
-        /// The invalid rate error.
-        source: RateError,
-    },
-    /// The finite event rates had a non-finite total.
+    InvalidRate { index: usize, source: RateError },
     TotalRateNotFinite,
-    /// The clock could not accept the sampled waiting time.
+    InvalidSlot { slot: usize, slot_count: usize },
+    SlotCountChanged { expected: usize, found: usize },
+    StepCounterOverflow,
     Clock(ClockError),
-    /// The model could not apply the selected event.
     Model(ME),
 }
 
@@ -48,6 +34,13 @@ impl<ME: Error> fmt::Display for SimError<ME> {
                 write!(f, "invalid rate for event {index}: {source}")
             }
             Self::TotalRateNotFinite => write!(f, "total event rate is not finite"),
+            Self::InvalidSlot { slot, slot_count } => {
+                write!(f, "slot {slot} out of range for {slot_count} slots")
+            }
+            Self::SlotCountChanged { expected, found } => {
+                write!(f, "slot count changed from {expected} to {found}")
+            }
+            Self::StepCounterOverflow => write!(f, "step counter overflowed u64::MAX"),
             Self::Clock(source) => write!(f, "clock error: {source}"),
             Self::Model(source) => write!(f, "model error: {source}"),
         }
@@ -58,189 +51,109 @@ impl<ME: Error + 'static> Error for SimError<ME> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidRate { source, .. } => Some(source),
-            Self::TotalRateNotFinite => None,
+            Self::TotalRateNotFinite
+            | Self::InvalidSlot { .. }
+            | Self::SlotCountChanged { .. }
+            | Self::StepCounterOverflow => None,
             Self::Clock(source) => Some(source),
             Self::Model(source) => Some(source),
         }
     }
 }
 
-/// The result of running a simulation for a bounded number of steps.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RunSummary {
-    /// The number of events fired during this run call.
     pub steps: u64,
-    /// The simulation time after this run call.
     pub time: f64,
-    /// Whether the simulation stopped in an absorbing state.
     pub absorbed: bool,
 }
 
-/// A serial direct-method kinetic Monte Carlo simulation.
+/// Serial direct-method KMC simulation backed by [`Engine`] and [`DirectCatalog`].
 pub struct Simulation<M: Model> {
-    model: M,
-    state: M::State,
-    clock: Clock,
-    rng: KmcRng,
-    steps: u64,
-    events: Vec<M::Event>,
-    rates: Vec<Rate>,
+    engine: Engine<M, DirectCatalog<M::Event>>,
 }
 
 impl<M: Model> Simulation<M> {
-    /// Creates a simulation with a seeded random stream.
     pub fn new(model: M, state: M::State, seed: u64) -> Self {
+        Self::with_rng(model, state, KmcRng::from_seed(seed))
+    }
+
+    pub fn with_rng(model: M, state: M::State, rng: KmcRng) -> Self {
         Self {
-            model,
-            state,
-            clock: Clock::new(),
-            rng: KmcRng::from_seed(seed),
-            steps: 0,
-            events: Vec::new(),
-            rates: Vec::new(),
+            engine: Engine::from_parts(model, state, Clock::new(), rng, 0, DirectCatalog::new()),
         }
     }
 
-    /// Returns the model.
+    pub fn engine(&self) -> &Engine<M, DirectCatalog<M::Event>> {
+        &self.engine
+    }
+
     pub fn model(&self) -> &M {
-        &self.model
+        self.engine.model()
     }
 
-    /// Returns the current model state.
     pub fn state(&self) -> &M::State {
-        &self.state
+        self.engine.state()
     }
 
-    /// Returns the current simulation time.
+    pub fn clock(&self) -> Clock {
+        self.engine.clock()
+    }
+
     pub fn time(&self) -> f64 {
-        self.clock.time()
+        self.engine.time()
     }
 
-    /// Returns the total number of events fired by this simulation.
     pub fn steps(&self) -> u64 {
-        self.steps
+        self.engine.steps()
     }
 
-    /// Fires one event, or reports that the state is absorbing.
+    /// Validates active rates without advancing RNG, clock, or step count; returns `Ok(true)` if absorbed.
+    pub fn is_absorbed(&mut self) -> Result<bool, SimError<M::Error>> {
+        self.engine.is_absorbed()
+    }
+
+    /// Fires one transition atomically; on `Err`, simulation state, catalog, clock, steps, and RNG are unchanged.
     pub fn step(&mut self) -> Result<Step<M::Event>, SimError<M::Error>> {
-        self.events.clear();
-        self.rates.clear();
-
-        let mut validation_error = None;
-        let mut index = 0;
-        let (model, state, events, rates) =
-            (&self.model, &self.state, &mut self.events, &mut self.rates);
-        model.enumerate_events(state, &mut |event, value| {
-            let event_index = index;
-            index += 1;
-            match Rate::new(value) {
-                Ok(rate) if !rate.is_zero() => {
-                    events.push(event);
-                    rates.push(rate);
-                }
-                Ok(_) => {}
-                Err(source) => {
-                    if validation_error.is_none() {
-                        validation_error = Some(SimError::InvalidRate {
-                            index: event_index,
-                            source,
-                        });
-                    }
-                }
-            }
-        });
-        if let Some(error) = validation_error {
-            return Err(error);
-        }
-
-        let mut total = 0.0;
-        for rate in &self.rates {
-            total += rate.get();
-        }
-        if !total.is_finite() {
-            return Err(SimError::TotalRateNotFinite);
-        }
-        if self.events.is_empty() {
-            return Ok(Step::Absorbed);
-        }
-
-        let u1 = self.rng.open01();
-        let idx = select(&self.rates, total, u1);
-        let u2 = self.rng.open01();
-        let dt = -u2.ln() / total;
-
-        let mut advanced_clock = self.clock;
-        advanced_clock.advance(dt).map_err(SimError::Clock)?;
-        let event = self.events.swap_remove(idx);
-        self.model
-            .apply(&mut self.state, &event)
-            .map_err(SimError::Model)?;
-        self.clock = advanced_clock;
-        self.steps += 1;
-        Ok(Step::Fired { event, dt })
+        self.engine.step()
     }
 
-    /// Runs up to max_steps events, stopping early if the state is absorbing.
+    /// Invokes `before_apply(&model, &state_before, next_clock)` after clock validation and before
+    /// transition application; external side effects in `before_apply` are not rolled back on `Err`.
+    pub fn step_observing<F>(
+        &mut self,
+        before_apply: F,
+    ) -> Result<Step<M::Event>, SimError<M::Error>>
+    where
+        F: FnOnce(&M, &M::State, Clock),
+    {
+        self.engine.step_observing(before_apply)
+    }
+
     pub fn run(&mut self, max_steps: u64) -> Result<RunSummary, SimError<M::Error>> {
-        let mut fired = 0;
-        let mut absorbed = false;
-        for _ in 0..max_steps {
-            match self.step()? {
-                Step::Fired { .. } => fired += 1,
-                Step::Absorbed => {
-                    absorbed = true;
-                    break;
-                }
-            }
-        }
-        Ok(RunSummary {
-            steps: fired,
-            time: self.clock.time(),
-            absorbed,
-        })
+        self.engine.run(max_steps)
     }
 }
 
 impl<M: Checkpointable> Simulation<M> {
-    /// Encodes the simulation as a checkpoint in schema version 1.
     pub fn checkpoint(&self) -> Vec<u8> {
-        checkpoint::encode(self.steps, &self.clock, &self.rng, &self.model, &self.state)
+        self.engine.checkpoint()
     }
 
-    /// Rebuilds a simulation from `bytes`, validating them against `model`.
     pub fn resume(model: M, bytes: &[u8]) -> Result<Self, CheckpointError> {
-        let (steps, clock, rng, state) = checkpoint::decode(&model, bytes)?;
         Ok(Self {
-            model,
-            state,
-            clock,
-            rng,
-            steps,
-            events: Vec::new(),
-            rates: Vec::new(),
+            engine: Engine::resume(model, bytes)?,
         })
     }
 }
 
-fn select(rates: &[Rate], total: f64, u: f64) -> usize {
-    let target = u * total;
-    let mut acc = 0.0;
-    for (i, rate) in rates.iter().enumerate() {
-        acc += rate.get();
-        if target < acc {
-            return i;
-        }
-    }
-    // The running sum reproduces total bitwise in the same order, so this
-    // fallback selects the final event when rounding puts target at total.
-    rates.len() - 1
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Simulation, Step, select};
+    use super::{Simulation, Step};
+    use crate::catalog::direct_select;
     use crate::rate::Rate;
     use crate::reference::GraphRandomWalk;
+    use crate::rng::KmcRng;
 
     fn rates(values: &[f64]) -> Vec<Rate> {
         values
@@ -252,35 +165,33 @@ mod tests {
     #[test]
     fn select_handles_two_equal_rates_and_the_boundary() {
         let values = rates(&[1.0, 1.0]);
-        assert_eq!(select(&values, 2.0, 0.5), 1);
-        assert_eq!(select(&values, 2.0, 0.49999999999999994), 0);
-        assert_eq!(select(&values, 2.0, 0.25), 0);
+        assert_eq!(direct_select(&values, 2.0, 0.5), 1);
+        assert_eq!(direct_select(&values, 2.0, 0.49999999999999994), 0);
+        assert_eq!(direct_select(&values, 2.0, 0.25), 0);
     }
 
     #[test]
     fn select_handles_three_rates() {
         let values = rates(&[1.0, 2.0, 3.0]);
-        assert_eq!(select(&values, 6.0, 0.1), 0);
-        assert_eq!(select(&values, 6.0, 0.4), 1);
-        assert_eq!(select(&values, 6.0, 0.9), 2);
+        assert_eq!(direct_select(&values, 6.0, 0.1), 0);
+        assert_eq!(direct_select(&values, 6.0, 0.4), 1);
+        assert_eq!(direct_select(&values, 6.0, 0.9), 2);
     }
 
     #[test]
     fn select_falls_back_to_the_last_rate_when_target_equals_total() {
-        assert_eq!(select(&rates(&[3.0]), 3.0, 1.0), 0);
-        assert_eq!(select(&rates(&[1.0, 1.0]), 2.0, 1.0), 1);
+        assert_eq!(direct_select(&rates(&[3.0]), 3.0, 1.0), 0);
+        assert_eq!(direct_select(&rates(&[1.0, 1.0]), 2.0, 1.0), 1);
     }
 
     #[test]
     fn absorbing_step_draws_no_random_numbers() {
         let model = GraphRandomWalk::new(vec![vec![]]).unwrap();
-        let mut sim = Simulation::new(model, 0, 99);
+        let mut sim = Simulation::with_rng(model.clone(), 0, KmcRng::from_seed(99));
         for _ in 0..3 {
             assert_eq!(sim.step().unwrap(), Step::Absorbed);
         }
-        assert_eq!(
-            sim.rng.open01().to_bits(),
-            crate::rng::KmcRng::from_seed(99).open01().to_bits()
-        );
+        let fresh = Simulation::new(model, 0, 99);
+        assert_eq!(sim.checkpoint(), fresh.checkpoint());
     }
 }

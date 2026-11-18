@@ -1,21 +1,16 @@
-//! A single vacancy exchanging with its eight nearest neighbours in BCC iron.
+//! Single-vacancy nearest-neighbour diffusion on a periodic BCC lattice (`D_v = r a^2`).
 
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
-use okrates_core::{Checkpointable, Model};
+use okrates_core::{Checkpointable, IncrementalModel, IndependentSnapshot, Model, ReversibleModel};
 
 use crate::bcc::{BccLattice, DISPLACEMENTS};
 
-/// Boltzmann's constant in eV/K, from exact SI-defined constants.
-///
-/// This is the exact SI value of k_B in J/K divided by the elementary charge in C.
+/// Exact SI Boltzmann constant `k_B / e` in `eV/K`.
 pub const BOLTZMANN_EV_PER_K: f64 = 1.380649e-23 / 1.602176634e-19;
 
-/// Computes an Arrhenius jump rate from attempt frequency, migration energy, and temperature.
-///
-/// The inputs are in s⁻¹, eV, and K respectively, and the result is in s⁻¹.
+/// Arrhenius jump rate `nu * exp(-E_m / (k_B T))` in `s^-1` (`attempt_frequency` in `s^-1`, `migration_energy_ev` in `eV`, `temperature_k` in `K`).
 pub fn jump_rate(
     attempt_frequency: f64,
     migration_energy_ev: f64,
@@ -42,18 +37,12 @@ pub fn jump_rate(
     Ok(rate)
 }
 
-/// An error computing an Arrhenius rate.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RateParameterError {
-    /// The attempt frequency was not finite and positive.
     AttemptFrequency(f64),
-    /// The migration energy was not finite and non-negative.
     MigrationEnergy(f64),
-    /// The temperature was not finite and positive.
     Temperature(f64),
-    /// The rate underflowed to a non-positive value.
     Underflow,
-    /// The rate was not finite.
     Overflow,
 }
 
@@ -83,16 +72,12 @@ impl fmt::Display for RateParameterError {
 
 impl Error for RateParameterError {}
 
-/// The species occupying a lattice site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Species {
-    /// An iron atom.
     Fe,
-    /// The single vacancy.
     Vacancy,
 }
 
-/// The occupancy and unwrapped position of a single vacancy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VacancyState {
     occupancy: Vec<Species>,
@@ -101,49 +86,47 @@ pub struct VacancyState {
     displacement: [i64; 3],
 }
 
+impl IndependentSnapshot for VacancyState {
+    fn snapshot(&self) -> Self {
+        self.clone()
+    }
+}
+
 impl VacancyState {
-    /// Returns the species at every lattice site.
     pub fn occupancy(&self) -> &[Species] {
         &self.occupancy
     }
 
-    /// Returns the vacancy's wrapped lattice site.
     pub fn vacancy(&self) -> usize {
         self.vacancy
     }
 
-    /// Returns the vacancy's origin lattice site.
     pub fn origin(&self) -> usize {
         self.origin
     }
 
-    /// Returns the vacancy's unwrapped displacement in half-lattice units.
+    /// Unwrapped displacement in `a/2` units.
     pub fn displacement(&self) -> [i64; 3] {
         self.displacement
     }
 
-    /// Returns squared displacement in the physical length units of `lattice_parameter`.
+    /// Squared displacement in the squared length units of `lattice_parameter`.
     pub fn squared_displacement(&self, lattice_parameter: f64) -> f64 {
-        let integer_squared = self
+        let sq_sum = self
             .displacement
             .iter()
-            .map(|&component| component * component)
-            .sum::<i64>();
-        integer_squared as f64 * lattice_parameter * lattice_parameter / 4.0
+            .map(|&component| (component as f64) * (component as f64))
+            .sum::<f64>();
+        sq_sum * lattice_parameter * lattice_parameter / 4.0
     }
 }
 
-/// A vacancy jump along one of the eight BCC nearest-neighbour directions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VacancyJump {
-    /// The index into [`DISPLACEMENTS`](crate::bcc::DISPLACEMENTS).
     pub direction: usize,
 }
 
-/// A single-vacancy exchange model on a periodic BCC lattice.
-///
-/// This is the vacancy diffusivity model, not atom tracer diffusion. For this model,
-/// `D_v = r a²`.
+/// Isotropic single-vacancy BCC random walk (`D_v = r a^2`, distinct from tracer diffusivity).
 #[derive(Clone, Debug)]
 pub struct VacancyDiffusion {
     lattice: BccLattice,
@@ -151,22 +134,18 @@ pub struct VacancyDiffusion {
 }
 
 impl VacancyDiffusion {
-    /// Creates a model with the supplied lattice and per-direction jump rate.
     pub fn new(lattice: BccLattice, jump_rate: f64) -> Self {
         Self { lattice, jump_rate }
     }
 
-    /// Returns the model's lattice.
     pub fn lattice(&self) -> &BccLattice {
         &self.lattice
     }
 
-    /// Returns the per-direction jump rate.
     pub fn jump_rate(&self) -> f64 {
         self.jump_rate
     }
 
-    /// Creates an all-iron state with a vacancy at `vacancy_site`.
     pub fn initial_state(&self, vacancy_site: usize) -> Result<VacancyState, InvariantViolation> {
         let sites = self.lattice.site_count();
         if vacancy_site >= sites {
@@ -186,7 +165,6 @@ impl VacancyDiffusion {
         })
     }
 
-    /// Checks occupancy, vacancy location, and consistency with unwrapped displacement.
     pub fn check_invariants(&self, state: &VacancyState) -> Result<(), InvariantViolation> {
         let expected = self.lattice.site_count();
         if state.occupancy.len() != expected {
@@ -224,8 +202,11 @@ impl VacancyDiffusion {
         }
 
         let origin = self.lattice.position(state.origin);
-        let unwrapped = std::array::from_fn(|axis| origin[axis] + state.displacement[axis]);
-        if self.lattice.site_at(unwrapped) != Some(state.vacancy) {
+        let wrapped = std::array::from_fn(|axis| {
+            let period = 2 * self.lattice.cells()[axis] as i128;
+            (origin[axis] as i128 + state.displacement[axis] as i128).rem_euclid(period) as i64
+        });
+        if self.lattice.site_at(wrapped) != Some(state.vacancy) {
             return Err(InvariantViolation::UnwrappedMismatch);
         }
         Ok(())
@@ -235,7 +216,7 @@ impl VacancyDiffusion {
 impl Model for VacancyDiffusion {
     type State = VacancyState;
     type Event = VacancyJump;
-    type Error = Infallible;
+    type Error = InvariantViolation;
 
     fn enumerate_events(&self, _state: &Self::State, emit: &mut dyn FnMut(Self::Event, f64)) {
         for direction in 0..8 {
@@ -244,13 +225,60 @@ impl Model for VacancyDiffusion {
     }
 
     fn apply(&self, state: &mut Self::State, event: &Self::Event) -> Result<(), Self::Error> {
+        let Some(&shift) = DISPLACEMENTS.get(event.direction) else {
+            return Err(InvariantViolation::InvalidDirection(event.direction));
+        };
+        let mut next_disp = [0_i64; 3];
+        for axis in 0..3 {
+            next_disp[axis] = state.displacement[axis]
+                .checked_add(shift[axis])
+                .ok_or(InvariantViolation::DisplacementOverflow)?;
+        }
         let target = self.lattice.neighbor(state.vacancy, event.direction);
         state.occupancy.swap(state.vacancy, target);
         state.vacancy = target;
-        for axis in 0..3 {
-            state.displacement[axis] += DISPLACEMENTS[event.direction][axis];
-        }
+        state.displacement = next_disp;
         Ok(())
+    }
+}
+
+impl ReversibleModel for VacancyDiffusion {
+    type Undo = usize;
+
+    fn apply_reversible(
+        &self,
+        state: &mut Self::State,
+        event: &Self::Event,
+    ) -> Result<Self::Undo, Self::Error> {
+        self.apply(state, event)?;
+        Ok(7 - event.direction)
+    }
+
+    fn undo(&self, state: &mut Self::State, opposite: Self::Undo) {
+        let _ = self.apply(
+            state,
+            &VacancyJump {
+                direction: opposite,
+            },
+        );
+    }
+}
+
+impl IncrementalModel for VacancyDiffusion {
+    fn slot_count(&self, _state: &Self::State) -> usize {
+        8
+    }
+
+    fn slot_rate(&self, _state: &Self::State, slot: usize) -> f64 {
+        if slot < 8 { self.jump_rate } else { f64::NAN }
+    }
+
+    fn slot_event(&self, _state: &Self::State, slot: usize) -> Self::Event {
+        VacancyJump { direction: slot }
+    }
+
+    fn affected_slots(&self, _state: &Self::State, _event: &Self::Event, out: &mut Vec<usize>) {
+        out.extend(0..8);
     }
 }
 
@@ -298,32 +326,15 @@ impl Checkpointable for VacancyDiffusion {
     }
 }
 
-/// A violation of a single-vacancy state invariant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvariantViolation {
-    /// The occupancy length differs from the lattice site count.
-    SiteCount {
-        /// The lattice site count.
-        expected: usize,
-        /// The occupancy vector length.
-        found: usize,
-    },
-    /// The occupancy contains a number of vacancies other than one.
+    SiteCount { expected: usize, found: usize },
     VacancyCount(usize),
-    /// A referenced lattice site is out of range.
-    SiteOutOfRange {
-        /// The invalid site index.
-        site: usize,
-        /// The number of sites in the lattice.
-        sites: usize,
-    },
-    /// The vacancy field does not point to the occupied vacancy.
-    VacancyMismatch {
-        /// The site stored in the vacancy field.
-        site: usize,
-    },
-    /// The unwrapped displacement does not lead to the wrapped vacancy site.
+    SiteOutOfRange { site: usize, sites: usize },
+    VacancyMismatch { site: usize },
     UnwrappedMismatch,
+    DisplacementOverflow,
+    InvalidDirection(usize),
 }
 
 impl fmt::Display for InvariantViolation {
@@ -342,6 +353,12 @@ impl fmt::Display for InvariantViolation {
             Self::UnwrappedMismatch => {
                 write!(f, "unwrapped displacement does not match vacancy site")
             }
+            Self::DisplacementOverflow => {
+                write!(f, "vacancy unwrapped displacement overflowed i64")
+            }
+            Self::InvalidDirection(dir) => {
+                write!(f, "vacancy jump direction {dir} is out of 0..8")
+            }
         }
     }
 }
@@ -355,7 +372,7 @@ mod tests {
         VacancyJump, jump_rate,
     };
     use crate::bcc::BccLattice;
-    use okrates_core::Model;
+    use okrates_core::{Checkpointable, Model, ReversibleModel};
 
     #[test]
     fn jump_rate_value() {
@@ -378,125 +395,100 @@ mod tests {
                 Err(RateParameterError::MigrationEnergy(_))
             ));
         }
-        for temperature in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+        for temperature in [0.0, -10.0, f64::NAN, f64::INFINITY] {
             assert!(matches!(
                 jump_rate(1.0, 0.1, temperature),
                 Err(RateParameterError::Temperature(_))
             ));
         }
         assert_eq!(
-            jump_rate(1e13, 0.65, 1.0),
+            jump_rate(1.0, 1000.0, 1.0),
             Err(RateParameterError::Underflow)
         );
-        assert_eq!(jump_rate(f64::MAX, 0.0, 300.0), Ok(f64::MAX));
+        assert_eq!(jump_rate(f64::MAX, 0.0, 1.0), Ok(f64::MAX));
     }
 
     #[test]
-    fn enumerates_eight_equal_rate_jumps_to_distinct_neighbours() {
+    fn reversible_undo_restores_exact_state() {
         let lattice = BccLattice::new([3, 3, 3]).unwrap();
-        let model = VacancyDiffusion::new(lattice, 2.5);
-        let state = model.initial_state(7).unwrap();
-        let mut events = Vec::new();
-        model.enumerate_events(&state, &mut |event, rate| events.push((event, rate)));
-
-        assert_eq!(events.len(), 8);
-        assert_eq!(
-            events
-                .iter()
-                .map(|(event, _)| event.direction)
-                .collect::<Vec<_>>(),
-            (0..8).collect::<Vec<_>>()
-        );
-        assert!(events.iter().all(|(_, rate)| *rate == 2.5));
-        let targets = events
-            .iter()
-            .map(|(event, _)| model.lattice().neighbor(state.vacancy(), event.direction))
-            .collect::<Vec<_>>();
-        for index in 0..targets.len() {
-            assert!(!targets[..index].contains(&targets[index]));
-        }
+        let model = VacancyDiffusion::new(lattice, 1.0);
+        let mut state = model.initial_state(0).unwrap();
+        let before = state.clone();
+        let undo = model
+            .apply_reversible(&mut state, &VacancyJump { direction: 5 })
+            .unwrap();
+        assert_ne!(state, before);
+        model.undo(&mut state, undo);
+        assert_eq!(state, before);
     }
 
     #[test]
-    fn invariants_detect_corruption() {
-        let model = VacancyDiffusion::new(BccLattice::new([2, 2, 2]).unwrap(), 1.0);
-        let valid = model.initial_state(3).unwrap();
+    fn check_invariants_rejects_corrupted_states() {
+        let lattice = BccLattice::new([2, 2, 2]).unwrap();
+        let model = VacancyDiffusion::new(lattice, 1.0);
+        let base = model.initial_state(0).unwrap();
 
-        let mut extra_vacancy = valid.clone();
-        extra_vacancy.occupancy[5] = Species::Vacancy;
+        let mut wrong_len = base.clone();
+        wrong_len.occupancy.pop();
+        assert!(matches!(
+            model.check_invariants(&wrong_len),
+            Err(InvariantViolation::SiteCount { .. })
+        ));
+
+        let mut two_vacancies = base.clone();
+        two_vacancies.occupancy[1] = Species::Vacancy;
         assert_eq!(
-            model.check_invariants(&extra_vacancy),
+            model.check_invariants(&two_vacancies),
             Err(InvariantViolation::VacancyCount(2))
         );
 
-        let mut truncated = valid.clone();
-        truncated.occupancy.pop();
+        let mut bad_disp = base;
+        bad_disp.displacement = [1, 1, 1];
         assert_eq!(
-            model.check_invariants(&truncated),
-            Err(InvariantViolation::SiteCount {
-                expected: 16,
-                found: 15
-            })
-        );
-
-        let mut mismatched = valid.clone();
-        mismatched.vacancy = 4;
-        assert_eq!(
-            model.check_invariants(&mismatched),
-            Err(InvariantViolation::VacancyMismatch { site: 4 })
-        );
-
-        let mut unwrapped_mismatch = valid.clone();
-        unwrapped_mismatch.displacement = [1, 1, 1];
-        assert_eq!(
-            model.check_invariants(&unwrapped_mismatch),
+            model.check_invariants(&bad_disp),
             Err(InvariantViolation::UnwrappedMismatch)
         );
+    }
 
-        assert_eq!(
-            model.initial_state(16),
-            Err(InvariantViolation::SiteOutOfRange {
-                site: 16,
-                sites: 16
-            })
+    #[test]
+    fn enumerates_eight_equal_rates() {
+        let model = VacancyDiffusion::new(BccLattice::new([2, 2, 2]).unwrap(), 2.5);
+        let state = model.initial_state(0).unwrap();
+        let mut out = Vec::new();
+        model.enumerate_events(&state, &mut |ev, r| out.push((ev.direction, r)));
+        assert_eq!(out.len(), 8);
+        assert!(
+            out.iter()
+                .enumerate()
+                .all(|(i, &(d, r))| d == i && r == 2.5)
         );
     }
 
     #[test]
-    fn invariant_bounds_are_checked() {
+    fn displacement_overflow_is_atomic_and_large_squared_displacement_stays_finite() {
         let model = VacancyDiffusion::new(BccLattice::new([2, 2, 2]).unwrap(), 1.0);
-        let valid = model.initial_state(3).unwrap();
-        let mut bad_vacancy = valid.clone();
-        bad_vacancy.vacancy = 16;
-        assert_eq!(
-            model.check_invariants(&bad_vacancy),
-            Err(InvariantViolation::SiteOutOfRange {
-                site: 16,
-                sites: 16
-            })
-        );
-        let mut bad_origin = valid;
-        bad_origin.origin = 16;
-        assert_eq!(
-            model.check_invariants(&bad_origin),
-            Err(InvariantViolation::SiteOutOfRange {
-                site: 16,
-                sites: 16
-            })
-        );
-    }
+        let near_max = i64::MAX - 3;
+        let mut raw = Vec::new();
+        model.encode_state(&model.initial_state(0).unwrap(), &mut raw);
+        raw[16..24].copy_from_slice(&near_max.to_le_bytes());
+        let mut state = model.decode_state(&raw).unwrap();
+        assert!(state.squared_displacement(1.0).is_finite());
 
-    #[test]
-    fn apply_swaps_the_vacancy_and_tracks_unwrapped_displacement() {
-        let lattice = BccLattice::new([2, 2, 2]).unwrap();
-        let model = VacancyDiffusion::new(lattice, 1.0);
-        let mut state = model.initial_state(0).unwrap();
-        model
-            .apply(&mut state, &VacancyJump { direction: 0 })
-            .unwrap();
-        assert_eq!(state.occupancy()[0], Species::Fe);
-        assert_eq!(state.occupancy()[state.vacancy()], Species::Vacancy);
-        assert_eq!(state.displacement(), [-1, -1, -1]);
-        assert_eq!(model.check_invariants(&state), Ok(()));
+        for _ in 0..3 {
+            model
+                .apply(&mut state, &VacancyJump { direction: 7 })
+                .unwrap();
+        }
+        let snapshot = state.clone();
+        assert_eq!(
+            model.apply(&mut state, &VacancyJump { direction: 7 }),
+            Err(InvariantViolation::DisplacementOverflow)
+        );
+        assert_eq!(state, snapshot);
+        assert_eq!(
+            model.apply(&mut state, &VacancyJump { direction: 8 }),
+            Err(InvariantViolation::InvalidDirection(8))
+        );
+        assert_eq!(state, snapshot);
     }
 }

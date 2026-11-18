@@ -1,14 +1,14 @@
 //! Tests of the Martínez et al. (2012) Fe–Cr energetics: parameter transcription,
-//! agreement with an independent oracle at 0 K and 800 K, local-delta consistency,
-//! detailed balance, absolute rates, barrier positivity and validation.
+//! oracle agreement at 0 K and 800 K, local-delta consistency, detailed balance,
+//! absolute rates, barrier floor policies, and validation.
 
 use std::collections::HashSet;
 use std::fs;
 
-use okrates_core::Model;
+use okrates_core::{Model, SimError, Simulation};
 use okrates_models::bcc::BccLattice;
 use okrates_models::fecr::{Energetics, FeCrError, FeCrModel, Species};
-use okrates_models::fecr_martinez::{Martinez2012, params};
+use okrates_models::fecr_martinez::{BarrierFloorPolicy, Martinez2012, params};
 use okrates_models::vacancy::BOLTZMANN_EV_PER_K;
 
 const NU: f64 = 1e13;
@@ -28,7 +28,6 @@ fn model(cells: [usize; 3], temperature_k: f64) -> FeCrModel<Martinez2012> {
     .unwrap()
 }
 
-/// Deterministic xorshift generator for test draws.
 struct Xorshift(u64);
 
 impl Xorshift {
@@ -42,8 +41,6 @@ impl Xorshift {
         (self.next() % n as u64) as usize
     }
 }
-
-// ---------------------------------------------------------------- fixtures
 
 fn triple(tokens: &[&str]) -> [i64; 3] {
     [
@@ -63,7 +60,6 @@ struct Block {
     barriers: Vec<([i64; 3], f64)>,
 }
 
-/// Parses `config`/`mix` blocks; returns the blocks and the `# ht`/`# gt` line values.
 fn parse_blocks(text: &str, saddle_tag: &str) -> (Vec<Block>, [[f64; 2]; 2]) {
     let mut blocks: Vec<Block> = Vec::new();
     let mut saddle = [[f64::NAN; 2]; 2];
@@ -122,8 +118,6 @@ fn occupancy_of(lattice: &BccLattice, block: &Block) -> Vec<Species> {
     occ
 }
 
-// ---------------------------------------------------------------- T1
-
 fn json_number(text: &str, key: &str) -> f64 {
     let pattern = format!("\"{key}\":");
     let start = text
@@ -174,8 +168,6 @@ fn constants_match_json() {
     }
 }
 
-// ---------------------------------------------------------------- T2
-
 #[test]
 fn vacancy_formation() {
     let lattice = BccLattice::new([6, 6, 6]).unwrap();
@@ -193,13 +185,10 @@ fn vacancy_formation() {
             let e_vac = energetics.total_energy(&lattice, &with_vacancy);
             let formation = e_vac - e_pure * (n - 1.0) / n;
             let expected = dhf - temperature * BOLTZMANN_EV_PER_K * dsf;
-            println!("T={temperature} {species:?}: formation {formation} expected {expected}");
             assert!((formation - expected).abs() < 1e-9);
         }
     }
 }
-
-// ---------------------------------------------------------------- T3
 
 #[test]
 fn table2_barriers() {
@@ -227,7 +216,6 @@ fn table2_barriers() {
         }
         occ[site(vacancy)] = Species::Vacancy;
         let rust = energetics.barrier(&lattice, &occ, site(vacancy), site(jumper));
-        println!("{} {name}: rust {rust:.12} fixture {value:.12}", t[1]);
         assert!((rust - value).abs() < 1e-6, "{} {name}", t[1]);
         if name == "H0" {
             h0[matrix] = rust;
@@ -250,8 +238,6 @@ fn table2_barriers() {
     }
 }
 
-// ---------------------------------------------------------------- T4
-
 #[test]
 fn saddle_fit() {
     for (file, tag, temperature, tolerance) in [
@@ -264,19 +250,12 @@ fn saddle_fit() {
             .saddle_interactions();
         for a in 0..2 {
             for b in 0..2 {
-                println!(
-                    "T={temperature} {a}{b}: {} vs {}",
-                    fitted[a][b], expected[a][b]
-                );
                 assert!((fitted[a][b] - expected[a][b]).abs() < tolerance, "{a}{b}");
             }
         }
     }
 }
 
-// ---------------------------------------------------------------- T5, T6
-
-/// Checks energies and barriers of every `config` block in `file`.
 fn check_configs(file: &str, temperature: f64, energy_tol: f64, barrier_tol: f64) {
     let lattice = BccLattice::new([6, 6, 6]).unwrap();
     let energetics = Martinez2012::new(temperature).unwrap();
@@ -329,7 +308,6 @@ fn oracle_0k() {
         let hmix =
             energetics.total_energy(&lattice, &occ) / n - (1.0 - x) * e_fe / n - x * e_cr / n;
         let expected = block.hmix.unwrap();
-        println!("{}: hmix {hmix} vs {expected}", block.header);
         assert!((hmix - expected).abs() < 1e-9, "{}", block.header);
     }
 }
@@ -338,8 +316,6 @@ fn oracle_0k() {
 fn oracle_t800() {
     check_configs("martinez2012_t800.txt", 800.0, 1e-8, 1e-8);
 }
-
-// ---------------------------------------------------------------- T7
 
 fn energy_with(
     energetics: &Martinez2012,
@@ -418,10 +394,6 @@ fn local_deltas_match_total_smoke() {
     local_deltas([3, 3, 3], &[0.5], 1, 20);
 }
 
-// ---------------------------------------------------------------- T8
-
-/// Checks detailed balance for every jump; returns the number of jumps whose raw
-/// barrier lies below the floor max(0, dE).
 fn check_detailed_balance_with(
     model: &FeCrModel<Martinez2012>,
     fractions: &[f64],
@@ -470,9 +442,6 @@ fn detailed_balance() {
     check_detailed_balance_with(&model([4, 4, 4], 800.0), &[0.1, 0.5, 0.9], 5);
 }
 
-/// The floor raises the saddle to max(E_initial, E_final), the same level for the
-/// forward and the reverse jump, so detailed balance holds when it acts. A saddle
-/// shift forces it to act.
 #[test]
 fn floor_preserves_detailed_balance() {
     let shift = -0.12;
@@ -480,13 +449,68 @@ fn floor_preserves_detailed_balance() {
     let model = FeCrModel::new(BccLattice::new([4, 4, 4]).unwrap(), energetics, NU, 800.0).unwrap();
     let floored = check_detailed_balance_with(&model, &[0.1, 0.5, 0.9], 5);
     let counted = model.energetics().floor_activations();
-    println!("shift {shift} eV: {floored} floored forward jumps, floor_activations {counted}");
     assert!(floored >= 1, "floor never active at shift {shift}");
     assert!(counted > 0);
 }
 
-/// On the oracle configurations the floor does not act: every barrier equals the
-/// raw pair-model value and the counter stays at zero.
+#[test]
+fn floor_policies_behave_without_panicking() {
+    let shift = -0.15;
+    let lattice = BccLattice::new([4, 4, 4]).unwrap();
+
+    // Unfloored returns raw barrier directly even below max(0, dE).
+    let unfloored = Martinez2012::with_policy(800.0, NU, NU, BarrierFloorPolicy::Unfloored)
+        .unwrap()
+        .with_saddle_shift(shift);
+    let m_unfloored = FeCrModel::new(lattice.clone(), unfloored, NU, 800.0).unwrap();
+    let state = m_unfloored.random_state(63, 9000).unwrap();
+    let mut saw_below_floor = false;
+    for d in 0..8 {
+        let atom = lattice.neighbor(state.vacancy(), d);
+        let raw = m_unfloored.energetics().raw_barrier(
+            &lattice,
+            state.occupancy(),
+            state.vacancy(),
+            atom,
+        );
+        let b = m_unfloored.barrier(&state, d);
+        let de = m_unfloored.energetics().exchange_delta(
+            &lattice,
+            state.occupancy(),
+            state.vacancy(),
+            atom,
+        );
+        assert_eq!(b, raw);
+        if raw < de.max(0.0) {
+            saw_below_floor = true;
+        }
+    }
+    assert!(saw_below_floor);
+    assert!(m_unfloored.energetics().floor_activations() >= 1);
+
+    // Strict rejects floored jumps via SimError::InvalidRate without panicking or mutating state.
+    let strict = Martinez2012::with_policy(800.0, NU, NU, BarrierFloorPolicy::Strict)
+        .unwrap()
+        .with_saddle_shift(shift);
+    let probe = strict.clone();
+    let m_strict = FeCrModel::new(lattice.clone(), strict, NU, 800.0).unwrap();
+    let initial = state.clone();
+    let mut sim = Simulation::new(m_strict, state, 1);
+    assert!(matches!(sim.step(), Err(SimError::InvalidRate { .. })));
+    assert_eq!(sim.state(), &initial);
+    assert!(probe.floor_activations() >= 1);
+
+    // Invalid multi-vacancy input to raw_barrier returns NaN rather than panicking.
+    let mut two_vac = initial.occupancy().to_vec();
+    let nb = lattice.neighbors(initial.vacancy())[0];
+    two_vac[nb] = Species::Vacancy;
+    assert!(
+        probe
+            .raw_barrier(&lattice, &two_vac, initial.vacancy(), nb)
+            .is_nan()
+    );
+}
+
 #[test]
 fn floor_inactive_on_oracles() {
     let lattice = BccLattice::new([6, 6, 6]).unwrap();
@@ -514,8 +538,7 @@ fn floor_inactive_on_oracles() {
                 occ[vacancy] = Species::Vacancy;
                 cases.push((occ, vacancy, site(triple(&t[4..7]))));
             }
-            let file = "martinez2012_0k.txt";
-            cases.extend(config_cases(&lattice, file));
+            cases.extend(config_cases(&lattice, "martinez2012_0k.txt"));
         } else {
             cases.extend(config_cases(&lattice, "martinez2012_t800.txt"));
         }
@@ -527,11 +550,9 @@ fn floor_inactive_on_oracles() {
         }
         assert_eq!(energetics.floor_activations(), 0, "T={temperature}");
     }
-    println!("{checked} barriers checked");
     assert!(checked > 20);
 }
 
-/// All eight jumps of every `config` block of an oracle file.
 fn config_cases(lattice: &BccLattice, file: &str) -> Vec<(Vec<Species>, usize, usize)> {
     let (blocks, _) = parse_blocks(&data(file), "ht");
     let mut cases = Vec::new();
@@ -544,8 +565,6 @@ fn config_cases(lattice: &BccLattice, file: &str) -> Vec<(Vec<Species>, usize, u
     }
     cases
 }
-
-// ---------------------------------------------------------------- T9
 
 #[test]
 fn absolute_rates() {
@@ -572,7 +591,6 @@ fn absolute_rates() {
         let expected = 1e13 * (-(dh0 - ts) / kt).exp();
         for d in 0..8 {
             let rate = m.rate(&state, d);
-            println!("{species:?} dir {d}: {rate} vs {expected}");
             assert!(rel(rate, expected) <= 1e-12, "{species:?} dir {d}");
         }
     }
@@ -591,23 +609,17 @@ fn absolute_rates() {
         .unwrap();
     let expected = 3e13 * (-(params::DH2_FE - ts) / kt).exp();
     let rate = m.rate(&state, d);
-    println!("Cr in Fe: {rate} vs {expected}");
     assert!(rel(rate, expected) <= 1e-12);
 }
-
-// ---------------------------------------------------------------- T10
 
 fn barriers_positive(fractions: &[f64], seeds: u64) {
     let n = 2 * 6 * 6 * 6;
     for temperature in [0.0, 800.0] {
-        // T = 0 cannot be a model temperature, so states come from an 800 K model
-        // and the energetics are evaluated directly.
         let energetics = Martinez2012::new(temperature).unwrap();
         let lattice = BccLattice::new([6, 6, 6]).unwrap();
         let helper = model([6, 6, 6], 800.0);
         for &x in fractions {
             let cr_count = (x * (n - 1) as f64).round() as usize;
-            let (mut min_barrier, mut min_margin) = (f64::INFINITY, f64::INFINITY);
             for seed in 0..seeds {
                 let state = helper.random_state(cr_count, 11_000 + seed).unwrap();
                 let occ = state.occupancy();
@@ -620,13 +632,8 @@ fn barriers_positive(fractions: &[f64], seeds: u64) {
                         b > delta,
                         "T={temperature} x={x} seed={seed}: barrier {b} <= delta {delta}"
                     );
-                    min_barrier = min_barrier.min(b);
-                    min_margin = min_margin.min(b - delta.max(0.0));
                 }
             }
-            println!(
-                "T={temperature} x={x}: min barrier {min_barrier:.6} min (barrier - max(0, dE)) {min_margin:.6}"
-            );
         }
     }
 }
@@ -643,8 +650,6 @@ fn barriers_positive_full() {
 fn barriers_positive_smoke() {
     barriers_positive(&[0.1, 0.5, 0.9], 1);
 }
-
-// ---------------------------------------------------------------- T11
 
 #[test]
 fn validate_rejects() {
@@ -686,4 +691,21 @@ fn validate_rejects() {
         Some(FeCrError::AttemptFrequency(0.0))
     );
     assert!(Martinez2012::new(0.0).is_ok());
+}
+
+#[test]
+fn invalid_occupancy_lengths_return_nan_across_martinez2012() {
+    let lattice = BccLattice::new([3, 3, 3]).unwrap();
+    let energetics = Martinez2012::new(800.0).unwrap();
+    let atom = lattice.neighbor(0, 0);
+    let short = [Species::Vacancy, Species::Fe];
+    let mut oversized = vec![Species::Fe; lattice.site_count() + 1];
+    oversized[0] = Species::Vacancy;
+    for bad in [&short[..], &oversized[..]] {
+        assert!(energetics.raw_barrier(&lattice, bad, 0, atom).is_nan());
+        assert!(energetics.barrier(&lattice, bad, 0, atom).is_nan());
+        assert!(energetics.exchange_delta(&lattice, bad, 0, atom).is_nan());
+        assert!(energetics.swap_delta(&lattice, bad, 0, atom).is_nan());
+        assert!(energetics.total_energy(&lattice, bad).is_nan());
+    }
 }
