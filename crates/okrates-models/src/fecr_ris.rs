@@ -727,6 +727,8 @@ pub struct FeCrRis {
     lattice: BccLattice,
     energetics: Martinez2012,
     kt: f64,
+    /// Saddle interactions refitted at T (r2-spec §2.5); `params` keeps the fitted values.
+    saddle: [[f64; 2]; 2],
 }
 
 impl FeCrRis {
@@ -757,12 +759,86 @@ impl FeCrRis {
         let energetics =
             Martinez2012::new(params.temperature_k).map_err(FeCrRisError::Energetics)?;
         let kt = BOLTZMANN_EV_PER_K * params.temperature_k;
+        let saddle = if params.temperature_k > 0.0 {
+            Self::refit_saddle(&params)?
+        } else {
+            params.dumbbell.saddle
+        };
         Ok(Self {
             params,
             lattice,
             energetics,
             kt,
+            saddle,
         })
+    }
+
+    /// A 6×6×6 model without sinks at `temperature_k` with saddle table `saddle`.
+    fn probe(
+        params: &FeCrRisParams,
+        temperature_k: f64,
+        saddle: [[f64; 2]; 2],
+    ) -> Result<Self, FeCrRisError> {
+        Ok(Self {
+            params: FeCrRisParams {
+                cells: [6, 6, 6],
+                sink_planes: Vec::new(),
+                capacity: 1,
+                temperature_k,
+                ..params.clone()
+            },
+            lattice: BccLattice::new([6, 6, 6]).map_err(FeCrRisError::Lattice)?,
+            energetics: Martinez2012::new(temperature_k).map_err(FeCrRisError::Energetics)?,
+            kt: BOLTZMANN_EV_PER_K * temperature_k,
+            saddle,
+        })
+    }
+
+    /// Raw barriers of the four defining pure-Fe jumps of r2-spec §2.5, in the order
+    /// FeFe dumbbell / Fe, mixed / Cr, mixed / Fe, CrCr dumbbell / Cr.
+    fn defining_barriers(&self) -> Result<[f64; 4], FeCrRisError> {
+        use Species::{Cr, Fe};
+        let mut out = [0.0; 4];
+        for (i, (plus, minus, mover)) in [(Fe, Fe, Fe), (Cr, Fe, Cr), (Cr, Fe, Fe), (Cr, Cr, Cr)]
+            .into_iter()
+            .enumerate()
+        {
+            let occ = vec![Fe; self.lattice.site_count()];
+            let defect = Defect::Dumbbell {
+                site: 0,
+                axis: 0,
+                plus,
+                minus,
+            };
+            let s = self.state_with_defects(occ, &[defect], 0)?;
+            let mv = (0..8)
+                .filter_map(|j| self.jump_move(&s, 0, j))
+                .find(|mv| matches!(*mv, Move::Dumbbell { jumper, .. } if jumper == mover))
+                .expect("a pure-Fe dumbbell has jumps for both of its atoms");
+            out[i] = self.raw_of(&s, &mv);
+        }
+        Ok(out)
+    }
+
+    /// Refits the four saddle interactions at T so that the defining barriers keep their
+    /// 0 K values (r2-spec §2.5): FeFe and CrFe from jumps 1 and 2 (8 terms each), then
+    /// FeCr and CrCr from jumps 3 and 4 (1 term each).
+    fn refit_saddle(params: &FeCrRisParams) -> Result<[[f64; 2]; 2], FeCrRisError> {
+        let fitted = params.dumbbell.saddle;
+        let target = Self::probe(params, 0.0, fitted)?.defining_barriers()?;
+        let mut probe = Self::probe(params, params.temperature_k, fitted)?;
+        let b = probe.defining_barriers()?;
+        probe.saddle[0][0] -= (b[0] - target[0]) / 8.0;
+        probe.saddle[1][0] -= (b[1] - target[1]) / 8.0;
+        let b = probe.defining_barriers()?;
+        probe.saddle[0][1] -= b[2] - target[2];
+        probe.saddle[1][1] -= b[3] - target[3];
+        Ok(probe.saddle)
+    }
+
+    /// The saddle interactions `[jumper][neighbour]` in use at the model temperature.
+    pub fn dumbbell_saddle(&self) -> [[f64; 2]; 2] {
+        self.saddle
     }
 
     /// The parameters.
@@ -780,8 +856,8 @@ impl FeCrRis {
     /// Exists only to force the barrier floor in tests.
     #[doc(hidden)]
     pub fn with_dumbbell_saddle_shift(mut self, shift: f64) -> Self {
-        for row in &mut self.params.dumbbell.saddle {
-            for g in row {
+        for table in [&mut self.params.dumbbell.saddle, &mut self.saddle] {
+            for g in table.iter_mut().flatten() {
                 *g += shift;
             }
         }
@@ -1284,7 +1360,7 @@ impl FeCrRis {
             Move::Dumbbell {
                 jumper, rest, atom, ..
             } => {
-                let t = &self.params.dumbbell.saddle;
+                let t = &self.saddle;
                 sum += t[jumper.index()][rest.index()] + t[jumper.index()][atom.index()];
                 (*t, jumper)
             }
