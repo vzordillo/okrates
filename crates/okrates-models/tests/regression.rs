@@ -151,10 +151,18 @@ fn fecr_ris_trajectory() {
         "counters (created, recombined, absorbed_v, absorbed_i) differ"
     );
     assert_eq!(time_bits, FECR_RIS_TIME_BITS, "final time bits differ");
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     assert_eq!(dts, FECR_RIS_DTS, "dt digest differs");
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    println!("fecr_ris_trajectory: no dt digest pinned for this target_arch; dt check skipped");
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "macos")
+    )))]
+    println!(
+        "fecr_ris_trajectory: no dt digest pinned for this target (arch + OS); dt check skipped"
+    );
 }
 
 /// R-0001 estimator (vacancy_msd example) at 8 runs and 200 expected jumps.
@@ -378,8 +386,9 @@ const FECR_RIS_TIME_BITS: u64 = 4649587576939108156;
 // The dt digest is per target (ADR-0006 rule 4, PR #9): the event sequence, counters and
 // final time bits agree on x86_64 Linux and aarch64 macOS, but the last bits of single
 // dt values differ with the platform ln/exp, so the digest over their bits does too.
-#[cfg(target_arch = "x86_64")]
+// A target is architecture plus OS (the maths library comes with the OS); other targets skip only the dt check.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 const FECR_RIS_DTS: u64 = 12745560918834596932;
 // aarch64 value printed by macOS CI (PR #9, run 44330880606); events, counters and time bits match x86_64.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const FECR_RIS_DTS: u64 = 9886202463999487029;
