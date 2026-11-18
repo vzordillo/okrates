@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::fs;
 
-use okrates_core::Model;
+use okrates_core::{Checkpointable, IncrementalModel, IncrementalSimulation, Model, Step};
 use okrates_models::bcc::{BccLattice, DISPLACEMENTS};
 use okrates_models::fecr::{Energetics, Species};
 use okrates_models::fecr_martinez::Martinez2012;
@@ -746,6 +746,12 @@ fn ris_model(
     .unwrap()
 }
 
+/// Creation rate per site (s⁻¹) for the P = 64 runs and for the P = 16 smokes (T4, T5b, T7, T12).
+const FULL_K0: f64 = 1.0e8;
+const SMOKE_K0: f64 = 1.0e7;
+/// The T4 full run: creation is a large share of the total rate.
+const T4_K0: f64 = 1.0e9;
+
 fn free_records(s: &FeCrRisState) -> usize {
     s.records()
         .iter()
@@ -787,8 +793,8 @@ fn species_totals(s: &FeCrRisState) -> [i64; 2] {
 
 // ------------------------------------------------------------------ T5
 
-#[test]
-fn t5a_atom_conservation_without_creation() {
+/// T5a: no creation; six defects, atom totals conserved and invariants held after every step.
+fn t5a_run(steps: usize) {
     let m = ris_model([8, 8, 8], 650.0, 0.0, 6, &[0]);
     let base = m.random_state(102, 3, 1).unwrap();
     let p = |x, y, z| pos_site(&m, [x, y, z]);
@@ -810,7 +816,7 @@ fn t5a_atom_conservation_without_creation() {
     let mut s = m.state_with_defects(occupancy(&base), &defects, 1).unwrap();
     let before = species_totals(&s);
     let mut rng = Xorshift(0x5eed_0001);
-    for step in 0..2000 {
+    for step in 0..steps {
         let Some(e) = choose(&m, &s, &mut rng) else {
             break;
         };
@@ -829,28 +835,43 @@ fn t5a_atom_conservation_without_creation() {
 }
 
 #[test]
-fn t5b_defect_bookkeeping_with_creation() {
-    let m = ris_model([8, 8, 8], 650.0, 1.0e8, 6, &[0]);
-    let mut s = m.random_state(102, 3, 1).unwrap();
-    let mut rng = Xorshift(0x5eed_0002);
-    for step in 0..1000 {
-        let e = choose(&m, &s, &mut rng).expect("creation is always possible");
-        m.apply(&mut s, &e).unwrap();
+fn t5a_atom_conservation_smoke() {
+    t5a_run(250);
+}
+
+#[test]
+#[ignore = "full tier: conservation"]
+fn t5a_atom_conservation_without_creation() {
+    t5a_run(2000);
+}
+
+/// T5b: creation on; created = recombined + absorbed + present, per kind, after every step.
+fn t5b_run(capacity: usize, k0: f64, steps: usize, full: bool) {
+    let m = ris_model([8, 8, 8], 650.0, k0, capacity, &[0]);
+    let s = m.random_state(102, 3, 1).unwrap();
+    let mut sim = IncrementalSimulation::new(m, s, 0x5eed_0002).unwrap();
+    for step in 0..steps {
+        let event = match sim.step().unwrap() {
+            Step::Fired { event, .. } => event,
+            Step::Absorbed => panic!("creation keeps the model live"),
+        };
+        let s = sim.state();
         let (v, i) = s.defect_counts();
         assert_eq!(
             s.created(),
             s.recombined() + s.absorbed_i() + i as u64,
-            "interstitials, step {step}, event {e:?}"
+            "interstitials, step {step}, event {event:?}"
         );
         assert_eq!(
             s.created(),
             s.recombined() + s.absorbed_v() + v as u64,
-            "vacancies, step {step}, event {e:?}"
+            "vacancies, step {step}, event {event:?}"
         );
-        m.check_invariants(&s).unwrap();
+        sim.model().check_invariants(s).unwrap();
     }
+    let s = sim.state();
     println!(
-        "T5b created {} recombined {} absorbed I {} V {} peak {} attempts {}",
+        "T5b P={capacity} created {} recombined {} absorbed I {} V {} peak {} attempts {}",
         s.created(),
         s.recombined(),
         s.absorbed_i(),
@@ -858,9 +879,22 @@ fn t5b_defect_bookkeeping_with_creation() {
         s.peak_defects(),
         s.creation_attempts()
     );
-    assert!(s.created() > 0 && s.recombined() > 0);
-    assert!(s.absorbed_i() + s.absorbed_v() > 0);
-    assert!(s.peak_defects() >= 2);
+    assert!(s.created() > 0 && s.peak_defects() >= 2);
+    if full {
+        assert!(s.recombined() > 0, "no recombination");
+        assert!(s.absorbed_i() + s.absorbed_v() > 0, "no absorption");
+    }
+}
+
+#[test]
+fn t5b_defect_bookkeeping_smoke() {
+    t5b_run(16, SMOKE_K0, 100, false);
+}
+
+#[test]
+#[ignore = "full tier: bookkeeping"]
+fn t5b_defect_bookkeeping_with_creation() {
+    t5b_run(64, FULL_K0, 2000, true);
 }
 
 // ------------------------------------------------------------------ T6
@@ -1235,4 +1269,306 @@ fn t15b_floored_dumbbell_jumps_are_counted() {
     println!("T15b floored {}", s.floored_dumbbell_jumps());
     assert!(s.floored_dumbbell_jumps() > 0);
     assert_eq!(s.floored_vacancy_jumps(), 0);
+}
+
+// ------------------------------------------------------------------ T4
+
+/// Compares the tree's slot rates bitwise with a rebuild by `slot_rate`, and, if `enumerate`,
+/// the nonzero slots with `enumerate_events`.
+fn assert_catalog_matches_rebuild(
+    sim: &IncrementalSimulation<FeCrRis>,
+    enumerate: bool,
+    context: &str,
+) {
+    let (m, s) = (sim.model(), sim.state());
+    let count = m.slot_count(s);
+    assert_eq!(sim.tree().len(), count);
+    let mut nonzero = Vec::new();
+    for slot in 0..count {
+        let rebuilt = m.slot_rate(s, slot);
+        assert_eq!(
+            sim.tree().rate(slot).to_bits(),
+            rebuilt.to_bits(),
+            "{context}: slot {slot} of {count}"
+        );
+        if rebuilt > 0.0 {
+            nonzero.push((m.slot_event(s, slot), rebuilt));
+        }
+    }
+    if enumerate {
+        let mut emitted = Vec::new();
+        m.enumerate_events(s, &mut |e, r| emitted.push((e, r)));
+        assert_eq!(emitted, nonzero, "{context}: enumerate_events");
+    }
+}
+
+/// Runs `steps` steps from a random 10 % Cr state and checks the catalog after each step.
+fn t4_run(capacity: usize, k0: f64, steps: usize, full: bool) {
+    let m = ris_model([8, 8, 8], 650.0, k0, capacity, &[0]);
+    let s = m.random_state(102, 3, 1).unwrap();
+    let mut sim = IncrementalSimulation::new(m, s, 0x5eed_0004).unwrap();
+    assert_catalog_matches_rebuild(&sim, true, "initial");
+    let mut creations = 0_u64;
+    let mut share_sum = 0.0;
+    for step in 0..steps {
+        let s = sim.state();
+        let slot = sim.model().slot_count(s) - 1;
+        share_sum += sim.tree().rate(slot) / sim.tree().total();
+        let event = match sim.step().unwrap() {
+            Step::Fired { event, .. } => event,
+            Step::Absorbed => panic!("creation keeps the model live"),
+        };
+        creations += u64::from(event == FeCrRisEvent::Create);
+        assert_catalog_matches_rebuild(
+            &sim,
+            step % 20 == 0,
+            &format!("step {step}, event {event:?}"),
+        );
+    }
+    let s = sim.state();
+    println!(
+        "T4 P={capacity} steps {steps}: Create events {creations}, created {} recombined {} absorbed I {} V {}, \
+         mean creation share of the total rate {:.3}",
+        s.created(),
+        s.recombined(),
+        s.absorbed_i(),
+        s.absorbed_v(),
+        share_sum / steps as f64
+    );
+    assert!(creations > 0 && creations == s.created(), "no creation");
+    if full {
+        assert!(s.recombined() > 0, "no recombination");
+        assert!(s.absorbed_i() > 0 && s.absorbed_v() > 0, "no absorption");
+    }
+}
+
+#[test]
+fn t4_catalog_matches_rebuild_smoke() {
+    t4_run(16, SMOKE_K0, 40, false);
+}
+
+#[test]
+#[ignore = "full tier: equivalence"]
+fn t4_catalog_matches_rebuild() {
+    t4_run(64, T4_K0, 2000, true);
+}
+
+// ------------------------------------------------------------------ T7
+
+const T7_SEED: u64 = 0x5eed_0007;
+
+fn t7_model(k0: f64) -> FeCrRis {
+    ris_model([8, 8, 8], 650.0, k0, 16, &[0])
+}
+
+fn t7_fresh(k0: f64) -> IncrementalSimulation<FeCrRis> {
+    let m = t7_model(k0);
+    let s = m.random_state(102, 3, 1).unwrap();
+    IncrementalSimulation::new(m, s, T7_SEED).unwrap()
+}
+
+fn advance(sim: &mut IncrementalSimulation<FeCrRis>, steps: usize) -> Vec<(FeCrRisEvent, u64)> {
+    (0..steps)
+        .map(|_| match sim.step().unwrap() {
+            Step::Fired { event, dt } => (event, dt.to_bits()),
+            Step::Absorbed => panic!("creation keeps the model live"),
+        })
+        .collect()
+}
+
+fn state_bytes(sim: &IncrementalSimulation<FeCrRis>) -> Vec<u8> {
+    let mut out = Vec::new();
+    sim.model().encode_state(sim.state(), &mut out);
+    out
+}
+
+/// A checkpoint at each split point, taken just before and just after Create events too,
+/// resumes to the bytes, time and creation-stream position of an uninterrupted run.
+fn t7_run(k0: f64, total: usize) {
+    let mut reference = t7_fresh(k0);
+    let events = advance(&mut reference, total);
+    let creates: Vec<usize> = (0..total)
+        .filter(|&i| events[i].0 == FeCrRisEvent::Create)
+        .collect();
+    assert!(
+        creates.len() >= 2,
+        "need two Create events, got {creates:?}"
+    );
+    // After `k` steps the next event is index `k`: split k = c is just before Create c, k = c + 1 just after.
+    let mut splits = vec![0, 1, total / 2, total];
+    for &c in &creates[..2] {
+        splits.extend([c, c + 1]);
+    }
+    splits.sort_unstable();
+    splits.dedup();
+    let reference_bytes = state_bytes(&reference);
+    assert!(reference.state().creation_word_pos() > 0);
+    for k in splits {
+        let mut sim = t7_fresh(k0);
+        let mut recorded = advance(&mut sim, k);
+        let bytes = sim.checkpoint();
+        drop(sim);
+        let mut resumed = IncrementalSimulation::resume(t7_model(k0), &bytes).unwrap();
+        recorded.extend(advance(&mut resumed, total - k));
+        assert_eq!(recorded, events, "split {k}");
+        assert_eq!(state_bytes(&resumed), reference_bytes, "split {k}: state");
+        assert_eq!(resumed.time().to_bits(), reference.time().to_bits());
+        assert_eq!(resumed.steps(), reference.steps());
+        assert_eq!(
+            resumed.state().creation_word_pos(),
+            reference.state().creation_word_pos(),
+            "split {k}: word_pos"
+        );
+        assert_eq!(resumed.checkpoint(), reference.checkpoint(), "split {k}");
+    }
+    println!(
+        "T7 {total} steps, Creates at {creates:?}, final word_pos {}",
+        reference.state().creation_word_pos()
+    );
+}
+
+#[test]
+fn t7_bitwise_restart_smoke() {
+    t7_run(SMOKE_K0, 12);
+}
+
+#[test]
+#[ignore = "full tier: restart"]
+fn t7_bitwise_restart() {
+    t7_run(SMOKE_K0, 150);
+}
+
+// ------------------------------------------------------------------ T12
+
+/// A model and a state with two vacancies and two dumbbells far apart: records 0, 2 vacancies, 1, 3 dumbbells.
+fn t12_fixture() -> (FeCrRis, FeCrRisState, Vec<u8>) {
+    let m = ris_model([8, 8, 8], 650.0, 1.0e7, 6, &[0]);
+    let base = m.random_state(102, 3, 1).unwrap();
+    let p = |x, y, z| pos_site(&m, [x, y, z]);
+    let mixed = |site, axis| Defect::Dumbbell {
+        site,
+        axis,
+        plus: Species::Cr,
+        minus: Species::Fe,
+    };
+    let defects = [
+        Defect::Vacancy { site: p(4, 4, 4) },
+        mixed(p(6, 6, 6), 0),
+        Defect::Vacancy { site: p(12, 12, 4) },
+        mixed(p(10, 10, 6), 1),
+    ];
+    let s = m.state_with_defects(occupancy(&base), &defects, 1).unwrap();
+    let mut bytes = Vec::new();
+    m.encode_state(&s, &mut bytes);
+    (m, s, bytes)
+}
+
+/// Byte layout of the encoded fixture state (N = 1024 cells, P = 6 records of 8 bytes).
+struct Layout {
+    n: usize,
+}
+
+impl Layout {
+    fn record(&self, rec: usize) -> usize {
+        self.n + 8 * rec
+    }
+    fn reservoir_len(&self, capacity: usize) -> usize {
+        self.n + 8 * capacity
+    }
+}
+
+fn rejection(m: &FeCrRis, bytes: &[u8]) -> String {
+    match m.decode_state(bytes) {
+        Ok(_) => panic!("corrupted state was accepted"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn t12_round_trip_and_corruption() {
+    // Round trip of an evolved state: re-encoded bytes are equal and the catalog is rebuilt identically.
+    let mut sim = t7_fresh(SMOKE_K0);
+    advance(&mut sim, 30);
+    let bytes = state_bytes(&sim);
+    let decoded = sim.model().decode_state(&bytes).unwrap();
+    let mut again = Vec::new();
+    sim.model().encode_state(&decoded, &mut again);
+    assert_eq!(again, bytes);
+    assert!(decoded.last_changed().is_empty() && decoded.last_records().is_empty());
+    let m = sim.model();
+    for site in 0..m.lattice().site_count() {
+        assert_eq!(decoded.record_at(site), sim.state().record_at(site));
+    }
+    for slot in 0..m.slot_count(&decoded) {
+        assert_eq!(
+            m.slot_rate(&decoded, slot).to_bits(),
+            m.slot_rate(sim.state(), slot).to_bits()
+        );
+    }
+
+    let (m, s, bytes) = t12_fixture();
+    let (n, cap) = (m.lattice().site_count(), 6);
+    let lay = Layout { n };
+    let mut again = Vec::new();
+    m.encode_state(&m.decode_state(&bytes).unwrap(), &mut again);
+    assert_eq!(again, bytes);
+    let rec_site = |rec: usize| site_of(defect_of(s.records()[rec]).unwrap());
+    let corrupt = |f: &dyn Fn(&mut Vec<u8>)| {
+        let mut b = bytes.clone();
+        f(&mut b);
+        rejection(&m, &b)
+    };
+    let set_site = |b: &mut Vec<u8>, rec: usize, site: usize| {
+        let at = lay.record(rec) + 1;
+        b[at..at + 4].copy_from_slice(&(site as u32).to_le_bytes());
+    };
+
+    // Lengths.
+    assert!(corrupt(&|b| b.truncate(bytes.len() - 1)).contains("ends early"));
+    assert!(corrupt(&|b| b.truncate(n - 1)).contains("ends early"));
+    assert!(corrupt(&|b| b.push(0)).contains("trailing"));
+    let len_at = lay.reservoir_len(cap);
+    assert!(
+        corrupt(&|b| b[len_at..len_at + 8].copy_from_slice(&u64::MAX.to_le_bytes()))
+            .contains("reservoir")
+    );
+    // Tags.
+    assert!(corrupt(&|b| b[lay.record(0)] = 3).contains("kind tag"));
+    assert!(corrupt(&|b| b[0] = 4).contains("cell byte"));
+    assert!(corrupt(&|b| b[lay.record(1) + 6] = 2).contains("species byte"));
+    assert!(corrupt(&|b| b[lay.record(1) + 5] = 6).contains("invalid defect"));
+    // Cell/record mismatch: a record whose cell has another content, a swap that keeps the counts,
+    // a stray vacancy cell, a record on a site that holds a plain atom.
+    assert!(corrupt(&|b| b[rec_site(0)] = 0).contains("does not match"));
+    assert!(corrupt(&|b| b.swap(rec_site(0), rec_site(1))).contains("does not match"));
+    let plain = (0..n)
+        .find(|&x| s.record_at(x).is_none() && x != 0)
+        .unwrap();
+    assert!(corrupt(&|b| b[plain] = 2).contains("differ in number"));
+    assert!(corrupt(&|b| set_site(b, 0, plain)).contains("does not match"));
+    // Duplicate site (two vacancies).
+    assert!(corrupt(&|b| set_site(b, 2, rec_site(0))).contains("two records"));
+    // Defect on the sink plane (x = 0): move vacancy 0 there, keeping cells and record consistent.
+    let sink_site = pos_site(&m, [0, 6, 6]);
+    assert!(
+        corrupt(&|b| {
+            b[rec_site(0)] = 0;
+            b[sink_site] = 2;
+            set_site(b, 0, sink_site);
+        })
+        .contains("sink")
+    );
+    // I-V pair within Rc: move vacancy 0 next to dumbbell 1.
+    let near = pos_site(&m, [7, 7, 7]);
+    assert!(
+        corrupt(&|b| {
+            b[rec_site(0)] = 0;
+            b[near] = 2;
+            set_site(b, 0, near);
+        })
+        .contains("recombination radius")
+    );
+    // Creation stream other than 1.
+    let stream_at = bytes.len() - 32;
+    assert!(corrupt(&|b| b[stream_at] = 0).contains("stream"));
 }

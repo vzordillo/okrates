@@ -9,16 +9,16 @@
 //! detailed balance holds to rounding. The barrier is `max(raw, max(0, ΔE))`; the
 //! floor acts on the saddle level shared by the forward and the reverse jump.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::LazyLock;
 
-use okrates_core::{KmcRng, Model};
+use okrates_core::{Checkpointable, IncrementalModel, KmcRng, Model};
 use rand_chacha::ChaCha12Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 
-use crate::bcc::{BccLattice, DISPLACEMENTS, LatticeError};
+use crate::bcc::{BccLattice, DISPLACEMENTS, LatticeError, SECOND_DISPLACEMENTS};
 use crate::fecr::{Energetics, FeCrError, Species};
 use crate::fecr_martinez::Martinez2012;
 use crate::vacancy::BOLTZMANN_EV_PER_K;
@@ -1539,10 +1539,7 @@ impl Model for FeCrRis {
             }
         }
         if self.params.k0_dpa_per_s > 0.0 {
-            emit(
-                FeCrRisEvent::Create,
-                self.params.k0_dpa_per_s * self.lattice.site_count() as f64,
-            );
+            emit(FeCrRisEvent::Create, self.creation_rate());
         }
     }
 
@@ -1561,9 +1558,323 @@ impl Model for FeCrRis {
     }
 }
 
+/// Offsets whose sites can change a record's rates: `({0} ∪ 1NN) ⊕ H ⊕ H ⊕ H`, `H = {0} ∪ 1NN ∪ 2NN`.
+///
+/// A jump end is the record's site or a 1NN of it; three hops then reach the bond, the
+/// bond's local Cr count and the Cr counts of the bonds that change.
+pub(crate) static INFLUENCE_OFFSETS: LazyLock<Vec<[i64; 3]>> = LazyLock::new(|| {
+    let hop: Vec<[i64; 3]> = std::iter::once([0; 3])
+        .chain(DISPLACEMENTS)
+        .chain(SECOND_DISPLACEMENTS)
+        .collect();
+    let mut set: BTreeSet<[i64; 3]> = std::iter::once([0; 3]).chain(DISPLACEMENTS).collect();
+    for _ in 0..3 {
+        set = set
+            .iter()
+            .flat_map(|a| {
+                hop.iter()
+                    .map(move |h| [a[0] + h[0], a[1] + h[1], a[2] + h[2]])
+            })
+            .collect();
+    }
+    set.into_iter().collect()
+});
+
+impl IncrementalModel for FeCrRis {
+    fn slot_count(&self, state: &Self::State) -> usize {
+        8 * state.records.len() + 1
+    }
+
+    fn slot_rate(&self, state: &Self::State, slot: usize) -> f64 {
+        let creation = 8 * state.records.len();
+        if slot < creation {
+            self.rate(state, slot / 8, slot % 8)
+        } else {
+            self.creation_rate()
+        }
+    }
+
+    fn slot_event(&self, state: &Self::State, slot: usize) -> Self::Event {
+        let (rec, j) = (slot / 8, slot % 8);
+        if rec >= state.records.len() {
+            return FeCrRisEvent::Create;
+        }
+        match state.records[rec] {
+            Record::Vacancy { .. } => FeCrRisEvent::VacancyJump { rec, dir: j },
+            _ => FeCrRisEvent::DumbbellJump { rec, jump: j },
+        }
+    }
+
+    fn affected_slots(&self, state: &Self::State, _event: &Self::Event, out: &mut Vec<usize>) {
+        for &c in &state.last_changed {
+            let p = self.lattice.position(c);
+            for o in INFLUENCE_OFFSETS.iter() {
+                let site = self
+                    .lattice
+                    .site_at([p[0] - o[0], p[1] - o[1], p[2] - o[2]])
+                    .expect("influence offsets keep the sublattice parity");
+                if let Some(r) = state.record_at(site) {
+                    out.extend(8 * r..8 * r + 8);
+                }
+            }
+        }
+        for &r in &state.last_records {
+            out.extend(8 * r..8 * r + 8);
+        }
+    }
+}
+
+/// Appends `v` as little-endian bytes of its bit pattern.
+fn put_f64(out: &mut Vec<u8>, v: f64) {
+    out.extend_from_slice(&v.to_bits().to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+/// A cursor over checkpoint bytes that fails instead of panicking.
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if self.0.len() < n {
+            return Err(format!(
+                "state ends early: {n} bytes wanted, {} left",
+                self.0.len()
+            ));
+        }
+        let (head, tail) = self.0.split_at(n);
+        self.0 = tail;
+        Ok(head)
+    }
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Result<u32, String> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, String> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn u128(&mut self) -> Result<u128, String> {
+        Ok(u128::from_le_bytes(self.take(16)?.try_into().unwrap()))
+    }
+}
+
+fn species_byte(sp: Species) -> u8 {
+    sp.index() as u8
+}
+
+fn species_of(byte: u8) -> Result<Species, String> {
+    match byte {
+        0 => Ok(Species::Fe),
+        1 => Ok(Species::Cr),
+        b => Err(format!("species byte {b} is not Fe (0) or Cr (1)")),
+    }
+}
+
+impl Checkpointable for FeCrRis {
+    const MODEL_ID: &'static str = "okrates.fecr_ris";
+
+    fn encode_params(&self, out: &mut Vec<u8>) {
+        let p = &self.params;
+        for c in p.cells {
+            put_u64(out, c as u64);
+        }
+        put_u64(out, p.sink_planes.len() as u64);
+        for &x in &p.sink_planes {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        put_f64(out, p.temperature_k);
+        put_f64(out, p.k0_dpa_per_s);
+        put_u64(out, p.capacity as u64);
+        let d = &p.dumbbell;
+        put_f64(out, d.nu0);
+        put_f64(out, d.ds_mig_kb);
+        for v in d.g {
+            put_f64(out, v);
+        }
+        for v in d.e.iter().flatten().flatten() {
+            put_f64(out, *v);
+        }
+        for v in d.saddle.iter().flatten() {
+            put_f64(out, *v);
+        }
+    }
+
+    fn encode_state(&self, state: &Self::State, out: &mut Vec<u8>) {
+        out.extend(state.cells.iter().map(|c| *c as u8));
+        for r in &state.records {
+            let (kind, site, axis, plus, minus) = match *r {
+                Record::Empty => (0_u8, 0_u32, 0_u8, 0_u8, 0_u8),
+                Record::Vacancy { site } => (1, site as u32, 0, 0, 0),
+                Record::Dumbbell {
+                    site,
+                    axis,
+                    plus,
+                    minus,
+                } => (
+                    2,
+                    site as u32,
+                    axis as u8,
+                    species_byte(plus),
+                    species_byte(minus),
+                ),
+            };
+            out.push(kind);
+            out.extend_from_slice(&site.to_le_bytes());
+            out.extend_from_slice(&[axis, plus, minus]);
+        }
+        put_u64(out, state.reservoir.len() as u64);
+        out.extend(state.reservoir.iter().map(|&sp| species_byte(sp)));
+        put_u64(out, state.borrowed_fe);
+        for v in [
+            state.created,
+            state.recombined,
+            state.absorbed_v,
+            state.absorbed_i,
+            state.creation_attempts,
+            state.floored_dumbbell_jumps,
+            state.floored_vacancy_jumps,
+        ] {
+            put_u64(out, v);
+        }
+        out.extend_from_slice(&state.creation_rng.get_seed());
+        put_u64(out, state.creation_rng.get_stream());
+        out.extend_from_slice(&state.creation_rng.get_word_pos().to_le_bytes());
+        put_u64(out, state.peak_defects);
+    }
+
+    fn decode_state(&self, bytes: &[u8]) -> Result<Self::State, Box<dyn Error + Send + Sync>> {
+        Ok(self.decode(bytes)?)
+    }
+}
+
+impl FeCrRis {
+    /// The creation rate `K0·N` in s⁻¹ (0 when `K0` is 0).
+    fn creation_rate(&self) -> f64 {
+        self.params.k0_dpa_per_s * self.lattice.site_count() as f64
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Result<FeCrRisState, String> {
+        let n = self.lattice.site_count();
+        let p = self.params.capacity;
+        let mut rd = Reader(bytes);
+        let mut cells = Vec::with_capacity(n);
+        for &b in rd.take(n)? {
+            cells.push(match b {
+                0 => Cell::Fe,
+                1 => Cell::Cr,
+                2 => Cell::Vacancy,
+                3 => Cell::Dumbbell,
+                b => return Err(format!("cell byte {b} is not a content tag")),
+            });
+        }
+        let mut records = Vec::with_capacity(p);
+        let mut site_record = vec![NO_RECORD; n];
+        for i in 0..p {
+            let kind = rd.u8()?;
+            let site = rd.u32()? as usize;
+            let (axis, plus, minus) = (rd.u8()?, rd.u8()?, rd.u8()?);
+            let record = match kind {
+                0 => {
+                    if (site, axis, plus, minus) != (0, 0, 0, 0) {
+                        return Err(format!("empty record {i} has non-zero fields"));
+                    }
+                    Record::Empty
+                }
+                1 => {
+                    if (axis, plus, minus) != (0, 0, 0) {
+                        return Err(format!("vacancy record {i} has non-zero fields"));
+                    }
+                    Record::Vacancy { site }
+                }
+                2 => Record::Dumbbell {
+                    site,
+                    axis: axis as usize,
+                    plus: species_of(plus)?,
+                    minus: species_of(minus)?,
+                },
+                k => return Err(format!("record {i} has kind tag {k}")),
+            };
+            if let Record::Vacancy { site } | Record::Dumbbell { site, .. } = record {
+                if site >= n {
+                    return Err(format!("record {i} site {site} is out of range"));
+                }
+                if site_record[site] != NO_RECORD {
+                    return Err(format!("two records on site {site}"));
+                }
+                let expected = match record {
+                    Record::Vacancy { .. } => Cell::Vacancy,
+                    _ => Cell::Dumbbell,
+                };
+                if cells[site] != expected {
+                    return Err(format!("record {i} does not match the cell on site {site}"));
+                }
+                site_record[site] = i as u32;
+            }
+            records.push(record);
+        }
+        let reservoir_len = rd.u64()?;
+        let reservoir_len = usize::try_from(reservoir_len)
+            .ok()
+            .filter(|&l| l <= rd.0.len())
+            .ok_or_else(|| {
+                format!("reservoir length {reservoir_len} exceeds the remaining bytes")
+            })?;
+        let reservoir = rd
+            .take(reservoir_len)?
+            .iter()
+            .map(|&b| species_of(b))
+            .collect::<Result<VecDeque<_>, _>>()?;
+        let borrowed_fe = rd.u64()?;
+        let mut counters = [0_u64; 7];
+        for c in &mut counters {
+            *c = rd.u64()?;
+        }
+        let seed: [u8; 32] = rd.take(32)?.try_into().unwrap();
+        let stream = rd.u64()?;
+        if stream != 1 {
+            return Err(format!("creation stream is {stream}, expected 1"));
+        }
+        let word_pos = rd.u128()?;
+        let peak_defects = rd.u64()?;
+        if !rd.0.is_empty() {
+            return Err(format!("{} trailing bytes after the state", rd.0.len()));
+        }
+        let mut creation_rng = ChaCha12Rng::from_seed(seed);
+        creation_rng.set_stream(stream);
+        creation_rng.set_word_pos(word_pos);
+        if creation_rng.get_word_pos() != word_pos {
+            return Err(format!("word position {word_pos} is out of range"));
+        }
+        let state = FeCrRisState {
+            cells,
+            records,
+            site_record,
+            reservoir,
+            borrowed_fe,
+            created: counters[0],
+            recombined: counters[1],
+            absorbed_v: counters[2],
+            absorbed_i: counters[3],
+            creation_attempts: counters[4],
+            floored_dumbbell_jumps: counters[5],
+            floored_vacancy_jumps: counters[6],
+            creation_rng,
+            peak_defects,
+            last_changed: Vec::new(),
+            last_records: Vec::new(),
+        };
+        self.check_invariants(&state).map_err(|e| e.to_string())?;
+        Ok(state)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RC_OFFSETS, creation_rng, open01};
+    use super::{INFLUENCE_OFFSETS, RC_OFFSETS, creation_rng, open01};
     use okrates_core::KmcRng;
 
     #[test]
@@ -1587,5 +1898,10 @@ mod tests {
     #[test]
     fn rc_offsets_count() {
         assert_eq!(RC_OFFSETS.len(), 50);
+    }
+
+    #[test]
+    fn influence_offsets_count() {
+        assert_eq!(INFLUENCE_OFFSETS.len(), 363);
     }
 }
