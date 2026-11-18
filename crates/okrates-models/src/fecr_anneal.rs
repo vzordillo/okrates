@@ -68,6 +68,8 @@ pub struct Anneal {
 /// Stateful Kawasaki Metropolis annealer preserving RNG and lattice state across sweep chunks.
 #[derive(Clone, Debug)]
 pub struct KawasakiAnnealer {
+    cells: [usize; 3],
+    temperature_bits: u64,
     occupancy: Vec<Species>,
     fe: Vec<usize>,
     cr: Vec<usize>,
@@ -85,6 +87,11 @@ impl KawasakiAnnealer {
         occupancy: Vec<Species>,
         rng: KmcRng,
     ) -> Result<Self, FeCrError> {
+        if !model.energetics().supports_equilibrium_swaps() {
+            return Err(FeCrError::UnsupportedEquilibration(
+                "tabulated barrier sets define local jump rates only, not global swap energies",
+            ));
+        }
         model.state(occupancy.clone())?;
         let mut fe = Vec::new();
         let mut cr = Vec::new();
@@ -98,6 +105,8 @@ impl KawasakiAnnealer {
         let current_energy = model.energetics().total_energy(model.lattice(), &occupancy);
         let initial_sro = warren_cowley_alpha1(model.lattice(), &occupancy);
         Ok(Self {
+            cells: model.lattice().cells(),
+            temperature_bits: model.temperature_k().to_bits(),
             occupancy,
             fe,
             cr,
@@ -115,12 +124,21 @@ impl KawasakiAnnealer {
         model: &FeCrModel<E>,
         sweeps: u64,
     ) -> Result<(), FeCrError> {
-        let expected = model.lattice().site_count();
-        if self.occupancy.len() != expected {
-            return Err(FeCrError::SiteCount {
-                expected,
-                found: self.occupancy.len(),
-            });
+        if !model.energetics().supports_equilibrium_swaps() {
+            return Err(FeCrError::UnsupportedEquilibration(
+                "tabulated barrier sets define local jump rates only, not global swap energies",
+            ));
+        }
+        if model.lattice().cells() != self.cells
+            || model.temperature_k().to_bits() != self.temperature_bits
+        {
+            return Err(FeCrError::AnnealerModelMismatch);
+        }
+        let recomputed = model
+            .energetics()
+            .total_energy(model.lattice(), &self.occupancy);
+        if (recomputed - self.current_energy).abs() > 1e-9 {
+            return Err(FeCrError::AnnealerModelMismatch);
         }
         let lattice = model.lattice();
         let energetics = model.energetics();

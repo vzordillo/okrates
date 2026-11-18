@@ -1,9 +1,45 @@
 //! Deterministic property and hostile-input fuzz invariants for SumTree, CloneRollback, and checkpoints.
 
-use okrates_core::reference::GraphRandomWalk;
+use std::error::Error;
+use std::fmt;
+
+use okrates_core::reference::{GraphRandomWalk, Hop};
 use okrates_core::{
-    CheckpointError, CloneRollback, IncrementalSimulation, KmcRng, Simulation, Step, SumTree,
+    CheckpointError, Checkpointable, CloneRollback, IncrementalSimulation, KmcRng, Model,
+    ReversibleModel, Simulation, Step, SumTree,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PartialMutError;
+
+impl fmt::Display for PartialMutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "simulated failure after partial mutation")
+    }
+}
+
+impl Error for PartialMutError {}
+
+struct PartialMutatingModel;
+
+impl Model for PartialMutatingModel {
+    type State = Vec<u64>;
+    type Event = bool;
+    type Error = PartialMutError;
+
+    fn enumerate_events(&self, _state: &Self::State, emit: &mut dyn FnMut(Self::Event, f64)) {
+        emit(true, 1.0);
+    }
+
+    fn apply(&self, state: &mut Self::State, &succeed: &Self::Event) -> Result<(), Self::Error> {
+        state.push(99);
+        if succeed {
+            Ok(())
+        } else {
+            Err(PartialMutError)
+        }
+    }
+}
 
 #[test]
 fn sum_tree_property_invariants_across_sizes_and_random_mutations() {
@@ -46,15 +82,32 @@ fn sum_tree_property_invariants_across_sizes_and_random_mutations() {
 }
 
 #[test]
-fn clone_rollback_adapter_preserves_direct_simulation_trajectories() {
+fn clone_rollback_adapter_preserves_trajectories_and_restores_on_undo_or_err() {
     let walk = GraphRandomWalk::new(vec![
         vec![(1, 1.5), (2, 0.5)],
         vec![(2, 2.0), (0, 0.7)],
         vec![(0, 1.2)],
     ])
     .unwrap();
-    let mut a = Simulation::new(walk.clone(), 0, 55);
-    let mut b = Simulation::new(CloneRollback(walk), 0, 55);
+    let wrapped = CloneRollback(walk.clone());
+    let mut state = 0_usize;
+    let undo = wrapped
+        .apply_reversible(&mut state, &Hop { from: 0, to: 2 })
+        .unwrap();
+    assert_eq!(state, 2);
+    wrapped.undo(&mut state, undo);
+    assert_eq!(state, 0);
+
+    let fallible = CloneRollback(PartialMutatingModel);
+    let mut buf = vec![1_u64, 2, 3];
+    assert_eq!(
+        fallible.apply_reversible(&mut buf, &false),
+        Err(PartialMutError)
+    );
+    assert_eq!(buf, vec![1, 2, 3]);
+
+    let mut a = Simulation::new(walk, 0, 55);
+    let mut b = Simulation::new(wrapped, 0, 55);
     for _ in 0..100 {
         assert_eq!(a.step().unwrap(), b.step().unwrap());
         assert_eq!(a.state(), b.state());
@@ -82,7 +135,39 @@ fn checkpoint_decoder_never_panics_or_ooms_on_mutated_and_hostile_bytes() {
         assert!(IncrementalSimulation::resume(model.clone(), &valid[..cut]).is_err());
     }
 
-    // Hostile length prefixes (`u64::MAX`) inside section headers must return Truncated without allocating.
+    // Hostile length prefixes (`u32::MAX` / `u64::MAX`) inside section headers must return Truncated without allocating.
+    let mut bad_id_len = valid.clone();
+    bad_id_len[92..96].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(matches!(
+        Simulation::resume(model.clone(), &bad_id_len),
+        Err(CheckpointError::Truncated)
+    ));
+    assert!(matches!(
+        IncrementalSimulation::resume(model.clone(), &bad_id_len),
+        Err(CheckpointError::Truncated)
+    ));
+
+    let params_len_offset = 96 + GraphRandomWalk::MODEL_ID.len();
+    let params_len = usize::try_from(u64::from_le_bytes(
+        valid[params_len_offset..params_len_offset + 8]
+            .try_into()
+            .unwrap(),
+    ))
+    .unwrap();
+    let state_len_offset = params_len_offset + 8 + params_len;
+    for section_offset in [params_len_offset, state_len_offset] {
+        let mut bad_section_len = valid.clone();
+        bad_section_len[section_offset..section_offset + 8]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(
+            Simulation::resume(model.clone(), &bad_section_len),
+            Err(CheckpointError::Truncated)
+        ));
+        assert!(matches!(
+            IncrementalSimulation::resume(model.clone(), &bad_section_len),
+            Err(CheckpointError::Truncated)
+        ));
+    }
     for offset in 0..valid.len().saturating_sub(8) {
         let mut hostile = valid.clone();
         hostile[offset..offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());

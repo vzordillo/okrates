@@ -90,7 +90,18 @@ impl SampleGrid {
         }
         let times = if t_equil == 0.0 {
             (1..=count)
-                .map(|k| k as f64 * t_end / count as f64)
+                .map(|k| {
+                    if k == count {
+                        t_end
+                    } else {
+                        let prod = k as f64 * t_end;
+                        if prod.is_finite() {
+                            prod / count as f64
+                        } else {
+                            (k as f64 / count as f64) * t_end
+                        }
+                    }
+                })
                 .collect()
         } else if count == 1 {
             vec![t_end]
@@ -308,6 +319,9 @@ impl<M: IncrementalModel> TrajectorySource for IncrementalSimulation<M> {
 
 /// Samples a right-continuous CTMC trajectory on `grid`, evaluating `observe` lazily
 /// only on steps whose post-jump time strictly exceeds the next grid target.
+///
+/// Each individual step is atomic on [`SimError`]; mid-trajectory errors (`MaxStepsExceeded`,
+/// `Absorbed`, or a later `Sim`) leave `sim` at the last completed step.
 pub fn sample_trajectory<S, T, F>(
     sim: &mut S,
     grid: &SampleGrid,

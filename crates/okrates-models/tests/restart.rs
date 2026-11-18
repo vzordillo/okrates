@@ -173,7 +173,15 @@ fn checkpoint_rejects_mismatched_params_and_corrupted_state() {
         Err(CheckpointError::InvalidState(_))
     ));
 
-    // Corrupting FeCrState displacement sum is rejected on resume.
+    let mut max_disp = bytes.clone();
+    max_disp[at..at + 8].copy_from_slice(&i64::MAX.to_le_bytes());
+    assert!(matches!(
+        Simulation::resume(vacancy_model(1.0), &max_disp),
+        Err(CheckpointError::InvalidState(_))
+    ));
+
+    // Shifting one entity's z-displacement by one full period (+6) preserves wrapped position
+    // while breaking zero total displacement (`FeCrError::DisplacementSum`).
     let fecr = FeCrModel::new(
         BccLattice::new([3, 3, 3]).unwrap(),
         PairEnergetics::illustrative(),
@@ -183,11 +191,30 @@ fn checkpoint_rejects_mismatched_params_and_corrupted_state() {
     .unwrap();
     let mut fecr_sim = Simulation::new(fecr.clone(), fecr.random_state(11, 7).unwrap(), SEED);
     advance(&mut fecr_sim, 5);
-    let mut fecr_bytes = fecr_sim.checkpoint();
+    let fecr_valid = fecr_sim.checkpoint();
+
+    let mut fecr_bytes = fecr_valid.clone();
     let end = fecr_bytes.len() - 8;
-    fecr_bytes[end..].copy_from_slice(&999_i64.to_le_bytes());
+    let orig_dz = i64::from_le_bytes(fecr_bytes[end..].try_into().unwrap());
+    fecr_bytes[end..].copy_from_slice(&(orig_dz + 6).to_le_bytes());
+    match Simulation::resume(fecr.clone(), &fecr_bytes) {
+        Err(CheckpointError::InvalidState(err)) => {
+            assert!(
+                err.to_string().contains("displacements do not sum to zero"),
+                "got: {err}"
+            );
+        }
+        other => panic!(
+            "expected InvalidState(DisplacementSum), got {}",
+            other.is_ok()
+        ),
+    }
+
+    let mut fecr_extreme = fecr_valid;
+    fecr_extreme[end - 24..end - 16].copy_from_slice(&i64::MAX.to_le_bytes());
+    fecr_extreme[end..].copy_from_slice(&i64::MAX.to_le_bytes());
     assert!(matches!(
-        Simulation::resume(fecr, &fecr_bytes),
+        Simulation::resume(fecr, &fecr_extreme),
         Err(CheckpointError::InvalidState(_))
     ));
 }

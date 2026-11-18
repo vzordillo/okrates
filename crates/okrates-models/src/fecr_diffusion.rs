@@ -181,7 +181,8 @@ pub fn observables(state: &FeCrState, lattice_parameter: f64) -> Observables {
     }
 }
 
-/// Lazily samples [`observables`] on `grid` without evaluating displacements on intermediate jumps.
+/// Lazily samples [`observables`] on `grid` without evaluating displacements on intermediate jumps
+/// (mid-trajectory errors such as `MaxStepsExceeded` leave `sim` at the last completed jump).
 pub fn sample_fecr_run<E: Energetics>(
     sim: &mut Simulation<FeCrModel<E>>,
     grid: &SampleGrid,
@@ -416,7 +417,7 @@ pub struct Summary {
     pub tracer: [(f64, f64); 2],
     pub tracer_all: (f64, f64),
     pub collective: [(f64, f64); 3],
-    /// Unbiased ratio-of-means `n_atoms * mean(D*_all) / mean(D_v)` and delete-1 jackknife SE.
+    /// Consistent ratio-of-means `n_atoms * mean(D*_all) / mean(D_v)` and delete-1 jackknife SE.
     pub f: (f64, f64),
     pub mean_jumps: f64,
     /// Relative drift `(mean_late - mean_early) / |mean_late|` of `D*_all` (`NaN` if `< 4` samples).

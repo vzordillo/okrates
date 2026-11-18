@@ -63,6 +63,8 @@ pub struct PymatgenNebTask {
     pub image_energies_ev: Vec<f64>,
     pub v0_hz: f64,
     pub functional: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_range_k: Option<[f64; 2]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -104,7 +106,7 @@ pub fn import_pymatgen_vasp_json(json: &str) -> Result<BarrierSet, AdapterError>
             attempt_frequency_hz: task.v0_hz,
             reverse_attempt_frequency_hz: None,
             barrier_std_ev: None,
-            temp_range_k: None,
+            temp_range_k: task.temp_range_k,
             provenance: Some(BarrierProvenance {
                 source_code: "VASP (pymatgen/atomate2)".to_string(),
                 functional: task.functional,
@@ -127,6 +129,7 @@ pub fn export_pymatgen_vasp_json(set: &BarrierSet) -> Result<String, AdapterErro
             image_energies_ev: vec![0.0, rec.forward_barrier_ev, rec.delta_energy_ev],
             v0_hz: rec.attempt_frequency_hz,
             functional: rec.provenance.as_ref().and_then(|p| p.functional.clone()),
+            temp_range_k: rec.temp_range_k,
         })
         .collect();
     Ok(serde_json::to_string_pretty(&PymatgenNebCollection {
@@ -147,6 +150,8 @@ pub struct AiidaQePath {
     pub reaction_energy_ev: f64,
     pub attempt_frequency_thz: f64,
     pub barrier_uncertainty_ev: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_range_k: Option<[f64; 2]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -173,7 +178,7 @@ pub fn import_aiida_qe_json(json: &str) -> Result<BarrierSet, AdapterError> {
             attempt_frequency_hz: p.attempt_frequency_thz * 1e12,
             reverse_attempt_frequency_hz: None,
             barrier_std_ev: p.barrier_uncertainty_ev,
-            temp_range_k: None,
+            temp_range_k: p.temp_range_k,
             provenance: Some(BarrierProvenance {
                 source_code: "QuantumESPRESSO (AiiDA)".to_string(),
                 functional: doc.dft_functional.clone(),
@@ -206,6 +211,7 @@ pub fn export_aiida_qe_json(
             reaction_energy_ev: r.delta_energy_ev,
             attempt_frequency_thz: r.attempt_frequency_hz * 1e-12,
             barrier_uncertainty_ev: r.barrier_std_ev,
+            temp_range_k: r.temp_range_k,
         })
         .collect();
     Ok(serde_json::to_string_pretty(&AiidaQeNebExport {

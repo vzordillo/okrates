@@ -324,7 +324,8 @@ impl<M: Model, C: CatalogBackend<M>> Engine<M, C> {
         self.step_observing(|_, _, _| {})
     }
 
-    /// Like [`Engine::step`], invoking `before_apply(&model, &state_before, next_clock)` once `next_clock` is validated.
+    /// Like [`Engine::step`], invoking `before_apply(&model, &state_before, next_clock)` once `dt` is validated
+    /// and before applying the transition (if `apply_and_update` later errors, engine state still rolls back).
     pub fn step_observing<F>(
         &mut self,
         before_apply: F,

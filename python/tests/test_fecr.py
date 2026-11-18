@@ -246,6 +246,27 @@ def test_dft_barrier_adapters_and_tabulated_diffusion():
     assert res.manifest.barrier_set_sha256 == sha
     assert res.manifest.model_id == "okrates.fecr_tabulated"
 
+    with pytest.raises(ValueError, match="equilibration unsupported"):
+        okrates.run_anneal(
+            cells=(3, 3, 3),
+            energetics=table_cfg,
+            cr_count=6,
+            temperature_k=800.0,
+            sweeps=4,
+            seed=19,
+        )
+    with pytest.raises(ValueError, match="equilibration unsupported"):
+        okrates.run_fecr_diffusion(
+            lattice=okrates.LatticeConfig(cells=(3, 3, 3), lattice_parameter_m=2.8665e-10),
+            energetics=table_cfg,
+            cr_count=6,
+            temperature_k=800.0,
+            sampling=okrates.SamplingConfig(t_end=1e-8, sample_count=4),
+            runs=2,
+            seed=19,
+            anneal=okrates.AnnealConfig(sweeps=2),
+        )
+
     qe_payload = json.dumps(
         {
             "workchain_uuid": "00000000-0000-0000-0000-000000000001",

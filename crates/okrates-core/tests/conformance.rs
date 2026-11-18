@@ -157,11 +157,12 @@ fn phase_type_absorbing_escape_times_match_matrix_exponential_cdf() {
     let n = 2_500_usize;
     let escape_times = run_ensemble(4242, n as u64, |ctx| {
         let mut sim = Simulation::with_rng(model.clone(), 0, ctx.rng(StreamRole::Dynamics));
-        loop {
+        for _ in 0..100_000 {
             if sim.step().unwrap() == Step::Absorbed {
                 return sim.time();
             }
         }
+        panic!("absorbing CTMC exceeded 100_000 steps without absorption");
     });
 
     let d = ks_statistic(&escape_times, |t| {
@@ -176,6 +177,10 @@ fn phase_type_absorbing_escape_times_match_matrix_exponential_cdf() {
 
 #[test]
 fn lazy_sampler_evaluates_observer_only_on_grid_crossings_and_handles_policies() {
+    let huge_grid = SampleGrid::from_origin(1e308, 4).unwrap();
+    assert!(huge_grid.times().iter().all(|t| t.is_finite()));
+    assert_eq!(*huge_grid.times().last().unwrap(), 1e308);
+
     let model = GraphRandomWalk::new(vec![vec![(1, 5.0)], vec![(0, 5.0)]]).unwrap();
     let grid = SampleGrid::windowed(2.0, 10.0, 5).unwrap();
 

@@ -8,9 +8,11 @@ use okrates_core::KmcRng;
 use okrates_core::ensemble::run_replicas;
 use okrates_core::testing::chi2_upper_quantile;
 use okrates_models::bcc::BccLattice;
-use okrates_models::fecr::{Energetics, FeCrModel, PairEnergetics, Species};
+use okrates_models::fecr::{Energetics, FeCrError, FeCrModel, PairEnergetics, Species};
 use okrates_models::fecr_anneal::{KawasakiAnnealer, anneal, warren_cowley_alpha1};
 use okrates_models::fecr_martinez::Martinez2012;
+use okrates_models::tabulated::TabulatedEnergetics;
+use okrates_schema::{BarrierRecord, BarrierSet};
 
 const ATTEMPT_FREQUENCY: f64 = 1e13;
 const TEMPERATURE_K: f64 = 800.0;
@@ -28,17 +30,106 @@ fn model(cells: [usize; 3]) -> FeCrModel<PairEnergetics> {
 }
 
 #[test]
-fn chunked_annealer_matches_single_call_bitwise() {
+fn chunked_annealer_matches_single_call_bitwise_and_rejects_mismatched_models() {
     let m = model([4, 4, 4]);
     let init = m.random_state(32, 42).unwrap().occupancy().to_vec();
     let one_shot = anneal(&m, init.clone(), 24, 99).unwrap();
 
-    let mut chunked = KawasakiAnnealer::new(&m, init, KmcRng::from_seed(99)).unwrap();
+    let mut chunked = KawasakiAnnealer::new(&m, init.clone(), KmcRng::from_seed(99)).unwrap();
     for step in [5, 7, 12] {
         chunked.run_sweeps(&m, step).unwrap();
     }
     assert_eq!(chunked.sweeps_completed(), 24);
     assert_eq!(chunked.finish(), one_shot);
+
+    let m_hot = FeCrModel::new(
+        BccLattice::new([4, 4, 4]).unwrap(),
+        PairEnergetics::illustrative(),
+        ATTEMPT_FREQUENCY,
+        950.0,
+    )
+    .unwrap();
+    let mut guard_check = KawasakiAnnealer::new(&m, init, KmcRng::from_seed(5)).unwrap();
+    assert_eq!(
+        guard_check.run_sweeps(&m_hot, 1),
+        Err(FeCrError::AnnealerModelMismatch)
+    );
+}
+
+#[test]
+fn tabulated_energetics_rejects_annealing_malformed_keys_and_inconsistent_prefactors() {
+    let rec = |id: &str, sp: &str, key: &str, ef: f64, er: f64, de: f64| BarrierRecord {
+        id: id.to_string(),
+        migrating_species: sp.to_string(),
+        env_key: key.to_string(),
+        forward_barrier_ev: ef,
+        reverse_barrier_ev: er,
+        delta_energy_ev: de,
+        attempt_frequency_hz: 1e13,
+        reverse_attempt_frequency_hz: None,
+        barrier_std_ev: None,
+        temp_range_k: None,
+        provenance: None,
+    };
+
+    // Valid non-canonical key order (`cr_vac=2,cr_atom=1`) is canonicalized and accepted,
+    // while Kawasaki equilibration is explicitly rejected.
+    let set = BarrierSet::new(
+        "tab",
+        1e-9,
+        vec![
+            rec("fe_star", "Fe", "*", 0.65, 0.65, 0.0),
+            rec("cr_star", "Cr", "*", 0.58, 0.58, 0.0),
+            rec("fe_asym", "Fe", "cr_vac=2,cr_atom=1", 0.67, 0.64, 0.03),
+        ],
+    )
+    .unwrap();
+    let tab = FeCrModel::new(
+        BccLattice::new([3, 3, 3]).unwrap(),
+        TabulatedEnergetics::new(set).unwrap(),
+        ATTEMPT_FREQUENCY,
+        TEMPERATURE_K,
+    )
+    .unwrap();
+    let occ = tab.random_state(8, 12).unwrap().occupancy().to_vec();
+    assert!(matches!(
+        KawasakiAnnealer::new(&tab, occ, KmcRng::from_seed(1)),
+        Err(FeCrError::UnsupportedEquilibration(_))
+    ));
+
+    // Malformed / out-of-range env_key strings are rejected instead of silently shadowed by "*".
+    for bad_key in ["cr=0", "cr_atom=1", "cr_atom=8,cr_vac=0", "cr_saddle=7"] {
+        let bad_set =
+            BarrierSet::new("bad", 1e-6, vec![rec("r", "Fe", bad_key, 0.6, 0.6, 0.0)]).unwrap();
+        assert!(matches!(
+            TabulatedEnergetics::new(bad_set),
+            Err(FeCrError::BarrierTable(_))
+        ));
+    }
+
+    // Duplicate after canonicalization (`cr_atom=1,cr_vac=2` vs `cr_vac=2,cr_atom=1`) is rejected.
+    let dup_set = BarrierSet::new(
+        "dup",
+        1e-6,
+        vec![
+            rec("r1", "Fe", "cr_atom=1,cr_vac=2", 0.67, 0.64, 0.03),
+            rec("r2", "Fe", "cr_vac=2,cr_atom=1", 0.67, 0.64, 0.03),
+        ],
+    )
+    .unwrap();
+    assert!(matches!(
+        TabulatedEnergetics::new(dup_set),
+        Err(FeCrError::BarrierTable(_))
+    ));
+
+    // Symmetric key with distinct reverse_attempt_frequency_hz violates symmetry.
+    let mut bad_sym = rec("sym", "Fe", "*", 0.65, 0.65, 0.0);
+    bad_sym.reverse_attempt_frequency_hz = Some(2e13);
+    let sym_set = BarrierSet::new("sym", 1e-6, vec![bad_sym]).unwrap();
+    assert!(matches!(
+        TabulatedEnergetics::new(sym_set),
+        Err(FeCrError::BarrierTable(_))
+    ));
 }
 
 #[test]

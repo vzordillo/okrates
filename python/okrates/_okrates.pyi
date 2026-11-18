@@ -1,4 +1,6 @@
-from typing import Sequence
+from typing import Sequence, TypeAlias
+
+_Cells3: TypeAlias = tuple[int, int, int]
 
 def jump_rate(
     attempt_frequency: float,
@@ -7,7 +9,7 @@ def jump_rate(
 ) -> float: ...
 def vacancy_trajectory(
     *,
-    cells: Sequence[int],
+    cells: _Cells3,
     jump_rate: float,
     lattice_parameter_m: float,
     seed: int,
@@ -16,7 +18,7 @@ def vacancy_trajectory(
 def fecr_illustrative_energetics() -> tuple[list[list[float]], float, float]: ...
 def run_fecr_transport(
     *,
-    cells: Sequence[int],
+    cells: _Cells3,
     cr_count: int,
     temperature_k: float,
     t_equil: float,
@@ -48,7 +50,7 @@ def run_fecr_transport(
 ]: ...
 def run_kawasaki_anneal(
     *,
-    cells: Sequence[int],
+    cells: _Cells3,
     cr_count: int,
     temperature_k: float,
     sweeps: int,

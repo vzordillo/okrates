@@ -45,6 +45,9 @@ pub trait EnumeratedTopology: TransitionTopology {
 }
 
 /// Topology whose candidate transitions occupy stable integer slots `0..slot_count(state)`.
+///
+/// [`EnumeratedTopology::enumerate_candidates`] must emit the exact events of active slots
+/// (`is_slot_active(state, slot) == true`) so [`CoupledModel`] matches across direct and incremental catalogs.
 pub trait SlottedTopology: EnumeratedTopology {
     fn slot_count(&self, state: &Self::State) -> usize;
 
@@ -54,7 +57,7 @@ pub trait SlottedTopology: EnumeratedTopology {
         true
     }
 
-    /// Appends every slot whose rate or active status may have changed after `event` produced `state`.
+    /// Appends every slot whose `is_slot_active` or [`RateModel::rate`] depends on state modified by `event`.
     fn affected_slots(&self, state: &Self::State, event: &Self::Event, out: &mut Vec<usize>);
 }
 

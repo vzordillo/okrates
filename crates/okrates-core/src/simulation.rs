@@ -109,6 +109,7 @@ impl<M: Model> Simulation<M> {
         self.engine.step()
     }
 
+    /// Fires one step, calling `before_apply(&model, &state_before, next_clock)` before applying the jump.
     pub fn step_observing<F>(
         &mut self,
         before_apply: F,

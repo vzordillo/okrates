@@ -27,6 +27,11 @@ struct ResolvedJump {
     attempt_hz: f64,
 }
 
+/// Rate-table Fe–Cr energetics backed by a validated [`BarrierSet`].
+///
+/// Defines local transition barriers and attempt frequencies rather than a global lattice
+/// Hamiltonian (`total_energy` returns `0.0`, `exchange_delta` returns the matched record's
+/// local `delta_energy_ev`, and [`Energetics::supports_equilibrium_swaps`] is `false`).
 #[derive(Clone, Debug)]
 pub struct TabulatedEnergetics {
     barrier_set: BarrierSet,
@@ -45,6 +50,7 @@ impl TabulatedEnergetics {
             .map_err(|err| FeCrError::BarrierTable(err.to_string()))?;
 
         let mut index = HashMap::with_capacity(barrier_set.records.len());
+        let mut canonical_keys = Vec::with_capacity(barrier_set.records.len());
         let mut uses_saddle_shell = false;
         for (idx, rec) in barrier_set.records.iter().enumerate() {
             let sp = match rec.migrating_species.as_str() {
@@ -57,44 +63,76 @@ impl TabulatedEnergetics {
                     )));
                 }
             };
-            if rec.env_key.contains("cr_saddle=") {
+            let canonical_key = canonicalize_env_key(&rec.env_key).map_err(|reason| {
+                FeCrError::BarrierTable(format!(
+                    "invalid env_key {:?} in record {:?}: {reason}",
+                    rec.env_key, rec.id
+                ))
+            })?;
+            if canonical_key.contains("cr_saddle=") {
                 uses_saddle_shell = true;
             }
-            if is_symmetric_key(&rec.env_key)
-                && rec.delta_energy_ev.abs() > barrier_set.tolerance_ev
-            {
+            if is_symmetric_key(&canonical_key) {
+                if rec.delta_energy_ev.abs() > barrier_set.tolerance_ev {
+                    return Err(FeCrError::BarrierTable(format!(
+                        "symmetric environment key {:?} in record {:?} requires |delta_energy_ev| <= {}, got {}",
+                        rec.env_key, rec.id, barrier_set.tolerance_ev, rec.delta_energy_ev
+                    )));
+                }
+                if let Some(rev_hz) = rec.reverse_attempt_frequency_hz
+                    && (rev_hz - rec.attempt_frequency_hz).abs() > 1e-12 * rec.attempt_frequency_hz
+                {
+                    return Err(FeCrError::BarrierTable(format!(
+                        "symmetric environment key {:?} in record {:?} requires matching forward/reverse attempt frequencies ({} vs {} Hz)",
+                        rec.env_key, rec.id, rec.attempt_frequency_hz, rev_hz
+                    )));
+                }
+            }
+            if index.insert((sp, canonical_key.clone()), idx).is_some() {
                 return Err(FeCrError::BarrierTable(format!(
-                    "symmetric environment key {:?} in record {:?} requires |delta_energy_ev| <= {}, got {}",
-                    rec.env_key, rec.id, barrier_set.tolerance_ev, rec.delta_energy_ev
+                    "duplicate canonical environment key ({}, {canonical_key:?}) in record {:?}",
+                    sp.name(),
+                    rec.id
                 )));
             }
-            index.insert((sp, rec.env_key.clone()), idx);
+            canonical_keys.push((sp, canonical_key));
         }
 
         // Verify cross-record consistency if both forward and reverse asymmetric keys exist.
-        for (idx, rec) in barrier_set.records.iter().enumerate() {
-            if let Some(rev_key) = reverse_env_key(&rec.env_key)
-                && rev_key != rec.env_key
+        for (idx, ((sp, canonical_key), rec)) in
+            canonical_keys.iter().zip(&barrier_set.records).enumerate()
+        {
+            if let Some(rev_key) = reverse_env_key(canonical_key)
+                && rev_key != *canonical_key
+                && let Some(&other_idx) = index.get(&(*sp, rev_key))
+                && other_idx > idx
             {
-                let sp = if rec.migrating_species == "Fe" {
-                    Species::Fe
-                } else {
-                    Species::Cr
-                };
-                if let Some(&other_idx) = index.get(&(sp, rev_key))
-                    && other_idx > idx
+                let other = &barrier_set.records[other_idx];
+                let tol = barrier_set.tolerance_ev;
+                if (rec.forward_barrier_ev - other.reverse_barrier_ev).abs() > tol
+                    || (rec.reverse_barrier_ev - other.forward_barrier_ev).abs() > tol
+                    || (rec.delta_energy_ev + other.delta_energy_ev).abs() > tol
                 {
-                    let other = &barrier_set.records[other_idx];
-                    let tol = barrier_set.tolerance_ev;
-                    if (rec.forward_barrier_ev - other.reverse_barrier_ev).abs() > tol
-                        || (rec.reverse_barrier_ev - other.forward_barrier_ev).abs() > tol
-                        || (rec.delta_energy_ev + other.delta_energy_ev).abs() > tol
-                    {
-                        return Err(FeCrError::BarrierTable(format!(
-                            "complementary records {:?} and {:?} disagree beyond tolerance {tol} eV",
-                            rec.id, other.id
-                        )));
-                    }
+                    return Err(FeCrError::BarrierTable(format!(
+                        "complementary records {:?} and {:?} disagree beyond tolerance {tol} eV",
+                        rec.id, other.id
+                    )));
+                }
+                let rec_rev_hz = rec
+                    .reverse_attempt_frequency_hz
+                    .unwrap_or(rec.attempt_frequency_hz);
+                let other_rev_hz = other
+                    .reverse_attempt_frequency_hz
+                    .unwrap_or(other.attempt_frequency_hz);
+                if (rec.attempt_frequency_hz - other_rev_hz).abs()
+                    > 1e-12 * rec.attempt_frequency_hz
+                    || (rec_rev_hz - other.attempt_frequency_hz).abs()
+                        > 1e-12 * other.attempt_frequency_hz
+                {
+                    return Err(FeCrError::BarrierTable(format!(
+                        "complementary records {:?} and {:?} disagree in attempt frequency",
+                        rec.id, other.id
+                    )));
                 }
             }
         }
@@ -217,11 +255,64 @@ impl TabulatedEnergetics {
     }
 }
 
-fn reverse_env_key(env_key: &str) -> Option<String> {
+fn canonicalize_env_key(env_key: &str) -> Result<String, String> {
+    if env_key == "*" {
+        return Ok("*".to_string());
+    }
+    let mut cs: Option<usize> = None;
+    let mut ca: Option<usize> = None;
+    let mut cv: Option<usize> = None;
+    for part in env_key.split(',') {
+        let Some((k, raw_v)) = part.split_once('=') else {
+            return Err("expected \"*\" or comma-separated key=value clauses".to_string());
+        };
+        let parse_bounded = |limit: usize, label: &str| -> Result<usize, String> {
+            let val = raw_v
+                .parse::<usize>()
+                .map_err(|_| format!("{label} count {raw_v:?} must be a non-negative integer"))?;
+            if val > limit {
+                return Err(format!(
+                    "{label} count {val} exceeds BCC shell maximum {limit}"
+                ));
+            }
+            Ok(val)
+        };
+        match k {
+            "cr_saddle" => {
+                if cs.replace(parse_bounded(6, "cr_saddle")?).is_some() {
+                    return Err("duplicate cr_saddle clause".to_string());
+                }
+            }
+            "cr_atom" => {
+                if ca.replace(parse_bounded(7, "cr_atom")?).is_some() {
+                    return Err("duplicate cr_atom clause".to_string());
+                }
+            }
+            "cr_vac" => {
+                if cv.replace(parse_bounded(7, "cr_vac")?).is_some() {
+                    return Err("duplicate cr_vac clause".to_string());
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unknown clause {other:?}; expected cr_saddle, cr_atom, or cr_vac"
+                ));
+            }
+        }
+    }
+    match (cs, ca, cv) {
+        (Some(s), None, None) => Ok(format!("cr_saddle={s}")),
+        (None, Some(a), Some(v)) => Ok(format!("cr_atom={a},cr_vac={v}")),
+        (Some(s), Some(a), Some(v)) => Ok(format!("cr_saddle={s},cr_atom={a},cr_vac={v}")),
+        _ => Err("cr_atom and cr_vac must be specified together".to_string()),
+    }
+}
+
+fn reverse_env_key(canonical_key: &str) -> Option<String> {
     let mut cs: Option<&str> = None;
     let mut ca: Option<&str> = None;
     let mut cv: Option<&str> = None;
-    for part in env_key.split(',') {
+    for part in canonical_key.split(',') {
         let (k, v) = part.split_once('=')?;
         match k {
             "cr_saddle" => cs = Some(v),
@@ -237,11 +328,13 @@ fn reverse_env_key(env_key: &str) -> Option<String> {
     }
 }
 
-fn is_symmetric_key(env_key: &str) -> bool {
-    if env_key == "*" || (env_key.starts_with("cr_saddle=") && !env_key.contains(',')) {
+fn is_symmetric_key(canonical_key: &str) -> bool {
+    if canonical_key == "*"
+        || (canonical_key.starts_with("cr_saddle=") && !canonical_key.contains(','))
+    {
         return true;
     }
-    reverse_env_key(env_key).is_some_and(|rev| rev == env_key)
+    reverse_env_key(canonical_key).is_some_and(|rev| rev == canonical_key)
 }
 
 impl Energetics for TabulatedEnergetics {
@@ -280,6 +373,10 @@ impl Energetics for TabulatedEnergetics {
     ) -> Option<f64> {
         self.resolve(lattice, occupancy, vacancy_site, atom_site)
             .map(|j| j.attempt_hz)
+    }
+
+    fn supports_equilibrium_swaps(&self) -> bool {
+        false
     }
 
     fn validate(&self, lattice: &BccLattice, temperature_k: f64) -> Result<(), FeCrError> {

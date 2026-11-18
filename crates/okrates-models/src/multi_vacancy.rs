@@ -164,8 +164,12 @@ impl MultiVacancyDiffusion {
         }
         for v in 0..n {
             let origin = self.lattice.position(state.origins[v]);
-            let unwrapped = std::array::from_fn(|axis| origin[axis] + state.displacements[v][axis]);
-            if self.lattice.site_at(unwrapped) != Some(state.sites[v]) {
+            let wrapped = std::array::from_fn(|axis| {
+                let period = 2 * self.lattice.cells()[axis] as i128;
+                (origin[axis] as i128 + state.displacements[v][axis] as i128).rem_euclid(period)
+                    as i64
+            });
+            if self.lattice.site_at(wrapped) != Some(state.sites[v]) {
                 return Err(MultiVacancyError::UnwrappedMismatch { vacancy: v });
             }
         }

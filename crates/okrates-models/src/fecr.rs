@@ -100,6 +100,11 @@ pub trait Energetics {
         self.attempt_frequency(occupancy[atom_site])
     }
 
+    /// Whether `total_energy` and `swap_delta` define a conservative Hamiltonian for Kawasaki swaps.
+    fn supports_equilibrium_swaps(&self) -> bool {
+        true
+    }
+
     fn validate(&self, lattice: &BccLattice, temperature_k: f64) -> Result<(), FeCrError> {
         let _ = (lattice, temperature_k);
         Ok(())
@@ -481,16 +486,16 @@ impl<E: Energetics> FeCrModel<E> {
                 });
             }
         }
-        let mut total = [0_i64; 3];
+        let mut total = [0_i128; 3];
         for d in &state.disp {
             for axis in 0..3 {
-                total[axis] += d[axis];
+                total[axis] += d[axis] as i128;
             }
         }
         if total != [0; 3] {
             return Err(FeCrError::DisplacementSum);
         }
-        let period: [i64; 3] = std::array::from_fn(|axis| 2 * self.lattice.cells()[axis] as i64);
+        let period: [i128; 3] = std::array::from_fn(|axis| 2 * self.lattice.cells()[axis] as i128);
         let mut seen_entities = vec![false; expected];
         for site in 0..expected {
             let entity = state.atom_at[site];
@@ -501,8 +506,11 @@ impl<E: Energetics> FeCrModel<E> {
             let here = self.lattice.position(site);
             let start = self.lattice.position(state.origin[entity]);
             let d = state.disp[entity];
-            if (0..3).any(|axis| (here[axis] - start[axis] - d[axis]).rem_euclid(period[axis]) != 0)
-            {
+            if (0..3).any(|axis| {
+                (here[axis] as i128 - start[axis] as i128 - d[axis] as i128)
+                    .rem_euclid(period[axis])
+                    != 0
+            }) {
                 return Err(FeCrError::UnwrappedMismatch { site });
             }
         }
@@ -708,6 +716,8 @@ pub enum FeCrError {
     LatticeTooSmall { min_cells: usize },
     TemperatureMismatch { model: f64, energetics: f64 },
     BarrierTable(String),
+    UnsupportedEquilibration(&'static str),
+    AnnealerModelMismatch,
 }
 
 impl fmt::Display for FeCrError {
@@ -748,6 +758,13 @@ impl fmt::Display for FeCrError {
                 "model temperature {model} K differs from energetics temperature {energetics} K"
             ),
             Self::BarrierTable(msg) => write!(f, "invalid barrier table: {msg}"),
+            Self::UnsupportedEquilibration(msg) => write!(f, "equilibration unsupported: {msg}"),
+            Self::AnnealerModelMismatch => {
+                write!(
+                    f,
+                    "annealer model differs from model used at initialization"
+                )
+            }
         }
     }
 }

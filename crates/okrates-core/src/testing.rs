@@ -159,6 +159,10 @@ pub fn solve_stationary_ctmc(rates: &[Vec<f64>]) -> Vec<f64> {
     }
     a[n - 1][n] = 1.0;
 
+    let scale = rates
+        .iter()
+        .flatten()
+        .fold(1.0_f64, |acc, &v| acc.max(v.abs()));
     for col in 0..n {
         let mut pivot = col;
         for row in (col + 1)..n {
@@ -168,7 +172,7 @@ pub fn solve_stationary_ctmc(rates: &[Vec<f64>]) -> Vec<f64> {
         }
         a.swap(col, pivot);
         let diag = a[col][col];
-        assert!(diag.abs() > 1e-15, "singular CTMC generator");
+        assert!(diag.abs() > 1e-13 * scale, "singular CTMC generator");
         for val in &mut a[col][col..=n] {
             *val /= diag;
         }
@@ -199,19 +203,20 @@ fn mat_mul(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
     out
 }
 
-/// Matrix exponential `exp(m)` via scaling-and-squaring with an 18-term Taylor series.
+/// Matrix exponential `exp(m)` via scaling-and-squaring with a 20-term Taylor series.
 pub fn mat_exp(m: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let n = m.len();
     let norm = m
         .iter()
         .map(|row| row.iter().map(|v| v.abs()).sum::<f64>())
         .fold(0.0_f64, f64::max);
+    assert!(norm.is_finite(), "mat_exp requires finite matrix entries");
     let scale_exp = if norm > 0.5 {
-        (norm * 2.0).log2().ceil().max(0.0) as u32
+        (norm.log2() + 1.0).ceil().clamp(0.0, 1022.0) as u32
     } else {
         0
     };
-    let scale = 2.0_f64.powi(-(scale_exp as i32));
+    let scale = 0.5_f64.powi(scale_exp as i32);
     let scaled: Vec<Vec<f64>> = m
         .iter()
         .map(|row| row.iter().map(|&v| v * scale).collect())

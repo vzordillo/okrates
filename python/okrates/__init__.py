@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TypeAlias, TypedDict
 
 import numpy as np
 import numpy.typing as npt
@@ -13,6 +13,13 @@ from okrates import _okrates
 
 FitMethodName: TypeAlias = Literal["windowed_ols", "origin_slope"]
 BarrierPolicyName: TypeAlias = Literal["symmetric_floor", "unfloored", "strict"]
+
+
+class IllustrativeEnergeticsDict(TypedDict):
+    """Typed return structure of :func:`fecr_illustrative_energetics`."""
+
+    pair_energies_ev: npt.NDArray[np.float64]
+    kra_ev: tuple[float, float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +214,49 @@ def _symmetric_2x2(v: list[float]) -> npt.NDArray[np.float64]:
     return np.array([[v[0], v[1]], [v[1], v[2]]], dtype=np.float64)
 
 
+def _decode_diffusion_result(
+    raw: tuple[
+        list[float],
+        list[float],
+        list[float],
+        float,
+        float,
+        int,
+        float | None,
+        str,
+    ],
+) -> DiffusionResult:
+    (
+        scalars,
+        lam,
+        lam_se,
+        mean_jumps,
+        window_drift_ratio,
+        floor_activations,
+        mean_final_sro,
+        manifest_json,
+    ) = raw
+    return DiffusionResult(
+        D_v=scalars[0],
+        D_v_se=scalars[1],
+        D_Fe=scalars[2],
+        D_Fe_se=scalars[3],
+        D_Cr=scalars[4],
+        D_Cr_se=scalars[5],
+        D_all=scalars[6],
+        D_all_se=scalars[7],
+        f=scalars[8],
+        f_se=scalars[9],
+        Lambda=_symmetric_2x2(lam),
+        Lambda_se=_symmetric_2x2(lam_se),
+        mean_jumps=mean_jumps,
+        window_drift_ratio=window_drift_ratio,
+        barrier_floor_activations=floor_activations,
+        mean_final_sro_alpha1=mean_final_sro,
+        manifest=RunManifest.from_json(manifest_json),
+    )
+
+
 def jump_rate(
     attempt_frequency: float,
     migration_energy_ev: float,
@@ -235,7 +285,7 @@ def vacancy_trajectory(
     return np.array(times, dtype=np.float64), np.array(squared, dtype=np.float64)
 
 
-def fecr_illustrative_energetics() -> dict[str, object]:
+def fecr_illustrative_energetics() -> IllustrativeEnergeticsDict:
     """Return round illustrative Fe–Cr pair energies (3x3 eV array) and `(kra_fe, kra_cr)` in eV."""
     pair, kra_fe, kra_cr = _okrates.fecr_illustrative_energetics()
     return {
@@ -257,16 +307,7 @@ def run_fecr_diffusion(
 ) -> DiffusionResult:
     """Run an ensemble Fe–Cr diffusion calculation (`ValueError` on invalid config, `RuntimeError` on dynamics failure)."""
     kwargs = _unpack_energetics(energetics)
-    (
-        scalars,
-        lam,
-        lam_se,
-        mean_jumps,
-        window_drift_ratio,
-        floor_activations,
-        mean_final_sro,
-        manifest_json,
-    ) = _okrates.run_fecr_transport(
+    raw = _okrates.run_fecr_transport(
         cells=lattice.cells,
         cr_count=cr_count,
         temperature_k=temperature_k,
@@ -281,25 +322,7 @@ def run_fecr_diffusion(
         anneal_sweeps=anneal.sweeps,
         **kwargs,
     )
-    return DiffusionResult(
-        D_v=scalars[0],
-        D_v_se=scalars[1],
-        D_Fe=scalars[2],
-        D_Fe_se=scalars[3],
-        D_Cr=scalars[4],
-        D_Cr_se=scalars[5],
-        D_all=scalars[6],
-        D_all_se=scalars[7],
-        f=scalars[8],
-        f_se=scalars[9],
-        Lambda=_symmetric_2x2(lam),
-        Lambda_se=_symmetric_2x2(lam_se),
-        mean_jumps=mean_jumps,
-        window_drift_ratio=window_drift_ratio,
-        barrier_floor_activations=floor_activations,
-        mean_final_sro_alpha1=mean_final_sro,
-        manifest=RunManifest.from_json(manifest_json),
-    )
+    return _decode_diffusion_result(raw)
 
 
 def run_anneal(
@@ -402,16 +425,7 @@ def fecr_diffusion(
         if pair_energies_ev is not None
         else None
     )
-    (
-        scalars,
-        lam,
-        lam_se,
-        mean_jumps,
-        window_drift_ratio,
-        floor_activations,
-        mean_final_sro,
-        manifest_json,
-    ) = _okrates.run_fecr_transport(
+    raw = _okrates.run_fecr_transport(
         cells=cells,
         cr_count=cr_count,
         temperature_k=temperature_k,
@@ -429,26 +443,7 @@ def fecr_diffusion(
         pair_energies_ev=pair,
         kra_ev=kra_ev,
     )
-    res = DiffusionResult(
-        D_v=scalars[0],
-        D_v_se=scalars[1],
-        D_Fe=scalars[2],
-        D_Fe_se=scalars[3],
-        D_Cr=scalars[4],
-        D_Cr_se=scalars[5],
-        D_all=scalars[6],
-        D_all_se=scalars[7],
-        f=scalars[8],
-        f_se=scalars[9],
-        Lambda=_symmetric_2x2(lam),
-        Lambda_se=_symmetric_2x2(lam_se),
-        mean_jumps=mean_jumps,
-        window_drift_ratio=window_drift_ratio,
-        barrier_floor_activations=floor_activations,
-        mean_final_sro_alpha1=mean_final_sro,
-        manifest=RunManifest.from_json(manifest_json),
-    )
-    return res.to_dict()
+    return _decode_diffusion_result(raw).to_dict()
 
 
 __all__ = [
@@ -459,6 +454,7 @@ __all__ = [
     "DiffusionResult",
     "EnergeticsConfig",
     "FitMethodName",
+    "IllustrativeEnergeticsDict",
     "LatticeConfig",
     "Martinez2012Config",
     "PairEnergeticsConfig",

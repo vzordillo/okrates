@@ -197,8 +197,11 @@ impl VacancyDiffusion {
         }
 
         let origin = self.lattice.position(state.origin);
-        let unwrapped = std::array::from_fn(|axis| origin[axis] + state.displacement[axis]);
-        if self.lattice.site_at(unwrapped) != Some(state.vacancy) {
+        let wrapped = std::array::from_fn(|axis| {
+            let period = 2 * self.lattice.cells()[axis] as i128;
+            (origin[axis] as i128 + state.displacement[axis] as i128).rem_euclid(period) as i64
+        });
+        if self.lattice.site_at(wrapped) != Some(state.vacancy) {
             return Err(InvariantViolation::UnwrappedMismatch);
         }
         Ok(())

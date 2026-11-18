@@ -19,8 +19,8 @@ pub struct BarrierProvenance {
 
 /// Elementary transition barrier record with forward/reverse consistency and optional UQ (`barrier_std_ev`).
 ///
-/// Sign convention: `delta_energy_ev = E_final - E_initial`, so microscopic reversibility
-/// requires `(forward_barrier_ev - reverse_barrier_ev) == delta_energy_ev`.
+/// Sign convention: `delta_energy_ev = E_final - E_initial`, so energy-level detailed balance
+/// checks `(forward_barrier_ev - reverse_barrier_ev) == delta_energy_ev` (equal forward/reverse prefactors).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BarrierRecord {
     pub id: String,
@@ -40,6 +40,7 @@ pub struct BarrierRecord {
 pub enum BarrierValidationError {
     UnsupportedSchema(u32),
     InvalidTolerance(f64),
+    InvalidTemperature(f64),
     EmptyBarrierSet,
     DuplicateEnvironment {
         species: String,
@@ -91,6 +92,9 @@ impl fmt::Display for BarrierValidationError {
                 "unsupported barrier schema version {v}, expected {BARRIER_SCHEMA_VERSION}"
             ),
             Self::InvalidTolerance(tol) => write!(f, "invalid tolerance {tol} eV"),
+            Self::InvalidTemperature(t) => {
+                write!(f, "temperature must be finite and positive, got {t} K")
+            }
             Self::EmptyBarrierSet => write!(f, "barrier set must contain at least one record"),
             Self::DuplicateEnvironment { species, env_key } => {
                 write!(
@@ -271,6 +275,9 @@ impl BarrierSet {
         &self,
         temperature_k: f64,
     ) -> Result<(), BarrierValidationError> {
+        if !temperature_k.is_finite() || temperature_k <= 0.0 {
+            return Err(BarrierValidationError::InvalidTemperature(temperature_k));
+        }
         self.validate()?;
         for rec in &self.records {
             if let Some([min_k, max_k]) = rec.temp_range_k

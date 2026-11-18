@@ -6,9 +6,9 @@
 
 | Tier | Identifier | Guarantee | Scope & Requirements |
 | --- | --- | --- | --- |
-| **Bitwise** | `bitwise_same_crate_same_fp` | Identical event sequence, residence times, and final floating-point bits (`u64::to_bits`) | Fixed crate version, IEEE-754 binary64 arithmetic without FMA contraction (`rustc` default), identical `CatalogBackend` (`direct` or `sum_tree`), identical `seed` and `StreamRole`, and Checkpoint v2 resume |
-| **Algorithmic** | `algorithmic_cross_backend` | Identical Markov jump chain in distribution; equivalent physical observables within Monte Carlo sampling error | Switching between `DirectCatalog` ($O(M)$) and `SumTreeCatalog` ($O(k \log M)$), or altering Rayon thread counts across independent `run_ensemble` replicas |
-| **Statistical** | `statistical_ensemble` | Unbiased convergence to analytical/thermodynamic reference values within $z$-score gates | Ensemble transport estimators (`WindowedOls`, delete-1 jackknife correlation factor $f$), Boltzmann occupancy distributions, and Kawasaki canonical equilibration |
+| **Bitwise** | `bitwise_same_crate_same_fp` | Identical event sequence, residence times, and final floating-point bits (`u64::to_bits`) | Fixed crate version, matching target architecture, Rust toolchain, and platform `libm` (`f64::ln` / `f64::exp`), IEEE-754 binary64 arithmetic without FMA contraction (`rustc` default), identical `CatalogBackend` (`direct` or `sum_tree`), identical `seed` and `StreamRole`, and Checkpoint v2 resume |
+| **Algorithmic** | `algorithmic_cross_backend` | Identical Markov jump chain in distribution; equivalent physical observables within Monte Carlo sampling error | Switching between `DirectCatalog` ($O(M)$) and `SumTreeCatalog` ($O(k \log M)$), cross-platform `libm` builds, or altering Rayon thread counts across independent `run_ensemble` replicas |
+| **Statistical** | `statistical_ensemble` | Consistent convergence to analytical/thermodynamic reference values within $z$-score gates | Ensemble transport estimators (`WindowedOls`, ratio-of-means + delete-1 jackknife correlation factor $f$), Boltzmann occupancy distributions, and Kawasaki canonical equilibration |
 
 ## 2. Deterministic RNG Substreams
 
@@ -24,7 +24,7 @@ Because `replica_id` and `StreamRole` map to orthogonal `ChaCha12` streams rathe
 ## 3. Clock & Checkpoint v2
 
 - **Compensated Clock**: `Clock` accumulates residence times using error-free Knuth TwoSum (`time + compensation`), preventing deep-run $\Delta t \ll t$ mantissa truncation, and returns `ClockError::Stagnation` if `time` fails to advance at finite `dt`.
-- **Checkpoint Schema v2**: Binary checkpoints (`OKRATES\0`, `SCHEMA_VERSION = 2`) persist model `MODEL_ID`, encoded model parameters, `steps`, `time`, TwoSum `compensation` bits, serialized `ChaCha12` RNG word index/seed, and model state. Resuming from a v2 checkpoint reproduces the uninterrupted trajectory bit-for-bit.
+- **Checkpoint Schema v2**: Binary checkpoints (`OKRATES\0`, `SCHEMA_VERSION = 2`) persist model `MODEL_ID`, encoded model parameters, `steps`, `time`, TwoSum `compensation` bits, serialized `ChaCha12` RNG word index/seed, and model state. On the same target/toolchain/`libm` environment, resuming from a v2 checkpoint reproduces the uninterrupted trajectory bit-for-bit.
 
 ## 4. Provenance Manifests (`okrates-schema`)
 
