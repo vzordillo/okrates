@@ -167,6 +167,70 @@ fn fecr_observables_bad_args() {
     );
 }
 
+/// Removes every `us_per_step=<value>` field: it is a wall-clock time and not deterministic.
+/// Applied to both the output and the expected file.
+fn without_wall_time(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let Some(start) = line.find("us_per_step=") else {
+                return line.to_string();
+            };
+            let value = &line[start + "us_per_step=".len()..];
+            let end = value
+                .find(' ')
+                .map_or(line.len(), |n| line.len() - value.len() + n);
+            format!("{}{}", &line[..start], &line[end..])
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// About 0.05 s in debug.
+#[test]
+fn fecr_ris_pilot_small() {
+    let (code, stdout, stderr) = run(example("fecr_ris_pilot").args([
+        "--cells",
+        "6",
+        "6",
+        "6",
+        "--temperature",
+        "773",
+        "--k0",
+        "1e-3",
+        "--dpa-end",
+        "0.3",
+        "--capacity",
+        "64",
+        "--seed",
+        "7",
+        "--report-every-steps",
+        "200",
+    ]));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("us_per_step="));
+    assert_eq!(
+        without_wall_time(&stdout),
+        without_wall_time(include_str!("data/fecr_ris_pilot_small.txt"))
+    );
+}
+
+#[test]
+fn fecr_ris_pilot_bad_args() {
+    assert_usage_error(
+        example("fecr_ris_pilot").args([
+            "--temperature",
+            "773",
+            "--k0",
+            "1e-3",
+            "--dpa-end",
+            "0.3",
+            "--capacity",
+            "64",
+        ]),
+        "usage: fecr_ris_pilot --temperature K --k0 dpa_per_s --dpa-end x --capacity P --seed s [--cells nx ny nz] [--report-every-steps n]",
+    );
+}
+
 /// About 3.5 s in debug.
 #[test]
 #[ignore = "full tier: e2e"]
