@@ -833,6 +833,11 @@ impl FeCrRis {
         let b = probe.defining_barriers()?;
         probe.saddle[0][1] -= b[2] - target[2];
         probe.saddle[1][1] -= b[3] - target[3];
+        if !probe.saddle.iter().flatten().all(|v| v.is_finite()) {
+            return Err(FeCrRisError::Parameter(
+                "the refitted dumbbell saddle interactions are not finite",
+            ));
+        }
         Ok(probe.saddle)
     }
 

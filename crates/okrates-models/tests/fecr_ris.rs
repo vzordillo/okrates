@@ -1652,3 +1652,25 @@ fn pilot_placement_uses_its_own_stream() {
     let on_engine_stream = occupancy(&m.random_state(cr, seed, seed).unwrap());
     assert_ne!(first, on_engine_stream);
 }
+
+/// A saddle table so large that the refit overflows is rejected instead of building a
+/// model with non-finite saddle interactions (PR #9).
+#[test]
+fn non_finite_saddle_refit_is_rejected() {
+    let mut dumbbell = DumbbellParams::senninger2016_r1();
+    dumbbell.saddle = [[f64::MAX; 2]; 2];
+    let result = FeCrRis::new(FeCrRisParams {
+        cells: [6, 6, 6],
+        sink_planes: vec![],
+        temperature_k: 773.0,
+        k0_dpa_per_s: 0.0,
+        capacity: 4,
+        dumbbell,
+    });
+    assert_eq!(
+        result.err(),
+        Some(FeCrRisError::Parameter(
+            "the refitted dumbbell saddle interactions are not finite"
+        ))
+    );
+}
