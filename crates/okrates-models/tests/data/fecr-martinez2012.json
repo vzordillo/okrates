@@ -1,5 +1,5 @@
 {
-  "source": "E. Martinez, O. Senninger, C.-C. Fu, F. Soisson, Phys. Rev. B 86, 224109 (2012), DOI 10.1103/PhysRevB.86.224109. Local PDF papers/PhysRevB.86.224109.pdf. Omega(x) from M. Levesque et al., arXiv:1307.7561v1 (29 Jul 2013; no journal reference printed in the PDF).",
+  "source": "E. Martinez, O. Senninger, C.-C. Fu, F. Soisson, Phys. Rev. B 86, 224109 (2012), DOI 10.1103/PhysRevB.86.224109. Local PDF papers/Martinez_2012_Decomposition_kinetics_of_Fe-Cr_solid_solutions_during_thermal_aging.pdf. Omega(x) from M. Levesque et al., arXiv:1307.7561v1 (29 Jul 2013; no journal reference printed in the PDF).",
   "extraction": "Table I read from a 150-dpi render of p.4 (pdftotext garbles it); Table II from p.6. Second independent transcription (Sonnet pass, scratchpad check/second_extraction.json) matched every value; see fecr-dft-sources.md section 0.",
   "units": "energies eV, entropies k_B, temperatures K, frequencies s^-1",
   "coordination": {"z1": 8, "z2": 6, "loc": "p.3, after Eq. (7)"},
