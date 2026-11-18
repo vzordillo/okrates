@@ -58,6 +58,7 @@ name = "okrates-models"
 version = "0.0.1"
 dependencies = [
  "okrates-core",
+ "rand_chacha",
 ]
 
 [[package]]
