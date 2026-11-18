@@ -1,3 +1,3 @@
 box=[6, 6, 6] sites=432 cr=43 T=773 K0=1e-3 dpa_end=3e-1 P=64 seed=7
-progress steps=200 t=2.257604e2 dose=2.257604e-1 V=1 I=1 V_peak=1 I_peak=1 V_mean=0.0000 I_mean=0.0000 created=98 recombined=96 absorbed_V=1 absorbed_I=1 borrowed_fe=0 creation_attempts=1356 floored_dumbbell=9 floored_vacancy=72 us_per_step=171.01
-final steps=284 t=3.005251e2 dose=3.005251e-1 V=1 I=1 V_peak=1 I_peak=1 V_mean=0.0000 I_mean=0.0000 created=140 recombined=138 absorbed_V=1 absorbed_I=1 borrowed_fe=0 creation_attempts=1952 floored_dumbbell=10 floored_vacancy=108 us_per_step=164.89
+progress steps=200 t=2.208307e2 dose=2.208307e-1 V=0 I=0 V_peak=1 I_peak=1 V_mean=0.0000 I_mean=0.0000 created=99 recombined=99 absorbed_V=0 absorbed_I=0 borrowed_fe=0 creation_attempts=1371 floored_dumbbell=1 floored_vacancy=77 us_per_step=219.29
+final steps=277 t=3.022899e2 dose=3.022899e-1 V=1 I=1 V_peak=1 I_peak=1 V_mean=0.0000 I_mean=0.0000 created=138 recombined=137 absorbed_V=0 absorbed_I=0 borrowed_fe=0 creation_attempts=1920 floored_dumbbell=1 floored_vacancy=108 us_per_step=201.73

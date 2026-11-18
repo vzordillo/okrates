@@ -1572,3 +1572,33 @@ fn t12_round_trip_and_corruption() {
     let stream_at = bytes.len() - 32;
     assert!(corrupt(&|b| b[stream_at] = 0).contains("stream"));
 }
+
+/// The pilot example's placement code, compiled into this test crate.
+#[allow(dead_code)]
+#[path = "../examples/fecr_ris_pilot.rs"]
+mod pilot;
+
+/// The pilot places Cr on stream 2, not on the engine's stream 0, so its first draw is not
+/// the engine's first uniform, and the same seed still gives the same placement.
+#[test]
+fn pilot_placement_uses_its_own_stream() {
+    use okrates_core::KmcRng;
+    use rand_chacha::rand_core::Rng;
+
+    let seed = 7;
+    let engine_u = KmcRng::from_seed(seed).open01();
+    let placement_bits = pilot::placement_rng(seed).next_u64();
+    let placement_u = ((placement_bits >> 12) as f64 + 0.5) * f64::EPSILON;
+    assert_ne!(placement_u, engine_u);
+
+    let (sites, cr) = (432, 43);
+    let first = pilot::place_cr(sites, cr, &mut pilot::placement_rng(seed));
+    let again = pilot::place_cr(sites, cr, &mut pilot::placement_rng(seed));
+    assert_eq!(first, again);
+    assert_eq!(first.iter().filter(|&&s| s == Species::Cr).count(), cr);
+
+    // Placement on the engine's stream (what `random_state` does) gives another layout.
+    let m = model([6, 6, 6], 773.0, 64);
+    let on_engine_stream = occupancy(&m.random_state(cr, seed, seed).unwrap());
+    assert_ne!(first, on_engine_stream);
+}
