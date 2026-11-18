@@ -12,7 +12,7 @@
 ## Workspace Crates
 
 - **`okrates-core`** — Geometry-agnostic 3-seam kMC engine (`TransitionTopology`, `RateModel`, `CatalogBackend`: $O(M)$ `DirectCatalog` and $O(k \log M)$ `SumTreeCatalog`), error-free TwoSum `Clock`, lazy piecewise-constant `sample_trajectory`, `ChaCha12` `StreamRole` substreams (`run_ensemble`), and Checkpoint v2.
-- **`okrates-schema`** — `RunManifest` v1 (SHA-256 parameter, barrier, and checkpoint lineage), `BarrierSet` forward/reverse detailed-balance validator, and JSON adapters for `pymatgen`/`atomate2` (VASP NEB) and `AiiDA-QuantumESPRESSO`.
+- **`okrates-schema`** — `RunManifest` v1 (SHA-256 parameter, barrier, and checkpoint lineage), `BarrierSet` forward/reverse detailed-balance validator, and JSON adapters that read and write an okrates-defined layout for barrier data exported from pymatgen/atomate2 (VASP NEB) and AiiDA-QuantumESPRESSO.
 - **`okrates-models`** — BCC single- and multi-vacancy diffusion, Fe–Cr vacancy-mediated transport (`PairEnergetics`, Martínez et al. 2012 `Martinez2012` with `BarrierFloorPolicy`, and DFT `TabulatedEnergetics`), stateful `KawasakiAnnealer` with Warren–Cowley 1NN SRO $\alpha_1$, windowed OLS transport estimators, and delete-1 jackknife correlation factor $f$.
 - **`okrates-python`** — PyO3 extension backing `okrates` (`LatticeConfig`, `Martinez2012Config`, `BarrierTableConfig`, `SamplingConfig`, `DiffusionResult`, `AnnealResult`, `RunManifest`).
 
