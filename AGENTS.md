@@ -25,3 +25,8 @@
 5. **Python & PyO3 bindings**
    - Put user-facing docstrings only in `python/okrates/` (concise 1–3 lines); keep `crates/okrates-python` `#[pyfunction]` items free of duplicated prose.
    - Encode shapes, defaults, and return schemas in Python type annotations (`dataclass(frozen=True)`, `.pyi` stubs, `NDArray[np.float64]`) rather than prose lists of dict keys or standard `ValueError`/`OverflowError` boilerplate.
+
+## Commit & Pull Request Attribution
+
+- Append `Co-authored-by: Gemini Antigravity <noreply@google.com>` as a commit trailer on agent-authored commits.
+- Append `🤖 Generated with [Gemini Antigravity](https://antigravity.google) (Antigravity for Science)` as a footer on agent-created pull request descriptions.
