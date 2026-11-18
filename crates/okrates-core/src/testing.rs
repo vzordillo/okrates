@@ -502,7 +502,7 @@ pub fn mat_exp(m: &[Vec<f64>]) -> Vec<Vec<f64>> {
                     off = off.add(Dd::from_f64(v * pre));
                 }
             }
-            nonneg && off.add(Dd::from_f64(row[i] * pre)).to_f64().abs() <= f64::EPSILON * off.0
+            nonneg && off.add(Dd::from_f64(row[i] * pre)).to_f64() == 0.0
         }
     });
     let scaled: Vec<Vec<Dd>> = m

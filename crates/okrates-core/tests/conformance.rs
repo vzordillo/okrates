@@ -647,6 +647,18 @@ fn ctmc_solvers_and_statistics_handle_extreme_scales_and_stiff_generators() {
         }
     }
 
+    // Rows sum to exactly -4 (not zero) although |sum| <= EPSILON * off: not a zero-sum generator.
+    let r54 = (1_u64 << 54) as f64;
+    let near_zero_sum = mat_exp(&[vec![-(r54 + 4.0), r54], vec![r54, -(r54 + 4.0)]]);
+    let expected = (-4.0_f64).exp();
+    for row in &near_zero_sum {
+        let sum: f64 = row.iter().sum();
+        assert!(
+            ((sum - expected) / expected).abs() < 1e-12,
+            "row sum {sum}, expected {expected}"
+        );
+    }
+
     let r54 = (1_u64 << 54) as f64;
     let tr = vec![vec![0.0, r54], vec![r54, 0.0]];
     for (ex, t) in [
