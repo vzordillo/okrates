@@ -37,21 +37,37 @@ Runs are reproducible in a strict sense. Every replica and every purpose (dynami
 A kinetic Monte Carlo code has two parts that change for different reasons. The physics, meaning which states exist, which transitions are possible and how fast they happen, changes with every material and mechanism. The algorithm, meaning how an event is chosen, how time advances and how the event list stays current, is the same for all of them. okrates keeps the two apart: a model describes physics only, and the engine owns selection, time, randomness and checkpoints. A new mechanism means writing a new model, and the engine's guarantees come with it.
 
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "20px"}, "flowchart": {"nodeSpacing": 40, "rankSpacing": 60, "padding": 14, "htmlLabels": true}}}%%
+%%{init: {"themeVariables": {"fontSize": "18px"}, "flowchart": {"nodeSpacing": 24, "rankSpacing": 50, "padding": 10}}}%%
 flowchart LR
-    lang["🐍 Python<br>🦀 Rust"]
-    model["🧪 <b>Your model</b><br>states · transitions · rates"]
-    engine["⚙️ <b>okrates engine</b><br>event selection · clock<br>random streams · checkpoints"]
-    out["📈 <b>Results</b><br>trajectories · transport<br>provenance"]
+    lang(["🐍 Python<br>🦀 Rust"])
+    subgraph model["🧪 Your model"]
+        direction TB
+        states["States<br><i>atoms, defects, species</i>"]
+        moves["Transitions<br><i>what can happen next</i>"]
+        rates["Rates<br><i>how fast, e.g. from DFT</i>"]
+    end
+    subgraph engine["⚙️ okrates engine"]
+        direction TB
+        pick{{"Event selection<br><i>direct or sum tree</i>"}}
+        clock{{"Continuous-time clock"}}
+        rng{{"Seeded random streams"}}
+        ckpt{{"Exact checkpoints"}}
+    end
+    subgraph out["📈 Results"]
+        direction TB
+        traj[/"Trajectories"/]
+        transport[/"Diffusivities, correlation<br>factors, segregation"/]
+        prov[/"Provenance records"/]
+    end
     lang -.-> model ==> engine ==> out
     classDef lang fill:#d95926,stroke:#8f3a18,color:#ffffff
     classDef model fill:#2a78d6,stroke:#1b4f8f,color:#ffffff
     classDef engine fill:#7a52c7,stroke:#4d3285,color:#ffffff
     classDef result fill:#1f9e78,stroke:#13664d,color:#ffffff
     class lang lang
-    class model model
-    class engine engine
-    class out result
+    class states,moves,rates model
+    class pick,clock,rng,ckpt engine
+    class traj,transport,prov result
 ```
 
 ## How a step works
@@ -59,16 +75,16 @@ flowchart LR
 With rates r₁ … r_M of the possible events and total rate R = Σ rᵢ, one step draws two uniform random numbers u₁ and u₂ in (0, 1). The first selects event i as the smallest index with u₁·R < r₁ + … + rᵢ. The second gives the waiting time Δt = −ln(u₂)/R. The event is applied and only the rates it changed are updated. If R = 0, nothing can happen and the run stops without drawing. A step either completes fully or leaves the simulation exactly as it was.
 
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "20px"}, "flowchart": {"nodeSpacing": 40, "rankSpacing": 60, "padding": 14, "htmlLabels": true}}}%%
-flowchart TB
-    s1["<b>1 · List the possible events</b><br>each with its rate; add them up"]
-    s2{{"<b>2 · Pick one event</b><br>a fast event is picked more often"}}
-    s3["<b>3 · Advance the clock</b><br>a random waiting time, shorter when<br>events are fast"]
-    s4["<b>4 · Apply the event</b><br>and refresh only the rates it changed"]
-    rest["<b>No events left</b><br>the system is at rest"]
-    s1 -->|"something can happen"| s2 --> s3 --> s4
+%%{init: {"themeVariables": {"fontSize": "18px"}, "flowchart": {"nodeSpacing": 24, "rankSpacing": 50, "padding": 10}}}%%
+flowchart LR
+    s1["<b>1 · List events</b><br>each with its rate"]
+    s2{{"<b>2 · Pick one</b><br>faster = likelier"}}
+    s3["<b>3 · Advance clock</b><br>random waiting time"]
+    s4["<b>4 · Apply it</b><br>update changed rates"]
+    rest(["At rest:<br>no events left"])
+    s1 --> s2 --> s3 --> s4
     s4 -->|"repeat"| s1
-    s1 -.->|"nothing can happen"| rest
+    s1 -.->|"none possible"| rest
     classDef step fill:#2a78d6,stroke:#1b4f8f,color:#ffffff
     classDef key fill:#7a52c7,stroke:#4d3285,color:#ffffff
     classDef rest fill:#787880,stroke:#4a4a50,color:#ffffff
