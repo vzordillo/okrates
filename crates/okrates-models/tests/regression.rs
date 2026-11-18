@@ -121,8 +121,7 @@ fn fecr_ris_trajectory() {
     let mut sim = IncrementalSimulation::new(model, state, SEED).unwrap();
     let mut digest = 0xcbf2_9ce4_8422_2325_u64;
     for _ in 0..2000 {
-        let before = sim.time();
-        let Step::Fired { event, .. } = sim.step().unwrap() else {
+        let Step::Fired { event, dt } = sim.step().unwrap() else {
             panic!("unexpected absorption");
         };
         let (kind, rec, index) = match event {
@@ -130,12 +129,7 @@ fn fecr_ris_trajectory() {
             FeCrRisEvent::DumbbellJump { rec, jump } => (2, rec, jump),
             FeCrRisEvent::Create => (0, 0, 0),
         };
-        for word in [
-            kind,
-            rec as u64,
-            index as u64,
-            (sim.time() - before).to_bits(),
-        ] {
+        for word in [kind, rec as u64, index as u64, dt.to_bits()] {
             digest = fnv1a(digest, word);
         }
     }
@@ -367,4 +361,4 @@ const R0005_REDUCED: &[u64] = &[
     4714297785282910612,
     4698817579328050235,
 ];
-const FECR_RIS_TRAJECTORY: &[u64] = &[14681123233513394520, 941, 938, 3, 2, 4656869773506930726];
+const FECR_RIS_TRAJECTORY: &[u64] = &[16196220491672327670, 941, 938, 3, 2, 4656869773506930726];
