@@ -260,7 +260,7 @@ class RunManifest:
 
 @dataclass(frozen=True, slots=True)
 class DiffusionResult:
-    """Fe–Cr transport coefficients in `m^2/s`, delete-1 jackknife correlation factor `f` (Quenouille, J. R. Stat. Soc. B 11, 68 (1949), Biometrika 43, 353 (1956); Tukey, Ann. Math. Stat. 29, 614 (1958)), and provenance manifest."""
+    """Fe–Cr transport coefficients in `m^2/s`, ratio-of-means correlation factor `f` with delete-1 jackknife standard error `f_se` (Quenouille, J. R. Stat. Soc. B 11, 68 (1949), Biometrika 43, 353 (1956); Tukey, Ann. Math. Stat. 29, 614 (1958)), and provenance manifest."""
 
     D_v: float
     D_v_se: float
