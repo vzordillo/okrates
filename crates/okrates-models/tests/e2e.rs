@@ -425,11 +425,47 @@ fn segregation_fit_lines(text: &str) -> Vec<&str> {
         .collect()
 }
 
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(prefix: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        for _ in 0..1024 {
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("{prefix}_{pid}_{nanos}_{seq}"));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Self(dir),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => panic!("failed to create temp dir {}: {err}", dir.display()),
+            }
+        }
+        panic!("exhausted temp dir attempts for prefix {prefix}");
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn fecr_ris_segregation_small() {
-    let ts_path = std::env::temp_dir().join(format!("okrates_seg_ts_{}.csv", std::process::id()));
-    let prof_path =
-        std::env::temp_dir().join(format!("okrates_seg_prof_{}.csv", std::process::id()));
+    let tmp = TempDir::new("okrates_seg_small");
+    let ts_path = tmp.path().join("ts.csv");
+    let prof_path = tmp.path().join("prof.csv");
     let ts_arg = ts_path.to_str().unwrap().to_string();
     let prof_arg = prof_path.to_str().unwrap().to_string();
 
@@ -503,9 +539,6 @@ fn fecr_ris_segregation_small() {
         Some("d_planes,distance_nm,c_cr_mean,c_cr_se,c_v_mean,c_v_se,c_i_mean,c_i_se")
     );
     assert_eq!(prof_lines.len(), 17);
-
-    let _ = std::fs::remove_file(&ts_path);
-    let _ = std::fs::remove_file(&prof_path);
 }
 
 #[test]
@@ -603,15 +636,14 @@ fn fecr_ris_segregation_bad_args() {
         usage,
     );
 
-    let pid = std::process::id();
-    let same_path = std::env::temp_dir().join(format!("okrates_seg_same_{pid}.csv"));
-    let sub_dir = std::env::temp_dir().join(format!("okrates_seg_sub_{pid}"));
-    let _ = std::fs::remove_file(&same_path);
-    std::fs::create_dir_all(&sub_dir).unwrap();
+    let tmp = TempDir::new("okrates_seg_bad_args");
+    let same_path = tmp.path().join("same.csv");
+    let sub_dir = tmp.path().join("sub");
+    std::fs::create_dir(&sub_dir).unwrap();
     let same_arg = same_path.to_str().unwrap().to_string();
     let eq_arg = sub_dir
         .join("..")
-        .join(same_path.file_name().unwrap())
+        .join("same.csv")
         .to_str()
         .unwrap()
         .to_string();
@@ -648,10 +680,8 @@ fn fecr_ris_segregation_bad_args() {
     }
     #[cfg(unix)]
     {
-        let hl_a = std::env::temp_dir().join(format!("okrates_seg_hla_{pid}.csv"));
-        let hl_b = std::env::temp_dir().join(format!("okrates_seg_hlb_{pid}.csv"));
-        let _ = std::fs::remove_file(&hl_a);
-        let _ = std::fs::remove_file(&hl_b);
+        let hl_a = tmp.path().join("hla.csv");
+        let hl_b = tmp.path().join("hlb.csv");
         std::fs::write(&hl_a, "keep\n").unwrap();
         std::fs::hard_link(&hl_a, &hl_b).unwrap();
         let (code, stdout, stderr) = run(example("fecr_ris_segregation").args([
@@ -683,8 +713,5 @@ fn fecr_ris_segregation_bad_args() {
             "stderr: {stderr}"
         );
         assert_eq!(std::fs::read_to_string(&hl_a).unwrap(), "keep\n");
-        let _ = std::fs::remove_file(&hl_a);
-        let _ = std::fs::remove_file(&hl_b);
     }
-    let _ = std::fs::remove_dir(&sub_dir);
 }
