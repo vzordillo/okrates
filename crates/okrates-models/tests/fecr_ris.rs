@@ -1581,6 +1581,16 @@ fn t12_round_trip_and_corruption() {
         })
         .contains("recombination radius")
     );
+    // creation_attempts < created.
+    let created_at = lay.reservoir_len(cap) + 16;
+    let attempts_at = lay.reservoir_len(cap) + 48;
+    assert!(
+        corrupt(&|b| {
+            b[created_at..created_at + 8].copy_from_slice(&2_u64.to_le_bytes());
+            b[attempts_at..attempts_at + 8].copy_from_slice(&1_u64.to_le_bytes());
+        })
+        .contains("creation_attempts")
+    );
     // Creation stream other than 1.
     let stream_at = bytes.len() - 32;
     assert!(corrupt(&|b| b[stream_at] = 0).contains("stream"));
@@ -1636,4 +1646,202 @@ fn non_finite_saddle_refit_is_rejected() {
             "the refitted dumbbell saddle interactions are not finite"
         ))
     );
+}
+
+#[test]
+fn recombination_takes_precedence_over_sink_absorption() {
+    let m = ris_model([8, 8, 8], 650.0, 0.0, 2, &[0]);
+    let n = m.lattice().site_count();
+    let sink = pos_site(&m, [0, 4, 4]);
+    let start = pos_site(&m, [1, 3, 3]);
+    let partner = pos_site(&m, [3, 5, 5]);
+    // Before the jump |partner - start|^2 = 12 (outside Rc); at sink |partner - sink|^2 = 11 (within Rc).
+
+    // (a) Vacancy jumps onto sink within Rc of a dumbbell.
+    let mut s_vac = m
+        .state_with_defects(
+            vec![Species::Fe; n],
+            &[
+                Defect::Vacancy { site: start },
+                Defect::Dumbbell {
+                    site: partner,
+                    axis: 0,
+                    plus: Species::Cr,
+                    minus: Species::Fe,
+                },
+            ],
+            1,
+        )
+        .unwrap();
+    let dir = (0..8)
+        .find(|&d| m.lattice().neighbor(start, d) == sink)
+        .unwrap();
+    let totals = species_totals(&s_vac);
+    m.apply(&mut s_vac, &FeCrRisEvent::VacancyJump { rec: 0, dir })
+        .unwrap();
+    assert_eq!(s_vac.recombined(), 1);
+    assert_eq!(s_vac.absorbed_v(), 0);
+    assert_eq!(s_vac.absorbed_i(), 0);
+    assert_eq!(s_vac.defect_counts(), (0, 0));
+    assert_eq!(species_totals(&s_vac), totals);
+    m.check_invariants(&s_vac).unwrap();
+
+    // (b) Dumbbell jumps onto sink within Rc of a vacancy.
+    let mut s_int = m
+        .state_with_defects(
+            vec![Species::Fe; n],
+            &[
+                Defect::Dumbbell {
+                    site: start,
+                    axis: 1,
+                    plus: Species::Cr,
+                    minus: Species::Fe,
+                },
+                Defect::Vacancy { site: partner },
+            ],
+            1,
+        )
+        .unwrap();
+    let jump = (0..8)
+        .find(|&j| {
+            matches!(
+                m.jump_result(&s_int, 0, j),
+                Some((Defect::Dumbbell { site, .. }, _)) if site == sink
+            )
+        })
+        .unwrap();
+    let totals = species_totals(&s_int);
+    m.apply(&mut s_int, &FeCrRisEvent::DumbbellJump { rec: 0, jump })
+        .unwrap();
+    assert_eq!(s_int.recombined(), 1);
+    assert_eq!(s_int.absorbed_i(), 0);
+    assert_eq!(s_int.absorbed_v(), 0);
+    assert_eq!(s_int.defect_counts(), (0, 0));
+    assert_eq!(species_totals(&s_int), totals);
+    m.check_invariants(&s_int).unwrap();
+}
+
+#[test]
+fn live_defect_counts_track_creation_reactions_and_undo() {
+    use okrates_core::ReversibleModel;
+
+    let m = ris_model([8, 8, 8], 650.0, FULL_K0, 16, &[0]);
+    let s0 = m.random_state(102, 3, 1).unwrap();
+    assert_eq!(s0.defect_counts(), (0, 0));
+    assert_eq!(s0.peak_defects(), 0);
+
+    let mut sim = IncrementalSimulation::new(m.clone(), s0.clone(), 0x5eed_0008).unwrap();
+    for _ in 0..500 {
+        sim.step().unwrap();
+        let s = sim.state();
+        let expected_v = s
+            .records()
+            .iter()
+            .filter(|r| matches!(r, Record::Vacancy { .. }))
+            .count();
+        let expected_i = s
+            .records()
+            .iter()
+            .filter(|r| matches!(r, Record::Dumbbell { .. }))
+            .count();
+        assert_eq!(s.defect_counts(), (expected_v, expected_i));
+        sim.model().check_invariants(s).unwrap();
+    }
+    let mut reversible_state = sim.state().clone();
+    let before_counts = reversible_state.defect_counts();
+    let undo = m
+        .apply_reversible(&mut reversible_state, &FeCrRisEvent::Create)
+        .unwrap();
+    assert_eq!(
+        reversible_state.defect_counts(),
+        (before_counts.0 + 1, before_counts.1 + 1)
+    );
+    m.undo(&mut reversible_state, undo);
+    assert_eq!(reversible_state.defect_counts(), before_counts);
+    m.check_invariants(&reversible_state).unwrap();
+}
+
+#[test]
+fn constructor_rejects_overflows_and_preserves_sub_unity_nu0_prefactor() {
+    let base = FeCrRisParams {
+        cells: [6, 6, 6],
+        sink_planes: vec![],
+        temperature_k: 300.0,
+        k0_dpa_per_s: 0.0,
+        capacity: 1,
+        dumbbell: DumbbellParams::senninger2016_r1(),
+    };
+    let bad = |f: &dyn Fn(&mut FeCrRisParams)| {
+        let mut p = base.clone();
+        f(&mut p);
+        FeCrRis::new(p).is_err()
+    };
+    assert!(bad(&|p| p.cells = [usize::MAX, 6, 6]));
+    assert!(bad(&|p| p.cells = [(i64::MAX as usize) / 2 + 1, 6, 6]));
+    assert!(bad(&|p| p.capacity = usize::MAX));
+    assert!(bad(&|p| p.capacity = usize::MAX / 8 + 1));
+    assert!(bad(&|p| p.capacity = u32::MAX as usize));
+    assert!(bad(&|p| p.dumbbell.ds_mig_kb = 800.0));
+    assert!(bad(&|p| p.k0_dpa_per_s = 1e308));
+
+    let mut sub_unity = base;
+    sub_unity.dumbbell.nu0 = 1e-100;
+    sub_unity.dumbbell.ds_mig_kb = 750.0;
+    let m = FeCrRis::new(sub_unity).unwrap();
+    let occ = vec![Species::Fe; m.lattice().site_count()];
+    let d = Defect::Dumbbell {
+        site: 0,
+        axis: 0,
+        plus: Species::Fe,
+        minus: Species::Fe,
+    };
+    let s = m.state_with_defects(occ, &[d], 1).unwrap();
+    let r = m.rate(&s, 0, 0);
+    assert!(r.is_finite() && r > 0.0, "rate = {r}");
+}
+
+#[test]
+fn public_jump_queries_return_fallbacks_out_of_range() {
+    let m = ris_model([8, 8, 8], 650.0, 0.0, 2, &[]);
+    let occ = vec![Species::Fe; m.lattice().site_count()];
+    let s = m
+        .state_with_defects(occ, &[Defect::Vacancy { site: 0 }], 1)
+        .unwrap();
+    for (rec, jump) in [(99, 0), (0, 8), (1, 8), (99, 99)] {
+        assert_eq!(m.jump_result(&s, rec, jump), None);
+        assert!(m.raw_barrier(&s, rec, jump).is_nan());
+        assert!(m.energy_change(&s, rec, jump).is_nan());
+        assert!(m.barrier(&s, rec, jump).is_nan());
+        assert_eq!(m.rate(&s, rec, jump), 0.0);
+    }
+}
+
+#[test]
+fn failed_apply_clears_last_changed_and_last_records() {
+    let m = ris_model([8, 8, 8], 650.0, 1.0e5, 2, &[]);
+    let mut s = m.random_state(0, 1, 1).unwrap();
+
+    m.apply(&mut s, &FeCrRisEvent::Create).unwrap();
+    assert!(!s.last_changed().is_empty() && !s.last_records().is_empty());
+
+    assert!(matches!(
+        m.apply(&mut s, &FeCrRisEvent::VacancyJump { rec: 99, dir: 0 }),
+        Err(FeCrRisError::NoSuchJump { rec: 99, jump: 0 })
+    ));
+    assert!(s.last_changed().is_empty());
+    assert!(s.last_records().is_empty());
+
+    m.apply(&mut s, &FeCrRisEvent::VacancyJump { rec: 0, dir: 0 })
+        .unwrap();
+    assert!(!s.last_changed().is_empty() && !s.last_records().is_empty());
+
+    assert!(matches!(
+        m.apply(&mut s, &FeCrRisEvent::Create),
+        Err(FeCrRisError::PoolExhausted {
+            capacity: 2,
+            defects: 2
+        })
+    ));
+    assert!(s.last_changed().is_empty());
+    assert!(s.last_records().is_empty());
 }

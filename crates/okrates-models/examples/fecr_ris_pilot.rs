@@ -83,7 +83,7 @@ fn parse() -> Args {
     }
     match (temperature, k0, dpa_end, capacity, seed) {
         (Some(temperature), Some(k0), Some(dpa_end), Some(capacity), Some(seed))
-            if k0 > 0.0 && dpa_end > 0.0 && report_every > 0 =>
+            if k0 > 0.0 && dpa_end.is_finite() && dpa_end > 0.0 && report_every > 0 =>
         {
             Args {
                 temperature,

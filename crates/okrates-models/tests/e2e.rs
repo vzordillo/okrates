@@ -230,6 +230,7 @@ fn fecr_ris_pilot_small() {
 
 #[test]
 fn fecr_ris_pilot_bad_args() {
+    let usage = "usage: fecr_ris_pilot --temperature K --k0 dpa_per_s --dpa-end x --capacity P --seed s [--cells nx ny nz] [--report-every-steps n]";
     assert_usage_error(
         example("fecr_ris_pilot").args([
             "--temperature",
@@ -241,8 +242,25 @@ fn fecr_ris_pilot_bad_args() {
             "--capacity",
             "64",
         ]),
-        "usage: fecr_ris_pilot --temperature K --k0 dpa_per_s --dpa-end x --capacity P --seed s [--cells nx ny nz] [--report-every-steps n]",
+        usage,
     );
+    for bad_dpa in ["inf", "-inf", "NaN"] {
+        assert_usage_error(
+            example("fecr_ris_pilot").args([
+                "--temperature",
+                "773",
+                "--k0",
+                "1e-3",
+                "--dpa-end",
+                bad_dpa,
+                "--capacity",
+                "64",
+                "--seed",
+                "7",
+            ]),
+            usage,
+        );
+    }
 }
 
 /// About 3.5 s in debug.

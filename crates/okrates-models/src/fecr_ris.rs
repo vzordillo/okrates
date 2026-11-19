@@ -6,6 +6,8 @@
 //!
 //! Thermal vacancy and dumbbell jumps use local energy differences obeying detailed balance to rounding;
 //! Frenkel-pair creation, I–V recombination, and sink absorption are driven or irreversible.
+//! When a jump lands on a sink site within [`RC_OFFSETS`] of an opposite defect, recombination takes
+//! precedence over sink absorption.
 //! Jump barriers apply a shared saddle-level floor `max(raw, max(0, ΔE))`.
 
 use std::cell::RefCell;
@@ -102,6 +104,16 @@ impl DumbbellParams {
         }
     }
 
+    /// Attempt prefactor `nu0 * exp(ds_mig_kb)`, evaluating in log space when `exp(ds_mig_kb)` overflows.
+    fn prefactor(&self) -> f64 {
+        let exp_ds = self.ds_mig_kb.exp();
+        if exp_ds.is_finite() {
+            self.nu0 * exp_ds
+        } else {
+            (self.nu0.ln() + self.ds_mig_kb).exp()
+        }
+    }
+
     fn validate(&self) -> Result<(), FeCrRisError> {
         let finite = self.g.iter().all(|v| v.is_finite())
             && self.e.iter().flatten().flatten().all(|v| v.is_finite())
@@ -117,6 +129,11 @@ impl DumbbellParams {
         }
         if !self.nu0.is_finite() || self.nu0 <= 0.0 {
             return Err(FeCrRisError::Parameter("nu0 must be finite and positive"));
+        }
+        if !self.prefactor().is_finite() {
+            return Err(FeCrRisError::Parameter(
+                "dumbbell rate prefactor must be finite",
+            ));
         }
         Ok(())
     }
@@ -285,11 +302,26 @@ fn open01(rng: &mut ChaCha12Rng) -> f64 {
 
 const N_CACHE_SIZE: usize = 1024;
 
+fn live_counts(records: &[Record]) -> (usize, usize) {
+    let mut vacancies = 0_usize;
+    let mut dumbbells = 0_usize;
+    for r in records {
+        match r {
+            Record::Empty => {}
+            Record::Vacancy { .. } => vacancies += 1,
+            Record::Dumbbell { .. } => dumbbells += 1,
+        }
+    }
+    (vacancies, dumbbells)
+}
+
 #[derive(Clone, Debug)]
 pub struct FeCrRisState {
     cells: Vec<Cell>,
     records: Vec<Record>,
     site_record: Vec<u32>,
+    live_vacancies: usize,
+    live_dumbbells: usize,
     reservoir: VecDeque<Species>,
     borrowed_fe: u64,
     created: u64,
@@ -385,17 +417,7 @@ impl FeCrRisState {
     }
     /// `(vacancies, dumbbells)` currently active in `records`.
     pub fn defect_counts(&self) -> (usize, usize) {
-        let v = self
-            .records
-            .iter()
-            .filter(|r| matches!(r, Record::Vacancy { .. }))
-            .count();
-        let d = self
-            .records
-            .iter()
-            .filter(|r| matches!(r, Record::Dumbbell { .. }))
-            .count();
-        (v, d)
+        (self.live_vacancies, self.live_dumbbells)
     }
 
     fn content(&self, site: usize) -> Content {
@@ -456,10 +478,7 @@ impl FeCrRisState {
     }
 
     fn open_records(&self) -> u64 {
-        self.records
-            .iter()
-            .filter(|r| !matches!(r, Record::Empty))
-            .count() as u64
+        (self.live_vacancies + self.live_dumbbells) as u64
     }
 }
 
@@ -653,12 +672,43 @@ impl FeCrRis {
         if params.capacity == 0 {
             return Err(FeCrRisError::Parameter("capacity must be at least 1"));
         }
-        let width = 2 * params.cells[0] as i64;
+        if params.capacity >= NO_RECORD as usize {
+            return Err(FeCrRisError::Parameter(
+                "capacity exceeds record index limit",
+            ));
+        }
+        let slot_count = 8_usize
+            .checked_mul(params.capacity)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(FeCrRisError::Parameter("capacity overflows slot count"))?;
+        okrates_core::SumTree::check_len(slot_count)
+            .map_err(|_| FeCrRisError::Parameter("capacity exceeds sum-tree limit"))?;
+        params
+            .capacity
+            .checked_mul(std::mem::size_of::<Record>())
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .ok_or(FeCrRisError::Parameter(
+                "capacity exceeds record allocation limit",
+            ))?;
+        let lattice = BccLattice::new(params.cells).map_err(FeCrRisError::Lattice)?;
+        if u32::try_from(lattice.site_count()).is_err() {
+            return Err(FeCrRisError::Lattice(LatticeError::TooLarge {
+                cells: params.cells,
+            }));
+        }
+        let width = i64::try_from(params.cells[0])
+            .ok()
+            .and_then(|c| c.checked_mul(2))
+            .ok_or(FeCrRisError::Lattice(LatticeError::TooLarge {
+                cells: params.cells,
+            }))?;
         if let Some(&x) = params.sink_planes.iter().find(|&&x| x < 0 || x >= width) {
             return Err(FeCrRisError::SinkPlane(x));
         }
         params.dumbbell.validate()?;
-        let lattice = BccLattice::new(params.cells).map_err(FeCrRisError::Lattice)?;
+        if !(params.k0_dpa_per_s * lattice.site_count() as f64).is_finite() {
+            return Err(FeCrRisError::Parameter("creation rate must be finite"));
+        }
         let energetics =
             Martinez2012::new(params.temperature_k).map_err(FeCrRisError::Energetics)?;
         let kt = BOLTZMANN_EV_PER_K * params.temperature_k;
@@ -784,10 +834,13 @@ impl FeCrRis {
         site_record: Vec<u32>,
         run_seed: u64,
     ) -> FeCrRisState {
+        let (live_vacancies, live_dumbbells) = live_counts(&records);
         let mut state = FeCrRisState {
             cells,
             records,
             site_record,
+            live_vacancies,
+            live_dumbbells,
             reservoir: VecDeque::new(),
             borrowed_fe: 0,
             created: 0,
@@ -857,7 +910,10 @@ impl FeCrRis {
                 defects: defects.len(),
             });
         }
-        let mut cells = Vec::with_capacity(n);
+        let mut cells = Vec::new();
+        cells
+            .try_reserve_exact(n)
+            .map_err(|_| FeCrRisError::Parameter("state allocation exceeds memory limit"))?;
         for (site, sp) in occ.iter().enumerate() {
             cells.push(match sp {
                 Species::Fe => Cell::Fe,
@@ -865,8 +921,16 @@ impl FeCrRis {
                 Species::Vacancy => return Err(FeCrRisError::VacancyInOccupancy { site }),
             });
         }
-        let mut records = vec![Record::Empty; self.params.capacity];
-        let mut site_record = vec![NO_RECORD; n];
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(self.params.capacity)
+            .map_err(|_| FeCrRisError::Parameter("state allocation exceeds memory limit"))?;
+        records.resize(self.params.capacity, Record::Empty);
+        let mut site_record = Vec::new();
+        site_record
+            .try_reserve_exact(n)
+            .map_err(|_| FeCrRisError::Parameter("state allocation exceeds memory limit"))?;
+        site_record.resize(n, NO_RECORD);
         for (i, &d) in defects.iter().enumerate() {
             let site = d.site();
             if site >= n {
@@ -940,16 +1004,26 @@ impl FeCrRis {
                 "cells and records differ in number",
             ));
         }
+        if s.creation_attempts < s.created {
+            return Err(FeCrRisError::Inconsistent(
+                "creation_attempts is less than created",
+            ));
+        }
+        let (mut v_count, mut d_count) = (0_usize, 0_usize);
         for (i, r) in s.records.iter().enumerate() {
             let (site, cell) = match *r {
                 Record::Empty => continue,
-                Record::Vacancy { site } => (site, Cell::Vacancy),
+                Record::Vacancy { site } => {
+                    v_count += 1;
+                    (site, Cell::Vacancy)
+                }
                 Record::Dumbbell {
                     site,
                     axis,
                     plus,
                     minus,
                 } => {
+                    d_count += 1;
                     if axis >= 6 || plus == Species::Vacancy || minus == Species::Vacancy {
                         return Err(FeCrRisError::InvalidDefect { site });
                     }
@@ -962,6 +1036,11 @@ impl FeCrRis {
             if self.on_sink(site) {
                 return Err(FeCrRisError::DefectOnSink { site });
             }
+        }
+        if (s.live_vacancies, s.live_dumbbells) != (v_count, d_count) {
+            return Err(FeCrRisError::Inconsistent(
+                "live defect counters do not match records",
+            ));
         }
         if s.site_record.iter().filter(|&&r| r != NO_RECORD).count() as u64 != s.open_records() {
             return Err(FeCrRisError::Inconsistent(
@@ -1162,15 +1241,17 @@ impl FeCrRis {
         out
     }
 
-    /// Resolves jump `jump` (0..8) of record `rec`; `None` for an empty record or a blocked target.
+    /// Resolves jump `jump` (0..8) of record `rec`; `None` for invalid indices, an empty record, or a blocked target.
     fn jump_move(&self, s: &FeCrRisState, rec: usize, jump: usize) -> Option<Move> {
-        assert!(jump < 8, "jump index {jump} out of range");
+        if jump >= 8 {
+            return None;
+        }
         let lattice_species = |site: usize| match s.cells[site] {
             Cell::Fe => Some(Species::Fe),
             Cell::Cr => Some(Species::Cr),
             _ => None,
         };
-        match s.records[rec] {
+        match *s.records.get(rec)? {
             Record::Empty => None,
             Record::Vacancy { site: q } => {
                 let p = self.lattice.neighbor(q, jump);
@@ -1321,10 +1402,7 @@ impl FeCrRis {
             (-barrier / self.kt).exp()
         };
         match mv {
-            Move::Dumbbell { .. } => {
-                let p = &self.params.dumbbell;
-                p.nu0 * p.ds_mig_kb.exp() * boltzmann
-            }
+            Move::Dumbbell { .. } => self.params.dumbbell.prefactor() * boltzmann,
             Move::Vacancy { atom, .. } => {
                 let nu = self
                     .energetics
@@ -1369,6 +1447,8 @@ pub struct FeCrRisUndo {
     last_changed_len: u8,
     last_records: [usize; 6],
     last_records_len: u8,
+    live_vacancies: usize,
+    live_dumbbells: usize,
     reservoir: ReservoirUndo,
     borrowed_fe: u64,
     created: u64,
@@ -1399,6 +1479,8 @@ impl FeCrRisUndo {
             last_changed_len: changed_len as u8,
             last_records,
             last_records_len: rec_len as u8,
+            live_vacancies: s.live_vacancies,
+            live_dumbbells: s.live_dumbbells,
             reservoir: ReservoirUndo::None,
             borrowed_fe: s.borrowed_fe,
             created: s.created,
@@ -1446,6 +1528,11 @@ impl FeCrRis {
     }
 
     fn free_record(s: &mut FeCrRisState, rec: usize, mut undo: Option<&mut FeCrRisUndo>) {
+        match s.records[rec] {
+            Record::Empty => {}
+            Record::Vacancy { .. } => s.live_vacancies -= 1,
+            Record::Dumbbell { .. } => s.live_dumbbells -= 1,
+        }
         if let Record::Vacancy { site } | Record::Dumbbell { site, .. } = s.records[rec] {
             if let Some(u) = undo.as_deref_mut() {
                 u.save_site(s, site);
@@ -1627,6 +1714,8 @@ impl FeCrRis {
             plus,
             minus,
         };
+        s.live_vacancies += 1;
+        s.live_dumbbells += 1;
         s.site_record[chain[0]] = v_rec as u32;
         s.site_record[chain[10]] = d_rec as u32;
         s.created += 1;
@@ -1637,6 +1726,8 @@ impl FeCrRis {
         Ok(())
     }
 
+    /// Applies jump `jump` of record `rec`; I–V recombination runs before and takes precedence
+    /// over sink absorption when the destination sits on a sink plane within [`RC_OFFSETS`].
     fn jump(
         &self,
         s: &mut FeCrRisState,
@@ -1767,6 +1858,8 @@ impl Model for FeCrRis {
     }
 
     fn apply(&self, state: &mut Self::State, event: &Self::Event) -> Result<(), Self::Error> {
+        state.last_changed.clear();
+        state.last_records.clear();
         self.apply_inner(state, event, None)
     }
 }
@@ -1808,6 +1901,8 @@ impl ReversibleModel for FeCrRis {
         state.floored_dumbbell_jumps = undo.floored_dumbbell_jumps;
         state.floored_vacancy_jumps = undo.floored_vacancy_jumps;
         state.peak_defects = undo.peak_defects;
+        state.live_vacancies = undo.live_vacancies;
+        state.live_dumbbells = undo.live_dumbbells;
         if let Some(rng) = undo.creation_rng {
             state.creation_rng = rng;
         }
@@ -2132,10 +2227,13 @@ impl FeCrRis {
         if creation_rng.get_word_pos() != word_pos {
             return Err(format!("word position {word_pos} is out of range"));
         }
+        let (live_vacancies, live_dumbbells) = live_counts(&records);
         let state = FeCrRisState {
             cells,
             records,
             site_record,
+            live_vacancies,
+            live_dumbbells,
             reservoir,
             borrowed_fe,
             created: counters[0],
