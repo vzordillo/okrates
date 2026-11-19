@@ -1,7 +1,7 @@
 //! Unit and integration tests for Fe–Cr grain-boundary RIS observables, continuous-time
 //! planar defect tallies, relaxation fits, validation guards, and ensemble determinism.
 
-use okrates_core::{Clock, IncrementalSimulation, KmcRng, Step, StreamRole};
+use okrates_core::{IncrementalSimulation, KmcRng, SimError, Step, StreamRole};
 use okrates_models::fecr::Species;
 use okrates_models::fecr_ris::{Defect, DumbbellParams, FeCrRis, FeCrRisError, FeCrRisParams};
 use okrates_models::fecr_ris_segregation::{
@@ -149,7 +149,7 @@ fn t2_zero_bias_random_alloy_and_bulk_window() {
     let mut lin_vals = Vec::with_capacity(n_draw);
     for id in 0..n_draw {
         let mut rng = KmcRng::for_replica(77, id as u64, StreamRole::InitialState);
-        let occ = place_random_cr(sites, cr_count, &mut rng);
+        let occ = place_random_cr(sites, cr_count, &mut rng).unwrap();
         let state = model.state_with_defects(occ, &[], id as u64).unwrap();
         let counts = PlaneCounts::from_state(&model, &state).unwrap();
         let m = compute_segregation_metrics(&counts, 0, bulk_min, DEFAULT_LATTICE_A_M).unwrap();
@@ -245,7 +245,7 @@ fn t3_continuous_time_plane_defect_tally_and_strict_crossing() {
     let rep = &run_ris_segregation(&m_sim, &config).unwrap()[0];
 
     let mut init_rng = KmcRng::for_replica(99, 0, StreamRole::InitialState);
-    let occ = place_random_cr(m_sim.lattice().site_count(), 40, &mut init_rng);
+    let occ = place_random_cr(m_sim.lattice().site_count(), 40, &mut init_rng).unwrap();
     let s0 = m_sim.state_with_defects(occ, &[], 99).unwrap();
     let mut sim = IncrementalSimulation::with_rng(
         m_sim.clone(),
@@ -288,9 +288,69 @@ fn t3_continuous_time_plane_defect_tally_and_strict_crossing() {
     for (s, &expected_gb) in rep.samples.iter().zip(&manual_gb) {
         assert_eq!(s.metrics.c_cr_gb.to_bits(), expected_gb.to_bits());
     }
-    let mut check_clk = Clock::new();
-    check_clk.advance(1.0).unwrap();
     assert_eq!(rep.samples.len(), 4);
+
+    // Exercise exact event-clock boundary: t1 = first event clock uses post-event state, while
+    // t1 - 1 ULP still reads the pre-event state.
+    let exact_model = test_model([6, 6, 6], vec![0], 1.0, 32);
+    let (exact_seed, t1, pre_metrics, post_metrics) = (0_u64..128)
+        .find_map(|seed| {
+            let mut rng = KmcRng::for_replica(seed, 0, StreamRole::InitialState);
+            let occ = place_random_cr(exact_model.lattice().site_count(), 40, &mut rng).ok()?;
+            let s0 = exact_model.state_with_defects(occ, &[], seed).ok()?;
+            let pre = compute_segregation_metrics(
+                &PlaneCounts::from_state(&exact_model, &s0).ok()?,
+                0,
+                4,
+                DEFAULT_LATTICE_A_M,
+            )
+            .ok()?;
+            let mut es = IncrementalSimulation::with_rng(
+                exact_model.clone(),
+                s0,
+                KmcRng::for_replica(seed, 0, StreamRole::Dynamics),
+            )
+            .ok()?;
+            match es.step().ok()? {
+                Step::Fired { .. } => {
+                    if es.clock().compensation() != 0.0 {
+                        return None;
+                    }
+                    let post = compute_segregation_metrics(
+                        &PlaneCounts::from_state(es.model(), es.state()).ok()?,
+                        0,
+                        4,
+                        DEFAULT_LATTICE_A_M,
+                    )
+                    .ok()?;
+                    (pre.s_cr_tot_nm.to_bits() != post.s_cr_tot_nm.to_bits()).then_some((
+                        seed,
+                        es.clock().time(),
+                        pre,
+                        post,
+                    ))
+                }
+                Step::Absorbed => None,
+            }
+        })
+        .expect("found seed with observable change on step 1");
+    let t_before = f64::from_bits(t1.to_bits() - 1);
+    let mut exact_cfg = RisSegregationConfig::uniform(40, t1, 2, 0.0, 4, 1, exact_seed).unwrap();
+    exact_cfg.sample_doses = vec![t_before, t1];
+    let exact_rep = &run_ris_segregation(&exact_model, &exact_cfg).unwrap()[0];
+    assert_eq!(exact_rep.steps, 1);
+    assert_eq!(
+        exact_rep.samples[0].metrics.s_cr_tot_nm.to_bits(),
+        pre_metrics.s_cr_tot_nm.to_bits()
+    );
+    assert_eq!(
+        exact_rep.samples[1].metrics.s_cr_tot_nm.to_bits(),
+        post_metrics.s_cr_tot_nm.to_bits()
+    );
+    assert_ne!(
+        pre_metrics.s_cr_tot_nm.to_bits(),
+        post_metrics.s_cr_tot_nm.to_bits()
+    );
 }
 
 #[test]
@@ -447,6 +507,135 @@ fn t5_validation_and_error_guards() {
     assert!(matches!(
         summarize_ris_segregation(&[]),
         Err(RisSegregationError::InsufficientReplicas(0))
+    ));
+
+    assert!(matches!(
+        PlaneDefectTally::new([usize::MAX / 2 + 1, 6, 6]),
+        Err(RisSegregationError::InvalidSummary(_))
+    ));
+    assert!(matches!(
+        PlaneDefectTally::new([6, 0, 6]),
+        Err(RisSegregationError::InvalidSummary(_))
+    ));
+    let m_688 = test_model([6, 8, 8], vec![0], 1.0e5, 32);
+    let s_688 = m_688
+        .state_with_defects(vec![Species::Fe; m_688.lattice().site_count()], &[], 1)
+        .unwrap();
+    let counts_688 = PlaneCounts::from_state(&m_688, &s_688).unwrap();
+    assert!(matches!(
+        PlaneDefectTally::new([6, 6, 6]).unwrap().into_profile(
+            &counts_688,
+            0,
+            4,
+            DEFAULT_LATTICE_A_M
+        ),
+        Err(RisSegregationError::InvalidSummary(_))
+    ));
+
+    assert!(matches!(
+        RisSegregationConfig::uniform(1, f64::from_bits(1), 2, 0.0, 4, 1, 7),
+        Err(RisSegregationError::InvalidDoseGrid(_))
+    ));
+
+    let mut rng_over = KmcRng::for_replica(11, 0, StreamRole::InitialState);
+    let mut rng_clone = rng_over.clone();
+    assert!(matches!(
+        place_random_cr(1, 2, &mut rng_over),
+        Err(RisSegregationError::InvalidCrCount {
+            cr_count: 2,
+            max: 1
+        })
+    ));
+    assert_eq!(rng_over.open01().to_bits(), rng_clone.open01().to_bits());
+
+    let two_reps = run_ris_segregation(
+        &m_ok,
+        &RisSegregationConfig::uniform(40, 2.0e-3, 2, 0.0, 4, 2, 7).unwrap(),
+    )
+    .unwrap();
+    let mut bad_prof = two_reps.clone();
+    bad_prof[1].profile.c_v_mean.pop();
+    assert!(matches!(
+        summarize_ris_segregation(&bad_prof),
+        Err(RisSegregationError::InvalidSummary(_))
+    ));
+    let alt_lat = &run_ris_segregation(
+        &m_ok,
+        &RisSegregationConfig::uniform(40, 2.0e-3, 2, 0.0, 4, 1, 7)
+            .unwrap()
+            .with_lattice_a_m(3.0e-10),
+    )
+    .unwrap()[0];
+    assert!(matches!(
+        summarize_ris_segregation(&[two_reps[0].clone(), alt_lat.clone()]),
+        Err(RisSegregationError::InvalidSummary(_))
+    ));
+
+    // A PoolExhausted failure strictly after dpa_end completes from the pre-event state,
+    // whereas failing before dpa_end still propagates PoolExhausted.
+    let mut trace_init = KmcRng::for_replica(7, 0, StreamRole::InitialState);
+    let trace_occ =
+        place_random_cr(m_tiny_cap.lattice().site_count(), 40, &mut trace_init).unwrap();
+    let trace_state = m_tiny_cap.state_with_defects(trace_occ, &[], 7).unwrap();
+    let mut trace_sim = IncrementalSimulation::with_rng(
+        m_tiny_cap.clone(),
+        trace_state,
+        KmcRng::for_replica(7, 0, StreamRole::Dynamics),
+    )
+    .unwrap();
+    let mut fail_info = None;
+    for _ in 0..10_000 {
+        let clock_before = trace_sim.clock();
+        let mut obs_next = None;
+        let mut obs_counts = None;
+        match trace_sim.step_observing(|m, sb, nc| {
+            obs_next = Some(nc);
+            obs_counts = PlaneCounts::from_state(m, sb).ok();
+        }) {
+            Ok(Step::Fired { .. }) => {}
+            Ok(Step::Absorbed) => panic!("unexpected absorption before pool exhaustion"),
+            Err(SimError::Model(FeCrRisError::PoolExhausted { .. })) => {
+                fail_info = Some((clock_before, obs_next.unwrap(), obs_counts.unwrap()));
+                break;
+            }
+            Err(other) => panic!("unexpected step error: {other}"),
+        }
+    }
+    let (clock_before_fail, fail_clock, pre_fail_counts) =
+        fail_info.expect("m_tiny_cap hits PoolExhausted");
+    let t_fail = fail_clock.time() + fail_clock.compensation();
+    let t_prev = clock_before_fail.time() + clock_before_fail.compensation();
+    let mid_t = t_prev + 0.5 * (t_fail - t_prev);
+    assert!(clock_before_fail.cmp_f64(mid_t).is_lt() && fail_clock.cmp_f64(mid_t).is_gt());
+
+    let recovered = &run_ris_segregation(
+        &m_tiny_cap,
+        &RisSegregationConfig::uniform(40, 1.0e8 * mid_t, 2, 0.0, 4, 1, 7).unwrap(),
+    )
+    .unwrap()[0];
+    let expected_pre =
+        compute_segregation_metrics(&pre_fail_counts, 0, 4, DEFAULT_LATTICE_A_M).unwrap();
+    assert_eq!(recovered.samples.len(), 2);
+    assert_eq!(
+        recovered.samples[1].metrics.c_cr_gb.to_bits(),
+        expected_pre.c_cr_gb.to_bits()
+    );
+    assert_eq!(
+        recovered.samples[1].metrics.s_cr_tot_nm.to_bits(),
+        expected_pre.s_cr_tot_nm.to_bits()
+    );
+    assert!((recovered.profile.steady_elapsed_s - mid_t).abs() < 1e-20);
+    assert!(recovered.final_dose <= 1.0e8 * mid_t);
+
+    assert!(matches!(
+        run_ris_segregation(
+            &m_tiny_cap,
+            &RisSegregationConfig::uniform(40, 1.0e8 * (t_fail * 1.1), 2, 0.0, 4, 1, 7).unwrap(),
+        ),
+        Err(RisSegregationError::Sim {
+            source: SimError::Model(FeCrRisError::PoolExhausted { .. }),
+            ..
+        })
     ));
 }
 

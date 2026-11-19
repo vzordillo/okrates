@@ -233,8 +233,35 @@ fn fmt_opt(v: Option<f64>) -> String {
     }
 }
 
+fn same_output_destination(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    if let (Ok(ca), Ok(cb)) = (fs::canonicalize(a), fs::canonicalize(b)) {
+        return ca == cb;
+    }
+    let resolved_parent_and_name = |p: &Path| -> Option<(PathBuf, std::ffi::OsString)> {
+        let name = p.file_name()?.to_os_string();
+        let raw_parent = p
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = fs::canonicalize(raw_parent).unwrap_or_else(|_| raw_parent.to_path_buf());
+        Some((parent, name))
+    };
+    matches!(
+        (resolved_parent_and_name(a), resolved_parent_and_name(b)),
+        (Some(pa), Some(pb)) if pa == pb
+    )
+}
+
 fn main() {
     let a = parse();
+    if let (Some(ts), Some(prof)) = (&a.timeseries_out, &a.profile_out)
+        && same_output_destination(ts, prof)
+    {
+        fail("--timeseries-out and --profile-out must refer to different paths");
+    }
     let model = FeCrRis::new(FeCrRisParams {
         cells: a.cells,
         sink_planes: vec![a.sink_plane],

@@ -204,11 +204,12 @@ pub struct PlaneCounts {
 }
 
 impl PlaneCounts {
-    /// Aggregates per-(100)-plane counts directly from `model` and `state`.
+    /// Requires `state` to have been created for `model`'s `[nx, ny, nz]` lattice geometry;
+    /// only total site count is validated.
     pub fn from_state(model: &FeCrRis, state: &FeCrRisState) -> Result<Self, RisSegregationError> {
         if state.cells().len() != model.lattice().site_count() {
             return Err(RisSegregationError::InvalidSummary(
-                "state cell count does not match model lattice",
+                "state site count does not match model lattice",
             ));
         }
         let cells = model.lattice().cells();
@@ -382,6 +383,18 @@ pub struct PlaneDefectProfile {
     pub i_bulk_mean: f64,
 }
 
+/// Computes the remaining overlap of `[clock_before, inf)` with `[t_start, t_end]`.
+#[inline]
+fn overlap_until_end(clock_before: Clock, t_start: f64, t_end: f64) -> f64 {
+    if clock_before.cmp_f64(t_end).is_ge() {
+        0.0
+    } else if clock_before.cmp_f64(t_start).is_ge() {
+        ((t_end - clock_before.time()) - clock_before.compensation()).max(0.0)
+    } else {
+        (t_end - t_start).max(0.0)
+    }
+}
+
 /// Computes the overlap of `[clock_before, clock_after]` (of width `dt`) with `[t_start, t_end]`.
 #[inline]
 fn interval_overlap(
@@ -401,15 +414,11 @@ fn interval_overlap(
     let before_ge = clock_before.cmp_f64(t_start).is_ge();
     let after_le = clock_after.cmp_f64(t_end).is_le();
     if before_ge && after_le {
-        return dt;
-    }
-    if !before_ge && !after_le {
-        return (t_end - t_start).max(0.0);
-    }
-    if !before_ge {
-        ((clock_after.time() - t_start) + clock_after.compensation()).clamp(0.0, dt)
+        dt
+    } else if !after_le {
+        overlap_until_end(clock_before, t_start, t_end).min(dt)
     } else {
-        ((t_end - clock_before.time()) - clock_before.compensation()).clamp(0.0, dt)
+        ((clock_after.time() - t_start) + clock_after.compensation()).clamp(0.0, dt)
     }
 }
 
@@ -417,6 +426,8 @@ fn interval_overlap(
 #[derive(Clone, Debug)]
 pub struct PlaneDefectTally {
     cells: [usize; 3],
+    sites_per_plane: usize,
+    site_count: usize,
     v_sum: Vec<f64>,
     v_comp: Vec<f64>,
     i_sum: Vec<f64>,
@@ -432,9 +443,21 @@ pub struct PlaneDefectTally {
 impl PlaneDefectTally {
     /// Allocates zeroed planar defect tallies for `cells` (`2 * cells[0]` planes).
     pub fn new(cells: [usize; 3]) -> Result<Self, RisSegregationError> {
-        let nx = 2 * cells[0];
+        let nx = cells[0].checked_mul(2).filter(|&n| n > 0).ok_or(
+            RisSegregationError::InvalidSummary("invalid lattice plane count"),
+        )?;
+        let sites_per_plane = cells[1].checked_mul(cells[2]).filter(|&n| n > 0).ok_or(
+            RisSegregationError::InvalidSummary("invalid lattice plane area"),
+        )?;
+        let site_count =
+            nx.checked_mul(sites_per_plane)
+                .ok_or(RisSegregationError::InvalidSummary(
+                    "lattice site count overflow",
+                ))?;
         Ok(Self {
             cells,
+            sites_per_plane,
+            site_count,
             v_sum: try_vec_zero(nx, 0.0)?,
             v_comp: try_vec_zero(nx, 0.0)?,
             i_sum: try_vec_zero(nx, 0.0)?,
@@ -484,15 +507,23 @@ impl PlaneDefectTally {
         }
     }
 
-    /// Collects active `(plane_x, is_vacancy)` pairs from `state` into `buf` without heap churn.
-    pub fn collect_active(cells: [usize; 3], state: &FeCrRisState, buf: &mut Vec<(usize, bool)>) {
+    /// Collects active `(plane_x, is_vacancy)` pairs from `state` into `buf`, reusing existing
+    /// buffer capacity.
+    pub fn collect_active(&self, state: &FeCrRisState, buf: &mut Vec<(usize, bool)>) {
         buf.clear();
         let records = state.records();
         for &rec in state.active_records() {
-            match records[rec] {
-                Record::Vacancy { site } => buf.push((site_plane_x(cells, site), true)),
-                Record::Dumbbell { site, .. } => buf.push((site_plane_x(cells, site), false)),
-                Record::Empty => {}
+            let Some(&record) = records.get(rec) else {
+                continue;
+            };
+            match record {
+                Record::Vacancy { site } if site < self.site_count => {
+                    buf.push((site_plane_x(self.cells, site), true));
+                }
+                Record::Dumbbell { site, .. } if site < self.site_count => {
+                    buf.push((site_plane_x(self.cells, site), false));
+                }
+                Record::Vacancy { .. } | Record::Dumbbell { .. } | Record::Empty => {}
             }
         }
     }
@@ -511,9 +542,12 @@ impl PlaneDefectTally {
         lattice_a_m: f64,
     ) -> Result<PlaneDefectProfile, RisSegregationError> {
         let nx = 2 * self.cells[0];
-        if final_counts.plane_count() != nx || self.v_sum.len() != nx {
+        if final_counts.plane_count() != nx
+            || self.v_sum.len() != nx
+            || final_counts.sites_per_plane != self.sites_per_plane
+        {
             return Err(RisSegregationError::InvalidSummary(
-                "plane count mismatch building profile",
+                "plane geometry mismatch building profile",
             ));
         }
         if sink_plane >= nx {
@@ -535,7 +569,7 @@ impl PlaneDefectTally {
         }
 
         let steady_elapsed_s = (self.elapsed + self.elapsed_comp).max(0.0);
-        let plane_sites = final_counts.sites_per_plane as f64;
+        let plane_sites = self.sites_per_plane as f64;
 
         let mut d_planes = try_vec_zero(nx, 0_isize)?;
         let mut distance_nm = try_vec_zero(nx, 0.0_f64)?;
@@ -631,6 +665,7 @@ impl RisSegregationConfig {
         sample_doses
             .try_reserve_exact(sample_count)
             .map_err(|_| RisSegregationError::Allocation(sample_count))?;
+        let mut prev = 0.0_f64;
         for k in 1..=sample_count {
             let d = if k == sample_count {
                 dpa_end
@@ -643,6 +678,12 @@ impl RisSegregationConfig {
                 };
                 v.clamp(0.0, dpa_end)
             };
+            if !d.is_finite() || d <= prev {
+                return Err(RisSegregationError::InvalidDoseGrid(
+                    "uniform dose grid has non-increasing or zero sample point",
+                ));
+            }
+            prev = d;
             sample_doses.push(d);
         }
         Ok(Self {
@@ -677,6 +718,12 @@ pub struct SegregationSample {
 }
 
 /// Full output of one RIS grain-boundary segregation replica.
+///
+/// `samples` and `profile` record the exact right-continuous CTMC trajectory over
+/// `[0, dpa_end]` and defect dwell on `[steady_start_dpa, dpa_end]`. `steps`, `final_time_s`,
+/// and `final_dose` report the last committed engine state (`final_dose` may exceed `dpa_end`
+/// when a committed step crosses the final target, or remain `<= dpa_end` if the target lands on
+/// a committed step or a strictly post-window step fails and rolls back).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RisSegregationReplica {
     pub replica_id: u64,
@@ -696,18 +743,32 @@ pub struct RisSegregationReplica {
 }
 
 /// Places `cr_count` Cr atoms on `sites` by partial Fisher-Yates shuffle without overflow.
-pub fn place_random_cr(sites: usize, cr_count: usize, rng: &mut KmcRng) -> Vec<Species> {
-    let mut order: Vec<usize> = (0..sites).collect();
+pub fn place_random_cr(
+    sites: usize,
+    cr_count: usize,
+    rng: &mut KmcRng,
+) -> Result<Vec<Species>, RisSegregationError> {
+    if cr_count > sites {
+        return Err(RisSegregationError::InvalidCrCount {
+            cr_count,
+            max: sites,
+        });
+    }
+    let mut order = Vec::new();
+    order
+        .try_reserve_exact(sites)
+        .map_err(|_| RisSegregationError::Allocation(sites))?;
+    order.extend(0..sites);
     for i in 0..cr_count {
         let rem = sites - i;
         let j = i + ((rng.open01() * rem as f64) as usize).min(rem - 1);
         order.swap(i, j);
     }
-    let mut occ = vec![Species::Fe; sites];
+    let mut occ = try_vec_zero(sites, Species::Fe)?;
     for &site in &order[..cr_count] {
         occ[site] = Species::Cr;
     }
-    occ
+    Ok(occ)
 }
 
 fn validate_run_inputs(
@@ -829,7 +890,7 @@ fn run_single_replica(
     let cells = model.lattice().cells();
     let sites = model.lattice().site_count();
     let mut init_rng = ctx.rng(StreamRole::InitialState);
-    let occ = place_random_cr(sites, config.cr_count, &mut init_rng);
+    let occ = place_random_cr(sites, config.cr_count, &mut init_rng)?;
     let state = model.state_with_defects(occ, &[], ctx.base_seed.wrapping_add(ctx.id))?;
     let mut sim =
         IncrementalSimulation::with_rng(model.clone(), state, ctx.rng(StreamRole::Dynamics))
@@ -888,58 +949,75 @@ fn run_single_replica(
         let clock_before = sim.clock();
         let next_idx = samples.len();
         let next_target = t_samples[next_idx];
+        let mut observed_next_clock: Option<Clock> = None;
         let mut crossed_counts: Result<Option<PlaneCounts>, RisSegregationError> = Ok(None);
         active_buf.clear();
 
-        let step = sim
-            .step_observing(|m, state_before, next_clock| {
-                if next_clock.cmp_f64(t_steady_start).is_gt() && clock_before.cmp_f64(t_end).is_lt()
-                {
-                    PlaneDefectTally::collect_active(cells, state_before, &mut active_buf);
-                }
-                if next_clock.cmp_f64(next_target).is_gt() {
-                    crossed_counts = PlaneCounts::from_state(m, state_before).map(Some);
-                }
-            })
-            .map_err(|source| RisSegregationError::Sim {
-                steps: sim.steps(),
-                time: sim.time(),
-                source,
-            })?;
-
-        match step {
-            Step::Fired { dt, .. } => {
-                let dt_steady =
-                    interval_overlap(clock_before, sim.clock(), dt, t_steady_start, t_end);
-                tally.update_active(&active_buf, dt_steady);
-
-                if let Some(counts) = crossed_counts? {
-                    let metrics = compute_segregation_metrics(
-                        &counts,
-                        sink_plane,
-                        config.bulk_min_distance_planes,
-                        config.lattice_a_m,
-                    )?;
-                    while samples.len() < t_samples.len()
-                        && sim.clock().cmp_f64(t_samples[samples.len()]).is_gt()
-                    {
-                        let idx = samples.len();
-                        let t_grid = t_samples[idx];
-                        samples.push(SegregationSample {
-                            dose: config.sample_doses[idx],
-                            time_s: t_grid,
-                            metrics,
-                        });
-                    }
-                    last_counts = Some(counts);
-                }
+        let step = sim.step_observing(|m, state_before, next_clock| {
+            observed_next_clock = Some(next_clock);
+            if next_clock.cmp_f64(t_steady_start).is_gt() && clock_before.cmp_f64(t_end).is_lt() {
+                tally.collect_active(state_before, &mut active_buf);
             }
-            Step::Absorbed => {
+            if next_clock.cmp_f64(next_target).is_gt() {
+                crossed_counts = PlaneCounts::from_state(m, state_before).map(Some);
+            }
+        });
+
+        let (dt_steady, boundary_clock, crossed) = match step {
+            Ok(Step::Fired { dt, .. }) => (
+                interval_overlap(clock_before, sim.clock(), dt, t_steady_start, t_end),
+                sim.clock(),
+                crossed_counts?,
+            ),
+            Ok(Step::Absorbed) => {
                 return Err(RisSegregationError::Absorbed {
                     steps: sim.steps(),
                     dose: k0 * sim.time(),
                 });
             }
+            Err(source) => {
+                if let Some(next_clock) = observed_next_clock
+                    && next_clock.cmp_f64(t_end).is_gt()
+                {
+                    let counts = match crossed_counts? {
+                        Some(c) => c,
+                        None => PlaneCounts::from_state(sim.model(), sim.state())?,
+                    };
+                    (
+                        overlap_until_end(clock_before, t_steady_start, t_end),
+                        next_clock,
+                        Some(counts),
+                    )
+                } else {
+                    return Err(RisSegregationError::Sim {
+                        steps: sim.steps(),
+                        time: sim.time(),
+                        source,
+                    });
+                }
+            }
+        };
+
+        tally.update_active(&active_buf, dt_steady);
+        if let Some(counts) = crossed {
+            let metrics = compute_segregation_metrics(
+                &counts,
+                sink_plane,
+                config.bulk_min_distance_planes,
+                config.lattice_a_m,
+            )?;
+            while samples.len() < t_samples.len()
+                && boundary_clock.cmp_f64(t_samples[samples.len()]).is_gt()
+            {
+                let idx = samples.len();
+                let t_grid = t_samples[idx];
+                samples.push(SegregationSample {
+                    dose: config.sample_doses[idx],
+                    time_s: t_grid,
+                    metrics,
+                });
+            }
+            last_counts = Some(counts);
         }
     }
 
@@ -1050,9 +1128,15 @@ pub fn summarize_ris_segregation(
     }
     let doses: Vec<f64> = first.samples.iter().map(|s| s.dose).collect();
     for r in replicas {
-        if r.samples.len() != n_samples || r.profile.d_planes.len() != nx {
+        if r.samples.len() != n_samples
+            || r.profile.d_planes.len() != nx
+            || r.profile.distance_nm.len() != nx
+            || r.profile.c_cr.len() != nx
+            || r.profile.c_v_mean.len() != nx
+            || r.profile.c_i_mean.len() != nx
+        {
             return Err(RisSegregationError::InvalidSummary(
-                "replicas have inconsistent sample or plane counts",
+                "replicas have inconsistent sample or profile lengths",
             ));
         }
         if r.samples
@@ -1067,6 +1151,16 @@ pub fn summarize_ris_segregation(
         if r.profile.d_planes != first.profile.d_planes {
             return Err(RisSegregationError::InvalidSummary(
                 "replicas have mismatched signed plane grids",
+            ));
+        }
+        if r.profile
+            .distance_nm
+            .iter()
+            .zip(&first.profile.distance_nm)
+            .any(|(a, b)| a.to_bits() != b.to_bits())
+        {
+            return Err(RisSegregationError::InvalidSummary(
+                "replicas have mismatched distance grids",
             ));
         }
     }

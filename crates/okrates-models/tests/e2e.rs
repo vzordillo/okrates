@@ -404,11 +404,25 @@ fn fecr_ris_transport_bad_args() {
     );
 }
 
-fn without_timing(text: &str) -> String {
+fn is_segregation_fit_line(line: &str) -> bool {
+    line.starts_with("phi_rel_s_cr_tot=") || line.starts_with("s_cr_tot_inf_nm=")
+}
+
+fn without_timing_and_fit(text: &str) -> String {
     text.lines()
-        .filter(|line| !line.starts_with("wall_s=") && !line.starts_with("us_per_step="))
+        .filter(|line| {
+            !line.starts_with("wall_s=")
+                && !line.starts_with("us_per_step=")
+                && !is_segregation_fit_line(line)
+        })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn segregation_fit_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|line| is_segregation_fit_line(line))
+        .collect()
 }
 
 #[test]
@@ -448,10 +462,50 @@ fn fecr_ris_segregation_small() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("wall_s="));
     assert!(stdout.contains("us_per_step="));
+    let expected = include_str!("data/fecr_ris_segregation_small.txt");
     assert_eq!(
-        without_timing(&stdout),
-        without_timing(include_str!("data/fecr_ris_segregation_small.txt"))
+        without_timing_and_fit(&stdout),
+        without_timing_and_fit(expected)
     );
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    assert_eq!(
+        segregation_fit_lines(&stdout),
+        segregation_fit_lines(expected),
+        "x86_64-linux relaxation fit output lines differ"
+    );
+    // aarch64-macos values printed by macOS CI (PR #25, run 44605084477);
+    // all 41 physics observable and counter lines match x86_64-linux bit-for-bit,
+    // while platform libm exp_m1/ln shifts the 1D golden-section SSE argmin by ~3e-8 relative.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    assert_eq!(
+        segregation_fit_lines(&stdout),
+        vec![
+            "phi_rel_s_cr_tot=1.154588383693e-3",
+            "s_cr_tot_inf_nm=1.818526045640e-2",
+        ],
+        "aarch64-macos relaxation fit output lines differ"
+    );
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "macos")
+    )))]
+    {
+        let got = segregation_fit_lines(&stdout);
+        let exp = segregation_fit_lines(expected);
+        assert_eq!(got.len(), 2, "expected 2 fit lines in {stdout}");
+        assert_eq!(exp.len(), 2);
+        for (g_line, e_line) in got.iter().zip(&exp) {
+            let (gk, gv) = g_line.split_once('=').unwrap();
+            let (ek, ev) = e_line.split_once('=').unwrap();
+            assert_eq!(gk, ek);
+            let g: f64 = gv.parse().unwrap();
+            let e: f64 = ev.parse().unwrap();
+            assert!(
+                ((g - e) / e).abs() <= 1e-6,
+                "{gk} differs beyond 1e-6 relative: got {g}, expected {e}"
+            );
+        }
+    }
 
     let ts_csv = std::fs::read_to_string(&ts_path).unwrap();
     let ts_lines: Vec<&str> = ts_csv.lines().collect();
@@ -569,4 +623,48 @@ fn fecr_ris_segregation_bad_args() {
         ]),
         usage,
     );
+
+    let same_path =
+        std::env::temp_dir().join(format!("okrates_seg_same_{}.csv", std::process::id()));
+    let _ = std::fs::remove_file(&same_path);
+    let same_arg = same_path.to_str().unwrap().to_string();
+    let eq_arg = same_path
+        .parent()
+        .unwrap()
+        .join(".")
+        .join(same_path.file_name().unwrap())
+        .to_str()
+        .unwrap()
+        .to_string();
+    for second_arg in [&same_arg, &eq_arg] {
+        let (code, stdout, stderr) = run(example("fecr_ris_segregation").args([
+            "--temperature",
+            "773",
+            "--k0",
+            "1e3",
+            "--cr-count",
+            "43",
+            "--dpa-end",
+            "2e-3",
+            "--capacity",
+            "32",
+            "--runs",
+            "2",
+            "--samples",
+            "4",
+            "--seed",
+            "7",
+            "--timeseries-out",
+            &same_arg,
+            "--profile-out",
+            second_arg,
+        ]));
+        assert_eq!(code, 1, "stderr: {stderr}");
+        assert_eq!(stdout, "");
+        assert!(
+            stderr.contains("must refer to different paths"),
+            "stderr: {stderr}"
+        );
+        assert!(!same_path.exists());
+    }
 }
