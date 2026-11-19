@@ -601,6 +601,10 @@ impl FeCrRisState {
     pub fn records(&self) -> &[Record] {
         &self.records
     }
+    /// Indices of currently non-empty defect records in `records()`.
+    pub fn active_records(&self) -> &[usize] {
+        &self.active_records
+    }
     pub fn record_at(&self, site: usize) -> Option<usize> {
         match self.site_record[site] {
             NO_RECORD => None,

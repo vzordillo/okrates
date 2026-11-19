@@ -403,3 +403,170 @@ fn fecr_ris_transport_bad_args() {
         usage,
     );
 }
+
+fn without_timing(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.starts_with("wall_s=") && !line.starts_with("us_per_step="))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn fecr_ris_segregation_small() {
+    let ts_path = std::env::temp_dir().join(format!("okrates_seg_ts_{}.csv", std::process::id()));
+    let prof_path =
+        std::env::temp_dir().join(format!("okrates_seg_prof_{}.csv", std::process::id()));
+    let ts_arg = ts_path.to_str().unwrap().to_string();
+    let prof_arg = prof_path.to_str().unwrap().to_string();
+
+    let (code, stdout, stderr) = run(example("fecr_ris_segregation").args([
+        "--temperature",
+        "773",
+        "--k0",
+        "1e3",
+        "--cr-count",
+        "43",
+        "--dpa-end",
+        "2e-3",
+        "--capacity",
+        "32",
+        "--runs",
+        "2",
+        "--samples",
+        "4",
+        "--seed",
+        "7",
+        "--cells",
+        "8",
+        "6",
+        "6",
+        "--timeseries-out",
+        &ts_arg,
+        "--profile-out",
+        &prof_arg,
+    ]));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("wall_s="));
+    assert!(stdout.contains("us_per_step="));
+    assert_eq!(
+        without_timing(&stdout),
+        without_timing(include_str!("data/fecr_ris_segregation_small.txt"))
+    );
+
+    let ts_csv = std::fs::read_to_string(&ts_path).unwrap();
+    let ts_lines: Vec<&str> = ts_csv.lines().collect();
+    assert_eq!(
+        ts_lines.first().copied(),
+        Some(
+            "dose_dpa,c_cr_gb,c_cr_gb_se,c_cr_bulk,c_cr_bulk_se,s_cr_tot_nm,s_cr_tot_nm_se,s_cr_linear_nm,s_cr_linear_nm_se"
+        )
+    );
+    assert_eq!(ts_lines.len(), 5);
+
+    let prof_csv = std::fs::read_to_string(&prof_path).unwrap();
+    let prof_lines: Vec<&str> = prof_csv.lines().collect();
+    assert_eq!(
+        prof_lines.first().copied(),
+        Some("d_planes,distance_nm,c_cr_mean,c_cr_se,c_v_mean,c_v_se,c_i_mean,c_i_se")
+    );
+    assert_eq!(prof_lines.len(), 17);
+
+    let _ = std::fs::remove_file(&ts_path);
+    let _ = std::fs::remove_file(&prof_path);
+}
+
+#[test]
+fn fecr_ris_segregation_bad_args() {
+    let usage = "usage: fecr_ris_segregation --temperature K --k0 dpa_per_s (--cr-frac f | --cr-count N) --dpa-end x --capacity P --runs R --samples K --seed S [--cells nx ny nz] [--sink-plane x] [--bulk-min-planes n] [--steady-start-dpa x] [--lattice-a m] [--max-steps N] [--timeseries-out path] [--profile-out path]";
+    assert_usage_error(&mut example("fecr_ris_segregation"), usage);
+    assert_usage_error(
+        example("fecr_ris_segregation").args([
+            "--temperature",
+            "773",
+            "--k0",
+            "1e3",
+            "--cr-frac",
+            "0.1",
+            "--cr-count",
+            "43",
+            "--dpa-end",
+            "2e-3",
+            "--capacity",
+            "32",
+            "--runs",
+            "2",
+            "--samples",
+            "4",
+            "--seed",
+            "7",
+        ]),
+        usage,
+    );
+    assert_usage_error(
+        example("fecr_ris_segregation").args([
+            "--temperature",
+            "773",
+            "--k0",
+            "1e3",
+            "--cr-frac",
+            "1.5",
+            "--dpa-end",
+            "2e-3",
+            "--capacity",
+            "32",
+            "--runs",
+            "2",
+            "--samples",
+            "4",
+            "--seed",
+            "7",
+        ]),
+        usage,
+    );
+    assert_usage_error(
+        example("fecr_ris_segregation").args([
+            "--temperature",
+            "773",
+            "--k0",
+            "1e3",
+            "--cr-count",
+            "43",
+            "--dpa-end",
+            "2e-3",
+            "--steady-start-dpa",
+            "2e-3",
+            "--capacity",
+            "32",
+            "--runs",
+            "2",
+            "--samples",
+            "4",
+            "--seed",
+            "7",
+        ]),
+        usage,
+    );
+    assert_usage_error(
+        example("fecr_ris_segregation").args([
+            "--temperature",
+            "773",
+            "--k0",
+            "1e3",
+            "--cr-count",
+            "43",
+            "--dpa-end",
+            "2e-3",
+            "--capacity",
+            "32",
+            "--runs",
+            "2",
+            "--samples",
+            "4",
+            "--seed",
+            "7",
+            "--max-steps",
+            "0",
+        ]),
+        usage,
+    );
+}
