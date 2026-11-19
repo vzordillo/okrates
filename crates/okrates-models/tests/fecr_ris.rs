@@ -1966,23 +1966,23 @@ fn t18_fast_paths_match_dense_and_wrap_boundaries() {
         .unwrap();
     assert_catalog_matches_rebuild(&sim_dense, false, "t18b init");
 
-    let mut saw_dense = false;
+    let mut saw_dense_recomb = false;
     for step in 0..80 {
         let (v, i) = sim_dense.state().defect_counts();
-        if v + i >= 128 && v >= 16 && i >= 16 {
-            saw_dense = true;
-        }
+        let before_recomb = sim_dense.state().recombined();
         sim_dense.step().unwrap();
         sim_dense
             .model()
             .check_invariants(sim_dense.state())
             .unwrap();
         assert_catalog_matches_rebuild(&sim_dense, false, &format!("t18b step {step}"));
+        if sim_dense.state().recombined() > before_recomb && v + i >= 128 && v >= 16 && i >= 16 {
+            saw_dense_recomb = true;
+        }
     }
-    assert!(saw_dense, "dense defect count regime was never active");
     assert!(
-        sim_dense.state().recombined() > 0,
-        "expected dense recombination near x=8/12"
+        saw_dense_recomb,
+        "expected recombination while active defect counts remained dense"
     );
 
     let m_outer = ris_model([8, 8, 8], 650.0, 0.0, 4, &[]);
@@ -2031,6 +2031,87 @@ fn t18_fast_paths_match_dense_and_wrap_boundaries() {
             assert!(
                 affected.contains(&slot),
                 "changed slot {slot} missing from affected_slots"
+            );
+        }
+    }
+
+    let m_d = ris_model([8, 8, 8], 650.0, 0.0, 40, &[0]);
+    let lat_d = m_d.lattice();
+    let n_d = lat_d.site_count();
+    let occ_d: Vec<Species> = (0..n_d)
+        .map(|site| {
+            if (site * 37 + 13) % 10 == 0 {
+                Species::Cr
+            } else {
+                Species::Fe
+            }
+        })
+        .collect();
+    let mut defects_d = Vec::with_capacity(34);
+    defects_d.push(Defect::Vacancy {
+        site: pos_site(&m_d, [4, 4, 4]),
+    });
+    for site in 0..n_d {
+        if defects_d.len() == 17 {
+            break;
+        }
+        if lat_d.position(site)[0] == 2 {
+            defects_d.push(Defect::Vacancy { site });
+        }
+    }
+    defects_d.push(Defect::Dumbbell {
+        site: pos_site(&m_d, [8, 4, 4]),
+        axis: 0,
+        plus: Species::Fe,
+        minus: Species::Cr,
+    });
+    for site in 0..n_d {
+        if defects_d.len() == 34 {
+            break;
+        }
+        if lat_d.position(site)[0] == 14 {
+            defects_d.push(Defect::Dumbbell {
+                site,
+                axis: 0,
+                plus: Species::Fe,
+                minus: Species::Fe,
+            });
+        }
+    }
+    assert_eq!(defects_d.len(), 34);
+    let mut s_d = m_d.state_with_defects(occ_d, &defects_d, 1).unwrap();
+    assert_eq!(s_d.defect_counts(), (17, 17));
+    let target_k = pos_site(&m_d, [7, 3, 3]);
+    let d_jump = (0..8)
+        .find(|&j| {
+            matches!(
+                m_d.jump_result(&s_d, 17, j),
+                Some((Defect::Dumbbell { site, .. }, _)) if site == target_k
+            )
+        })
+        .expect("dumbbell at [8,4,4] should have a jump to [7,3,3]");
+    let ev_d = FeCrRisEvent::DumbbellJump {
+        rec: 17,
+        jump: d_jump,
+    };
+    let before_d: Vec<u64> = (0..m_d.slot_count(&s_d))
+        .map(|slot| m_d.slot_rate(&s_d, slot).to_bits())
+        .collect();
+    m_d.apply(&mut s_d, &ev_d).unwrap();
+    m_d.check_invariants(&s_d).unwrap();
+    assert_eq!(s_d.recombined(), 1);
+    assert!(matches!(s_d.records()[0], Record::Empty));
+    assert!(matches!(s_d.records()[17], Record::Empty));
+    let after_d: Vec<u64> = (0..m_d.slot_count(&s_d))
+        .map(|slot| m_d.slot_rate(&s_d, slot).to_bits())
+        .collect();
+    let mut affected_d = Vec::new();
+    m_d.affected_slots(&s_d, &ev_d, &mut affected_d);
+    for (slot, (&b, &a)) in before_d.iter().zip(&after_d).enumerate() {
+        if b != a {
+            assert!(
+                affected_d.contains(&slot),
+                "dense recombination slot {slot} missing from affected_slots"
             );
         }
     }

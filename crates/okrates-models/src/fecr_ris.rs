@@ -61,8 +61,20 @@ pub static RC_OFFSETS: LazyLock<Vec<[i64; 3]>> = LazyLock::new(|| {
 const NO_RECORD: u32 = u32::MAX;
 
 #[inline]
-fn dot(a: [i64; 3], b: [i64; 3]) -> i64 {
+const fn dot(a: [i64; 3], b: [i64; 3]) -> i64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+const fn contains_offset(list: &[[i64; 3]], target: [i64; 3]) -> bool {
+    let mut i = 0;
+    while i < list.len() {
+        let item = list[i];
+        if item[0] == target[0] && item[1] == target[1] && item[2] == target[2] {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -73,31 +85,78 @@ struct DumbbellJumpSpec {
     jumper_is_new_plus: bool,
 }
 
-/// Precomputed Johnson 60° jump targets and orientations for `[axis][jump]`.
-static DUMBBELL_JUMPS: LazyLock<[[DumbbellJumpSpec; 8]; 6]> = LazyLock::new(|| {
-    std::array::from_fn(|axis| {
+const fn build_dumbbell_jumps() -> [[DumbbellJumpSpec; 8]; 6] {
+    let empty = DumbbellJumpSpec {
+        target_dir: 0,
+        jumper_is_plus: false,
+        new_axis: 0,
+        jumper_is_new_plus: false,
+    };
+    let mut table = [[empty; 8]; 6];
+    let mut axis = 0;
+    while axis < 6 {
         let u = AXES[axis];
-        std::array::from_fn(|jump| {
-            let (target_index, d) = DISPLACEMENTS
-                .iter()
-                .enumerate()
-                .filter(|(_, d)| dot(**d, u).abs() == 2)
-                .nth(jump / 2)
-                .expect("a dumbbell has 4 C sites");
-            let back = [-d[0], -d[1], -d[2]];
-            let new_axis = (0..6)
-                .filter(|&b| dot(back, AXES[b]).abs() == 2 && dot(u, AXES[b]).abs() == 1)
-                .nth(jump % 2)
-                .expect("a dumbbell jump has 2 new axes");
-            DumbbellJumpSpec {
+        let mut jump = 0;
+        while jump < 8 {
+            let target_want = jump / 2;
+            let mut seen_target = 0;
+            let mut target_index = 0;
+            let mut target_dir_vec = [0_i64; 3];
+            let mut found_target = false;
+            let mut i = 0;
+            while i < DISPLACEMENTS.len() {
+                let d = DISPLACEMENTS[i];
+                if dot(d, u).abs() == 2 {
+                    if seen_target == target_want {
+                        target_index = i;
+                        target_dir_vec = d;
+                        found_target = true;
+                        break;
+                    }
+                    seen_target += 1;
+                }
+                i += 1;
+            }
+            if !found_target {
+                panic!("a dumbbell has 4 C sites");
+            }
+
+            let back = [-target_dir_vec[0], -target_dir_vec[1], -target_dir_vec[2]];
+            let axis_want = jump % 2;
+            let mut seen_axis = 0;
+            let mut new_axis = 0;
+            let mut found_axis = false;
+            let mut b = 0;
+            while b < AXES.len() {
+                if dot(back, AXES[b]).abs() == 2 && dot(u, AXES[b]).abs() == 1 {
+                    if seen_axis == axis_want {
+                        new_axis = b;
+                        found_axis = true;
+                        break;
+                    }
+                    seen_axis += 1;
+                }
+                b += 1;
+            }
+            if !found_axis {
+                panic!("a dumbbell jump has 2 new axes");
+            }
+
+            table[axis][jump] = DumbbellJumpSpec {
                 target_dir: target_index as u8,
-                jumper_is_plus: dot(*d, u) > 0,
+                jumper_is_plus: dot(target_dir_vec, u) > 0,
                 new_axis: new_axis as u8,
                 jumper_is_new_plus: dot(back, AXES[new_axis]) > 0,
-            }
-        })
-    })
-});
+            };
+            jump += 1;
+        }
+        axis += 1;
+    }
+    table
+}
+
+/// Precomputed Johnson 60° jump targets and orientations for `[axis][jump]`.
+const DUMBBELL_JUMPS: [[DumbbellJumpSpec; 8]; 6] = build_dumbbell_jumps();
 
 #[inline]
 const fn dumbbell_kind(plus: Species, minus: Species) -> usize {
@@ -113,48 +172,83 @@ const fn dumbbell_kind(plus: Species, minus: Species) -> usize {
     }
 }
 
-/// Precomputed 1NN site type `t` (`0=C/CFe`, `1=T`, `2=CCr`) for `[axis][kind][dir]`.
-static DUMBBELL_SITE_TYPES: LazyLock<[[[u8; 8]; 3]; 6]> = LazyLock::new(|| {
+const fn build_dumbbell_site_types() -> [[[u8; 8]; 3]; 6] {
     let pairs = [
         (Species::Fe, Species::Fe),
         (Species::Fe, Species::Cr),
         (Species::Cr, Species::Fe),
     ];
-    std::array::from_fn(|axis| {
-        std::array::from_fn(|kind| {
+    let mut table = [[[0_u8; 8]; 3]; 6];
+    let mut axis = 0;
+    while axis < 6 {
+        let mut kind = 0;
+        while kind < 3 {
             let (plus, minus) = pairs[kind];
-            std::array::from_fn(|dir| site_type(axis, plus, minus, DISPLACEMENTS[dir]) as u8)
-        })
-    })
-});
+            let mut dir = 0;
+            while dir < 8 {
+                table[axis][kind][dir] = site_type(axis, plus, minus, DISPLACEMENTS[dir]) as u8;
+                dir += 1;
+            }
+            kind += 1;
+        }
+        axis += 1;
+    }
+    table
+}
 
-/// For jump direction `dir` (`a -> b`), the 3 `1NN(a) ∩ 2NN(b)` and 3 `2NN(a) ∩ 1NN(b)` indices.
-static SADDLE_SITE_INDICES: LazyLock<[([u8; 3], [u8; 3]); 8]> = LazyLock::new(|| {
-    std::array::from_fn(|dir| {
+/// Precomputed 1NN site type `t` (`0=C/CFe`, `1=T`, `2=CCr`) for `[axis][kind][dir]`.
+const DUMBBELL_SITE_TYPES: [[[u8; 8]; 3]; 6] = build_dumbbell_site_types();
+
+const fn build_saddle_site_indices() -> [([u8; 3], [u8; 3]); 8] {
+    let mut table = [([0_u8; 3], [0_u8; 3]); 8];
+    let mut dir = 0;
+    while dir < 8 {
         let d = DISPLACEMENTS[dir];
         let mut nb = [0_u8; 3];
         let mut n_nb = 0;
-        for (i, u) in DISPLACEMENTS.iter().enumerate() {
+        let mut i = 0;
+        while i < DISPLACEMENTS.len() {
+            let u = DISPLACEMENTS[i];
             let diff = [u[0] - d[0], u[1] - d[1], u[2] - d[2]];
-            if SECOND_DISPLACEMENTS.contains(&diff) {
+            if contains_offset(&SECOND_DISPLACEMENTS, diff) {
+                if n_nb >= 3 {
+                    panic!("each 1NN jump has 3 1NN-of-a saddle sites");
+                }
                 nb[n_nb] = i as u8;
                 n_nb += 1;
             }
+            i += 1;
         }
-        assert_eq!(n_nb, 3, "each 1NN jump has 3 1NN-of-a saddle sites");
+        if n_nb != 3 {
+            panic!("each 1NN jump has 3 1NN-of-a saddle sites");
+        }
+
         let mut sn = [0_u8; 3];
         let mut n_sn = 0;
-        for (j, s) in SECOND_DISPLACEMENTS.iter().enumerate() {
+        let mut j = 0;
+        while j < SECOND_DISPLACEMENTS.len() {
+            let s = SECOND_DISPLACEMENTS[j];
             let diff = [s[0] - d[0], s[1] - d[1], s[2] - d[2]];
-            if DISPLACEMENTS.contains(&diff) {
+            if contains_offset(&DISPLACEMENTS, diff) {
+                if n_sn >= 3 {
+                    panic!("each 1NN jump has 3 2NN-of-a saddle sites");
+                }
                 sn[n_sn] = j as u8;
                 n_sn += 1;
             }
+            j += 1;
         }
-        assert_eq!(n_sn, 3, "each 1NN jump has 3 2NN-of-a saddle sites");
-        (nb, sn)
-    })
-});
+        if n_sn != 3 {
+            panic!("each 1NN jump has 3 2NN-of-a saddle sites");
+        }
+        table[dir] = (nb, sn);
+        dir += 1;
+    }
+    table
+}
+
+/// For jump direction `dir` (`a -> b`), the 3 `1NN(a) ∩ 2NN(b)` and 3 `2NN(a) ∩ 1NN(b)` indices.
+const SADDLE_SITE_INDICES: [([u8; 3], [u8; 3]); 8] = build_saddle_site_indices();
 
 /// Parameters of the dumbbell energetics, in eV (and s⁻¹, k_B for the rates).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -651,13 +745,12 @@ impl FeCrRisState {
         let pos = self.active_pos[rec];
         debug_assert_ne!(pos, NO_RECORD);
         let idx = pos as usize;
-        let last = self
-            .active_records
-            .pop()
-            .expect("active_records cannot be empty when deactivating");
         if idx < self.active_records.len() {
-            self.active_records[idx] = last;
-            self.active_pos[last] = idx as u32;
+            self.active_records.swap_remove(idx);
+            if idx < self.active_records.len() {
+                let moved = self.active_records[idx];
+                self.active_pos[moved] = idx as u32;
+            }
         }
         self.active_pos[rec] = NO_RECORD;
     }
@@ -695,6 +788,9 @@ impl FeCrRisState {
             }
         }
         let mut active_records = Vec::new();
+        active_records
+            .try_reserve_exact(records.len())
+            .map_err(|_| FeCrRisError::Parameter("state allocation exceeds memory limit"))?;
         for (rec, &r) in records.iter().enumerate() {
             if !matches!(r, Record::Empty) {
                 active_pos[rec] = active_records.len() as u32;
@@ -885,16 +981,21 @@ fn dumbbell_type(plus: Species, minus: Species) -> usize {
 }
 
 /// Site type t for the neighbour offset `d` of a dumbbell: 0 C (CFe), 1 T, 2 CCr.
-fn site_type(axis: usize, plus: Species, minus: Species, d: [i64; 3]) -> usize {
+const fn site_type(axis: usize, plus: Species, minus: Species, d: [i64; 3]) -> usize {
     let along = dot(d, AXES[axis]);
     if along == 0 {
         return 1;
     }
-    if plus == minus {
+    if matches!(
+        (plus, minus),
+        (Species::Fe, Species::Fe)
+            | (Species::Cr, Species::Cr)
+            | (Species::Vacancy, Species::Vacancy)
+    ) {
         return 0;
     }
     let facing = if along > 0 { plus } else { minus };
-    if facing == Species::Fe { 0 } else { 2 }
+    if matches!(facing, Species::Fe) { 0 } else { 2 }
 }
 
 /// A jump, resolved: the sites, species and the new defect.
@@ -2248,26 +2349,26 @@ impl FeCrRis {
         rec: usize,
         mut undo: Option<&mut FeCrRisUndo>,
     ) -> bool {
-        let (site, is_dumbbell, opposite_count) = match s.records[rec] {
+        let (site, is_dumbbell) = match s.records[rec] {
             Record::Empty => return false,
             Record::Vacancy { site } => {
                 if s.live_dumbbells == 0 {
                     return false;
                 }
-                (site, false, s.live_dumbbells)
+                (site, false)
             }
             Record::Dumbbell { site, .. } => {
                 if s.live_vacancies == 0 {
                     return false;
                 }
-                (site, true, s.live_vacancies)
+                (site, true)
             }
         };
         let pos = self.lattice.position(site);
         let [lx, ly, lz] = self.lattice.cells();
         let m = [2 * lx as i64, 2 * ly as i64, 2 * lz as i64];
         let mut best: Option<(i64, usize, [i64; 3])> = None;
-        if opposite_count < 16 {
+        if s.active_records.len() < 16 {
             for &r in &s.active_records {
                 let other_site = match (s.records[r], is_dumbbell) {
                     (Record::Vacancy { site: vs }, true) => vs,
@@ -2373,6 +2474,9 @@ impl FeCrRis {
                 defects: s.open_records() as usize,
             });
         };
+        s.active_records
+            .try_reserve(2)
+            .map_err(|_| FeCrRisError::Parameter("state allocation exceeds memory limit"))?;
         let n = self.lattice.site_count();
         let draw = |rng: &mut ChaCha12Rng, m: usize| ((open01(rng) * m as f64) as usize).min(m - 1);
         let mut rng = s.creation_rng.clone();
@@ -3325,19 +3429,16 @@ mod tests {
             (Species::Fe, Species::Cr),
             (Species::Cr, Species::Fe),
         ];
-        for axis in 0..6 {
+        for (axis, by_kind) in DUMBBELL_SITE_TYPES.iter().enumerate() {
             for (kind, &(plus, minus)) in pairs.iter().enumerate() {
                 for (dir, &d) in DISPLACEMENTS.iter().enumerate() {
-                    assert_eq!(
-                        DUMBBELL_SITE_TYPES[axis][kind][dir] as usize,
-                        site_type(axis, plus, minus, d)
-                    );
+                    assert_eq!(by_kind[kind][dir] as usize, site_type(axis, plus, minus, d));
                 }
             }
         }
 
         let lat = BccLattice::new([6, 6, 6]).unwrap();
-        for dir in 0..8 {
+        for (dir, &(nb_idx, sn_idx)) in SADDLE_SITE_INDICES.iter().enumerate() {
             let b = lat.neighbor(0, dir);
             let nb0 = lat.neighbors(0);
             let sn0 = lat.second_neighbors(0);
@@ -3353,7 +3454,6 @@ mod tests {
                 .filter(|&(_, &s)| lat.neighbors(b).contains(&s))
                 .map(|(i, _)| i as u8)
                 .collect();
-            let (nb_idx, sn_idx) = SADDLE_SITE_INDICES[dir];
             assert_eq!(nb_idx.to_vec(), expected_nb);
             assert_eq!(sn_idx.to_vec(), expected_sn);
         }
@@ -3444,16 +3544,46 @@ mod tests {
         .unwrap();
         assert_eq!(s_apply.floored_dumbbell_jumps(), 1);
 
-        for j in 0..8 {
-            let _ = m1.rate(&s, 0, j);
-        }
+        let (j_ver, gap_pre, gap_post) = (0..8)
+            .find_map(|j| {
+                let raw_pre = m1.raw_barrier(&s_clean, 0, j);
+                let gap_pre = raw_pre - m1.energy_change(&s_clean, 0, j).max(0.0);
+                let mut s_next = s_clean.clone();
+                m1.apply_reversible(&mut s_next, &FeCrRisEvent::DumbbellJump { rec: 0, jump: j })
+                    .ok()?;
+                let raw_post = m1.raw_barrier(&s_next, 0, j);
+                let gap_post = raw_post - m1.energy_change(&s_next, 0, j).max(0.0);
+                (raw_pre.to_bits() != raw_post.to_bits() && (gap_pre - gap_post).abs() > 1e-6)
+                    .then_some((j, gap_pre, gap_post))
+            })
+            .expect("expected a jump where raw_barrier and floor margin change");
+
+        let _ = m1.rate(&s, 0, j_ver);
         let undo = m1
-            .apply_reversible(&mut s, &FeCrRisEvent::DumbbellJump { rec: 0, jump: 0 })
+            .apply_reversible(
+                &mut s,
+                &FeCrRisEvent::DumbbellJump {
+                    rec: 0,
+                    jump: j_ver,
+                },
+            )
             .unwrap();
         let mut encoded = Vec::new();
         m1.encode_state(&s, &mut encoded);
         let s_decoded = m1.decode_state(&encoded).unwrap();
+        let mut query_order = [j_ver; 8];
+        let mut idx = 1;
         for j in 0..8 {
+            if j != j_ver {
+                query_order[idx] = j;
+                idx += 1;
+            }
+        }
+        assert_ne!(
+            m1.raw_barrier(&s, 0, j_ver).to_bits(),
+            m1.raw_barrier(&s_clean, 0, j_ver).to_bits()
+        );
+        for j in query_order {
             assert_eq!(
                 m1.raw_barrier(&s, 0, j).to_bits(),
                 m1.raw_barrier(&s_decoded, 0, j).to_bits()
@@ -3468,8 +3598,9 @@ mod tests {
             );
         }
 
+        let _ = m1.rate(&s, 0, j_ver);
         m1.undo(&mut s, undo);
-        for j in 0..8 {
+        for j in query_order {
             assert_eq!(
                 m1.raw_barrier(&s, 0, j).to_bits(),
                 m1.raw_barrier(&s_clean, 0, j).to_bits()
@@ -3483,5 +3614,27 @@ mod tests {
                 m1.rate(&s_clean, 0, j).to_bits()
             );
         }
+
+        let m_mid = m1
+            .clone()
+            .with_dumbbell_saddle_shift(-0.5 * (gap_pre + gap_post) / 8.0);
+        let mut s_f = s_clean.clone();
+        let _ = m_mid.rate(&s_f, 0, j_ver);
+        let ev_ver = FeCrRisEvent::DumbbellJump {
+            rec: 0,
+            jump: j_ver,
+        };
+        m_mid.apply_reversible(&mut s_f, &ev_ver).unwrap();
+        let mut cold_bytes = Vec::new();
+        m_mid.encode_state(&s_f, &mut cold_bytes);
+        let mut s_cold = m_mid.decode_state(&cold_bytes).unwrap();
+        let before_cold = s_f.floored_dumbbell_jumps();
+        m_mid.apply_reversible(&mut s_f, &ev_ver).unwrap();
+        m_mid.apply_reversible(&mut s_cold, &ev_ver).unwrap();
+        assert_eq!(
+            s_f.floored_dumbbell_jumps() - before_cold,
+            s_cold.floored_dumbbell_jumps()
+        );
+        assert_eq!(s_f.floored_dumbbell_jumps(), 1);
     }
 }
