@@ -37,37 +37,40 @@ Runs are reproducible in a strict sense. Every replica and every purpose (dynami
 A kinetic Monte Carlo code has two parts that change for different reasons. The physics, meaning which states exist, which transitions are possible and how fast they happen, changes with every material and mechanism. The algorithm, meaning how an event is chosen, how time advances and how the event list stays current, is the same for all of them. okrates keeps the two apart: a model describes physics only, and the engine owns selection, time, randomness and checkpoints. A new mechanism means writing a new model, and the engine's guarantees come with it.
 
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "18px"}, "flowchart": {"nodeSpacing": 24, "rankSpacing": 50, "padding": 10}}}%%
+%%{init: {"flowchart": {"nodeSpacing": 18, "rankSpacing": 34, "padding": 8, "curve": "basis"}, "themeVariables": {"fontSize": "15px"}}}%%
 flowchart LR
-    lang(["🐍 Python<br>🦀 Rust"])
-    subgraph model["Your model"]
+    subgraph phys["Physics · per material"]
         direction TB
-        states["States"]
-        moves["Transitions"]
-        rates["Rates"]
+        builtin("Built-in models<br/>vacancy · Fe–Cr · RIS")
+        tables("Tabulated DFT barriers<br/>NEB adapters · balance checks")
+        custom("Custom model<br/>any state space")
     end
-    subgraph engine["okrates engine"]
+    seam("Model trait seam<br/>rates · apply · undo")
+    subgraph core["Core engine · shared by every model"]
         direction TB
-        pick{{"Event selection"}}
-        clock{{"Clock"}}
-        rng{{"Random streams"}}
-        ckpt{{"Checkpoints"}}
+        direct("DirectCatalog<br/>O(M) per step")
+        sumtree("SumTreeCatalog<br/>O(k log M) per step")
+        engine("Transactional BKL step<br/>ChaCha12 streams · TwoSum clock")
     end
-    subgraph out["Results"]
+    subgraph out["Outputs"]
         direction TB
-        traj[/"Trajectories"/]
-        transport[/"Transport"/]
-        prov[/"Provenance"/]
+        ens("Ensembles & estimators<br/>D*, D_v, jackknife f")
+        ckpt("Exact checkpoints<br/>bit-for-bit resume")
+        prov("RunManifest<br/>SHA-256 provenance")
     end
-    lang -.-> model ==> engine ==> out
-    classDef lang fill:#d95926,stroke:#8f3a18,color:#ffffff
-    classDef model fill:#2a78d6,stroke:#1b4f8f,color:#ffffff
-    classDef engine fill:#7a52c7,stroke:#4d3285,color:#ffffff
-    classDef result fill:#1f9e78,stroke:#13664d,color:#ffffff
-    class lang lang
-    class states,moves,rates model
-    class pick,clock,rng,ckpt engine
-    class traj,transport,prov result
+    api(["Rust crates &<br/>typed Python"])
+    phys --> seam --> core --> out --> api
+    classDef physNode fill:#1f4e79,stroke:#2a78d6,stroke-width:1.5px,color:#ffffff
+    classDef seamNode fill:#8c3b1a,stroke:#d95926,stroke-width:1.8px,color:#ffffff
+    classDef coreNode fill:#2b303b,stroke:#787880,stroke-width:1.5px,color:#ffffff
+    classDef outNode fill:#1b5245,stroke:#2a9d7c,stroke-width:1.5px,color:#ffffff
+    class builtin,tables,custom physNode
+    class seam seamNode
+    class direct,sumtree,engine coreNode
+    class ens,ckpt,prov,api outNode
+    style phys fill:none,stroke:#2a78d6,stroke-width:1.2px,stroke-dasharray: 5 3
+    style core fill:none,stroke:#787880,stroke-width:1.2px,stroke-dasharray: 5 3
+    style out fill:none,stroke:#2a9d7c,stroke-width:1.2px,stroke-dasharray: 5 3
 ```
 
 ## How a step works
@@ -75,22 +78,30 @@ flowchart LR
 With rates r₁ … r_M of the possible events and total rate R = Σ rᵢ, one step draws two uniform random numbers u₁ and u₂ in (0, 1). The first selects event i as the smallest index with u₁·R < r₁ + … + rᵢ. The second gives the waiting time Δt = −ln(u₂)/R. The event is applied and only the rates it changed are updated. If R = 0, nothing can happen and the run stops without drawing. A step either completes fully or leaves the simulation exactly as it was.
 
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "18px"}, "flowchart": {"nodeSpacing": 24, "rankSpacing": 50, "padding": 10}}}%%
+%%{init: {"flowchart": {"nodeSpacing": 18, "rankSpacing": 34, "padding": 8, "curve": "basis"}, "themeVariables": {"fontSize": "15px"}}}%%
 flowchart LR
-    s1["<b>1 · List events</b><br>each with its rate"]
-    s2{{"<b>2 · Pick one</b><br>faster = likelier"}}
-    s3["<b>3 · Advance clock</b><br>random waiting time"]
-    s4["<b>4 · Apply it</b><br>update changed rates"]
-    rest(["At rest:<br>no events left"])
-    s1 --> s2 --> s3 --> s4
-    s4 -->|"repeat"| s1
-    s1 -.->|"none possible"| rest
-    classDef step fill:#2a78d6,stroke:#1b4f8f,color:#ffffff
-    classDef key fill:#7a52c7,stroke:#4d3285,color:#ffffff
-    classDef rest fill:#787880,stroke:#4a4a50,color:#ffffff
-    class s1,s3,s4 step
-    class s2 key
-    class rest rest
+    prep("1 · Rates r₁ … r_M<br/>total R = Σ rᵢ")
+    zero{"R = 0 ?"}
+    pick("2 · Select event<br/>first i with Σ rⱼ > u₁R")
+    wait("3 · Wait<br/>Δt = −ln(u₂) / R")
+    apply("4 · Apply & update<br/>changed rates only")
+    fired(["Step::Fired<br/>commit"])
+    absorbed(["Step::Absorbed<br/>no draw"])
+    rollback(["Error<br/>atomic rollback"])
+    prep --> zero
+    zero -->|"no"| pick --> wait --> apply
+    apply -->|"ok"| fired
+    fired -.->|"next step"| prep
+    zero -->|"yes"| absorbed
+    apply -.->|"err"| rollback
+    classDef stepNode fill:#1f4e79,stroke:#2a78d6,stroke-width:1.5px,color:#ffffff
+    classDef gateNode fill:#8c3b1a,stroke:#d95926,stroke-width:1.8px,color:#ffffff
+    classDef okNode fill:#1b5245,stroke:#2a9d7c,stroke-width:1.5px,color:#ffffff
+    classDef stopNode fill:#2b303b,stroke:#787880,stroke-width:1.5px,color:#ffffff
+    class prep,pick,wait,apply stepNode
+    class zero gateNode
+    class fired okNode
+    class absorbed,rollback stopNode
 ```
 
 ## Getting started
