@@ -37,46 +37,37 @@ Runs are reproducible in a strict sense. Every replica and every purpose (dynami
 A kinetic Monte Carlo code has two parts that change for different reasons. The physics, meaning which states exist, which transitions are possible and how fast they happen, changes with every material and mechanism. The algorithm, meaning how an event is chosen, how time advances and how the event list stays current, is the same for all of them. okrates keeps the two apart: a model describes physics only, and the engine owns selection, time, randomness and checkpoints. A new mechanism means writing a new model, and the engine's guarantees come with it.
 
 ```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 24, "rankSpacing": 38, "padding": 12, "curve": "basis"}, "themeVariables": {"fontSize": "14px"}}}%%
-flowchart TB
-    subgraph phys["Physics layer — changes with material and mechanism"]
-        builtin("Built-in models · okrates-models<br/>BCC vacancy · Fe–Cr (Martínez 2012, KRA) · RIS")
-        tables("Tabulated barriers · okrates-schema<br/>DFT NEB JSON adapters · detailed-balance checks")
-        custom("Custom model · Rust<br/>any state space, lattice or reaction network")
+%%{init: {"flowchart": {"nodeSpacing": 18, "rankSpacing": 34, "padding": 8, "curve": "basis"}, "themeVariables": {"fontSize": "15px"}}}%%
+flowchart LR
+    subgraph phys["Physics · per material"]
+        direction TB
+        builtin("Built-in models<br/>vacancy · Fe–Cr · RIS")
+        tables("Tabulated DFT barriers<br/>NEB adapters · balance checks")
+        custom("Custom model<br/>any state space")
     end
-
-    seam("Model & IncrementalModel trait seam<br/>candidate rates · reversible apply · local affected slots")
-
-    subgraph core["Core engine · okrates-core — verified once, shared by every model"]
-        direct("DirectCatalog · O(M) per step<br/>full rate rebuild and linear scan")
-        sumtree("SumTreeCatalog · O(k log M) per step<br/>local slot updates and binary sum tree")
-        engine("Transactional BKL stepper<br/>ChaCha12 StreamRole RNG · TwoSum Clock · atomic rollback")
+    seam("Model trait seam<br/>rates · apply · undo")
+    subgraph core["Core engine · shared by every model"]
+        direction TB
+        direct("DirectCatalog<br/>O(M) per step")
+        sumtree("SumTreeCatalog<br/>O(k log M) per step")
+        engine("Transactional BKL step<br/>ChaCha12 streams · TwoSum clock")
     end
-
-    subgraph out["Execution, provenance and interfaces"]
-        ens("Parallel ensembles & estimators<br/>SampleGrid · D*, D_v, Onsager Λ, jackknife f")
-        ckpt("Exact checkpoints · schema v2<br/>bit-for-bit state, clock and RNG resume")
-        prov("RunManifest provenance · okrates-schema<br/>SHA-256 of parameters, barriers and checkpoints")
+    subgraph out["Outputs"]
+        direction TB
+        ens("Ensembles & estimators<br/>D*, D_v, jackknife f")
+        ckpt("Exact checkpoints<br/>bit-for-bit resume")
+        prov("RunManifest<br/>SHA-256 provenance")
     end
-
-    api(["Rust crates & typed Python bindings · okrates-python"])
-
-    builtin & tables & custom --> seam
-    seam --> direct & sumtree
-    direct & sumtree --> engine
-    engine --> ens & ckpt & prov
-    ens & ckpt & prov --> api
-
+    api(["Rust crates &<br/>typed Python"])
+    phys --> seam --> core --> out --> api
     classDef physNode fill:#1f4e79,stroke:#2a78d6,stroke-width:1.5px,color:#ffffff
     classDef seamNode fill:#8c3b1a,stroke:#d95926,stroke-width:1.8px,color:#ffffff
     classDef coreNode fill:#2b303b,stroke:#787880,stroke-width:1.5px,color:#ffffff
     classDef outNode fill:#1b5245,stroke:#2a9d7c,stroke-width:1.5px,color:#ffffff
-
     class builtin,tables,custom physNode
     class seam seamNode
     class direct,sumtree,engine coreNode
     class ens,ckpt,prov,api outNode
-
     style phys fill:none,stroke:#2a78d6,stroke-width:1.2px,stroke-dasharray: 5 3
     style core fill:none,stroke:#787880,stroke-width:1.2px,stroke-dasharray: 5 3
     style out fill:none,stroke:#2a9d7c,stroke-width:1.2px,stroke-dasharray: 5 3
@@ -87,30 +78,26 @@ flowchart TB
 With rates r₁ … r_M of the possible events and total rate R = Σ rᵢ, one step draws two uniform random numbers u₁ and u₂ in (0, 1). The first selects event i as the smallest index with u₁·R < r₁ + … + rᵢ. The second gives the waiting time Δt = −ln(u₂)/R. The event is applied and only the rates it changed are updated. If R = 0, nothing can happen and the run stops without drawing. A step either completes fully or leaves the simulation exactly as it was.
 
 ```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 28, "rankSpacing": 36, "padding": 12, "curve": "basis"}, "themeVariables": {"fontSize": "14px"}}}%%
-flowchart TB
-    prep("1. Prepare active rates r₁ … r_M<br/>validate finite rᵢ ≥ 0 · total rate R = Σ rᵢ")
-    zero{"R == 0 ?"}
-    absorbed(["Step::Absorbed<br/>stop · no RNG draw · clock unchanged"])
-    pick("2. Select event with u₁ ∈ (0, 1)<br/>Direct: first i with Σ rⱼ > u₁·R · SumTree: O(log M) descent")
-    wait("3. Draw waiting time with u₂ ∈ (0, 1)<br/>Δt = −ln(u₂) / R · validate TwoSum clock t + Δt")
-    apply("4. Apply transition & update rates<br/>Direct rebuild O(M) · SumTree affected_slots O(k log M)")
-    fired(["Step::Fired { event, dt }<br/>commit state, catalog, clock, RNG and step count"])
-    rollback(["Transactional rollback on Err<br/>undo state and tree · clock, RNG and steps unchanged"])
-
+%%{init: {"flowchart": {"nodeSpacing": 18, "rankSpacing": 34, "padding": 8, "curve": "basis"}, "themeVariables": {"fontSize": "15px"}}}%%
+flowchart LR
+    prep("1 · Rates r₁ … r_M<br/>total R = Σ rᵢ")
+    zero{"R = 0 ?"}
+    pick("2 · Select event<br/>first i with Σ rⱼ > u₁R")
+    wait("3 · Wait<br/>Δt = −ln(u₂) / R")
+    apply("4 · Apply & update<br/>changed rates only")
+    fired(["Step::Fired<br/>commit"])
+    absorbed(["Step::Absorbed<br/>no draw"])
+    rollback(["Error<br/>atomic rollback"])
     prep --> zero
-    zero -->|"Yes"| absorbed
-    zero -->|"No (R > 0)"| pick
-    pick --> wait --> apply
-    apply -->|"Ok"| fired
-    fired -->|"next step"| prep
-    apply -.->|"Err"| rollback
-
+    zero -->|"no"| pick --> wait --> apply
+    apply -->|"ok"| fired
+    fired -.->|"next step"| prep
+    zero -->|"yes"| absorbed
+    apply -.->|"err"| rollback
     classDef stepNode fill:#1f4e79,stroke:#2a78d6,stroke-width:1.5px,color:#ffffff
     classDef gateNode fill:#8c3b1a,stroke:#d95926,stroke-width:1.8px,color:#ffffff
     classDef okNode fill:#1b5245,stroke:#2a9d7c,stroke-width:1.5px,color:#ffffff
     classDef stopNode fill:#2b303b,stroke:#787880,stroke-width:1.5px,color:#ffffff
-
     class prep,pick,wait,apply stepNode
     class zero gateNode
     class fired okNode
