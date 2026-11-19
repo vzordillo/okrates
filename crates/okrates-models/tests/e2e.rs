@@ -403,3 +403,315 @@ fn fecr_ris_transport_bad_args() {
         usage,
     );
 }
+
+fn is_segregation_fit_line(line: &str) -> bool {
+    line.starts_with("phi_rel_s_cr_tot=") || line.starts_with("s_cr_tot_inf_nm=")
+}
+
+fn without_timing_and_fit(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            !line.starts_with("wall_s=")
+                && !line.starts_with("us_per_step=")
+                && !is_segregation_fit_line(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn segregation_fit_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|line| is_segregation_fit_line(line))
+        .collect()
+}
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(prefix: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        for _ in 0..1024 {
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("{prefix}_{pid}_{nanos}_{seq}"));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Self(dir),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => panic!("failed to create temp dir {}: {err}", dir.display()),
+            }
+        }
+        panic!("exhausted temp dir attempts for prefix {prefix}");
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn fecr_ris_segregation_small() {
+    let tmp = TempDir::new("okrates_seg_small");
+    let ts_path = tmp.path().join("ts.csv");
+    let prof_path = tmp.path().join("prof.csv");
+    let ts_arg = ts_path.to_str().unwrap().to_string();
+    let prof_arg = prof_path.to_str().unwrap().to_string();
+
+    let (code, stdout, stderr) = run(example("fecr_ris_segregation").args([
+        "--temperature",
+        "773",
+        "--k0",
+        "1e3",
+        "--cr-count",
+        "43",
+        "--dpa-end",
+        "2e-3",
+        "--capacity",
+        "32",
+        "--runs",
+        "2",
+        "--samples",
+        "4",
+        "--seed",
+        "7",
+        "--cells",
+        "8",
+        "6",
+        "6",
+        "--timeseries-out",
+        &ts_arg,
+        "--profile-out",
+        &prof_arg,
+    ]));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("wall_s="));
+    assert!(stdout.contains("us_per_step="));
+    let expected = include_str!("data/fecr_ris_segregation_small.txt");
+    assert_eq!(
+        without_timing_and_fit(&stdout),
+        without_timing_and_fit(expected)
+    );
+    // All 41 simulation observable and counter lines match bit-for-bit above; the two post-hoc
+    // golden-section exponential fit values depend on platform libm exp_m1/ln rounding (~3e-8
+    // relative delta observed across targets), so check keys and 1e-6 relative tolerance.
+    let got = segregation_fit_lines(&stdout);
+    let exp = segregation_fit_lines(expected);
+    assert_eq!(got.len(), 2, "expected 2 fit lines in {stdout}");
+    assert_eq!(exp.len(), 2);
+    for (g_line, e_line) in got.iter().zip(&exp) {
+        let (gk, gv) = g_line.split_once('=').unwrap();
+        let (ek, ev) = e_line.split_once('=').unwrap();
+        assert_eq!(gk, ek);
+        let g: f64 = gv.parse().unwrap();
+        let e: f64 = ev.parse().unwrap();
+        assert!(
+            ((g - e) / e).abs() <= 1e-6,
+            "{gk} differs beyond 1e-6 relative: got {g}, expected {e}"
+        );
+    }
+
+    let ts_csv = std::fs::read_to_string(&ts_path).unwrap();
+    let ts_lines: Vec<&str> = ts_csv.lines().collect();
+    assert_eq!(
+        ts_lines.first().copied(),
+        Some(
+            "dose_dpa,c_cr_gb,c_cr_gb_se,c_cr_bulk,c_cr_bulk_se,s_cr_tot_nm,s_cr_tot_nm_se,s_cr_linear_nm,s_cr_linear_nm_se"
+        )
+    );
+    assert_eq!(ts_lines.len(), 5);
+
+    let prof_csv = std::fs::read_to_string(&prof_path).unwrap();
+    let prof_lines: Vec<&str> = prof_csv.lines().collect();
+    assert_eq!(
+        prof_lines.first().copied(),
+        Some("d_planes,distance_nm,c_cr_mean,c_cr_se,c_v_mean,c_v_se,c_i_mean,c_i_se")
+    );
+    assert_eq!(prof_lines.len(), 17);
+}
+
+#[test]
+fn fecr_ris_segregation_bad_args() {
+    let usage = "usage: fecr_ris_segregation --temperature K --k0 dpa_per_s (--cr-frac f | --cr-count N) --dpa-end x --capacity P --runs R --samples K --seed S [--cells nx ny nz] [--sink-plane x] [--bulk-min-planes n] [--steady-start-dpa x] [--lattice-a m] [--max-steps N] [--timeseries-out path] [--profile-out path]";
+    assert_usage_error(&mut example("fecr_ris_segregation"), usage);
+    assert_usage_error(
+        example("fecr_ris_segregation").args([
+            "--temperature",
+            "773",
+            "--k0",
+            "1e3",
+            "--cr-frac",
+            "0.1",
+            "--cr-count",
+            "43",
+            "--dpa-end",
+            "2e-3",
+            "--capacity",
+            "32",
+            "--runs",
+            "2",
+            "--samples",
+            "4",
+            "--seed",
+            "7",
+        ]),
+        usage,
+    );
+    assert_usage_error(
+        example("fecr_ris_segregation").args([
+            "--temperature",
+            "773",
+            "--k0",
+            "1e3",
+            "--cr-frac",
+            "1.5",
+            "--dpa-end",
+            "2e-3",
+            "--capacity",
+            "32",
+            "--runs",
+            "2",
+            "--samples",
+            "4",
+            "--seed",
+            "7",
+        ]),
+        usage,
+    );
+    assert_usage_error(
+        example("fecr_ris_segregation").args([
+            "--temperature",
+            "773",
+            "--k0",
+            "1e3",
+            "--cr-count",
+            "43",
+            "--dpa-end",
+            "2e-3",
+            "--steady-start-dpa",
+            "2e-3",
+            "--capacity",
+            "32",
+            "--runs",
+            "2",
+            "--samples",
+            "4",
+            "--seed",
+            "7",
+        ]),
+        usage,
+    );
+    assert_usage_error(
+        example("fecr_ris_segregation").args([
+            "--temperature",
+            "773",
+            "--k0",
+            "1e3",
+            "--cr-count",
+            "43",
+            "--dpa-end",
+            "2e-3",
+            "--capacity",
+            "32",
+            "--runs",
+            "2",
+            "--samples",
+            "4",
+            "--seed",
+            "7",
+            "--max-steps",
+            "0",
+        ]),
+        usage,
+    );
+
+    let tmp = TempDir::new("okrates_seg_bad_args");
+    let same_path = tmp.path().join("same.csv");
+    let sub_dir = tmp.path().join("sub");
+    std::fs::create_dir(&sub_dir).unwrap();
+    let same_arg = same_path.to_str().unwrap().to_string();
+    let eq_arg = sub_dir
+        .join("..")
+        .join("same.csv")
+        .to_str()
+        .unwrap()
+        .to_string();
+    for second_arg in [&same_arg, &eq_arg] {
+        let (code, stdout, stderr) = run(example("fecr_ris_segregation").args([
+            "--temperature",
+            "773",
+            "--k0",
+            "1e3",
+            "--cr-count",
+            "43",
+            "--dpa-end",
+            "2e-3",
+            "--capacity",
+            "32",
+            "--runs",
+            "2",
+            "--samples",
+            "4",
+            "--seed",
+            "7",
+            "--timeseries-out",
+            &same_arg,
+            "--profile-out",
+            second_arg,
+        ]));
+        assert_eq!(code, 1, "stderr: {stderr}");
+        assert_eq!(stdout, "");
+        assert!(
+            stderr.contains("must refer to different paths"),
+            "stderr: {stderr}"
+        );
+        assert!(!same_path.exists());
+    }
+    #[cfg(unix)]
+    {
+        let hl_a = tmp.path().join("hla.csv");
+        let hl_b = tmp.path().join("hlb.csv");
+        std::fs::write(&hl_a, "keep\n").unwrap();
+        std::fs::hard_link(&hl_a, &hl_b).unwrap();
+        let (code, stdout, stderr) = run(example("fecr_ris_segregation").args([
+            "--temperature",
+            "773",
+            "--k0",
+            "1e3",
+            "--cr-count",
+            "43",
+            "--dpa-end",
+            "2e-3",
+            "--capacity",
+            "32",
+            "--runs",
+            "2",
+            "--samples",
+            "4",
+            "--seed",
+            "7",
+            "--timeseries-out",
+            hl_a.to_str().unwrap(),
+            "--profile-out",
+            hl_b.to_str().unwrap(),
+        ]));
+        assert_eq!(code, 1, "stderr: {stderr}");
+        assert_eq!(stdout, "");
+        assert!(
+            stderr.contains("must refer to different paths"),
+            "stderr: {stderr}"
+        );
+        assert_eq!(std::fs::read_to_string(&hl_a).unwrap(), "keep\n");
+    }
+}
