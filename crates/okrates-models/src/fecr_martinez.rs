@@ -217,6 +217,7 @@ pub struct Martinez2012 {
     g_aa: [f64; 2],
     g_av: [f64; 2],
     omega_scale: f64,
+    fe_cr_bond_table: [f64; 61],
     policy: BarrierFloorPolicy,
     floor_activations: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -273,13 +274,20 @@ impl Martinez2012 {
             (DHF_V_FE - t * k * DSF_V_FE) / 11.0 + g_aa[0] / 2.0,
             (DHF_V_CR - t * k * DSF_V_CR) / 11.0 + g_aa[1] / 2.0,
         ];
+        let omega_scale = (1.0 - t / THETA_K) / 11.0;
+        let mid_aa = 0.5 * (g_aa[0] + g_aa[1]);
+        let fe_cr_bond_table = std::array::from_fn(|n_sum| {
+            let x = f64::from(n_sum as u32) / LOCAL_DENOMINATOR;
+            mid_aa - omega(x) * omega_scale
+        });
         let mut model = Self {
             temperature_k,
             nu: [nu_fe, nu_cr],
             saddle: [[0.0; 2]; 2],
             g_aa,
             g_av,
-            omega_scale: (1.0 - t / THETA_K) / 11.0,
+            omega_scale,
+            fe_cr_bond_table,
             policy,
             floor_activations: std::sync::Arc::default(),
         };
@@ -361,6 +369,17 @@ impl Martinez2012 {
         self.temperature_k
     }
 
+    #[inline]
+    pub(crate) fn fe_cr_bond_energy(&self, n_sum: u32) -> f64 {
+        if let Some(&e) = self.fe_cr_bond_table.get(n_sum as usize) {
+            e
+        } else {
+            let x = f64::from(n_sum) / LOCAL_DENOMINATOR;
+            0.5 * (self.g_aa[0] + self.g_aa[1]) - omega(x) * self.omega_scale
+        }
+    }
+
+    #[inline]
     fn bond(&self, a: Cell, b: Cell, n_sum: u32) -> f64 {
         use Cell::{Cr, Empty, Fe, Vacancy};
         match (a, b) {
@@ -369,10 +388,7 @@ impl Martinez2012 {
             (Vacancy, Cr) | (Cr, Vacancy) => self.g_av[1],
             (Fe, Fe) => self.g_aa[0],
             (Cr, Cr) => self.g_aa[1],
-            (Fe, Cr) | (Cr, Fe) => {
-                let x = f64::from(n_sum) / LOCAL_DENOMINATOR;
-                0.5 * (self.g_aa[0] + self.g_aa[1]) - omega(x) * self.omega_scale
-            }
+            (Fe, Cr) | (Cr, Fe) => self.fe_cr_bond_energy(n_sum),
         }
     }
 
@@ -462,6 +478,7 @@ impl Martinez2012 {
     }
 
     /// Bond free energy between two site contents; `None` is an empty site (no bonds).
+    #[inline]
     pub(crate) fn bond_energy(&self, a: Option<Species>, b: Option<Species>, n_sum: u32) -> f64 {
         self.bond(
             a.map_or(Cell::Empty, Cell::from),

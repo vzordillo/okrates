@@ -1891,3 +1891,147 @@ fn t17_dumbbell_rate_splits_equally_across_two_orientations() {
         4.0 * gamma_ff
     );
 }
+
+#[test]
+fn t18_fast_paths_match_dense_and_wrap_boundaries() {
+    let m_wrap = ris_model([6, 6, 6], 650.0, FULL_K0, 32, &[0]);
+    let s_wrap = m_wrap.random_state(43, 101, 101).unwrap();
+    let mut sim_wrap = IncrementalSimulation::new(m_wrap, s_wrap, 0x5eed_0018).unwrap();
+    sim_wrap.model().check_invariants(sim_wrap.state()).unwrap();
+    assert_catalog_matches_rebuild(&sim_wrap, false, "t18a init");
+    for step in 0..150 {
+        sim_wrap.step().unwrap();
+        sim_wrap.model().check_invariants(sim_wrap.state()).unwrap();
+        assert_catalog_matches_rebuild(&sim_wrap, false, &format!("t18a step {step}"));
+    }
+    assert!(sim_wrap.state().created() > 0);
+
+    let m_dense = ris_model([8, 8, 8], 650.0, 0.0, 200, &[0]);
+    let lat = m_dense.lattice();
+    let n = lat.site_count();
+    let occ: Vec<Species> = (0..n)
+        .map(|site| {
+            if (site * 37 + 13) % 10 == 0 {
+                Species::Cr
+            } else {
+                Species::Fe
+            }
+        })
+        .collect();
+
+    let mut vac_sites = Vec::new();
+    let mut dumb_sites = Vec::new();
+    for site in 0..n {
+        let p = lat.position(site);
+        if p[0] == 8 {
+            vac_sites.push(site);
+        } else if p[0] == 12 && dumb_sites.len() < 20 {
+            dumb_sites.push(site);
+        }
+    }
+    for site in 0..n {
+        if vac_sites.len() >= 134 {
+            break;
+        }
+        let p = lat.position(site);
+        if (1..=6).contains(&p[0]) {
+            vac_sites.push(site);
+        }
+    }
+    assert!(vac_sites.len() == 134 && dumb_sites.len() == 20);
+
+    let mut defects = Vec::with_capacity(vac_sites.len() + dumb_sites.len());
+    for site in vac_sites {
+        defects.push(Defect::Vacancy { site });
+    }
+    for (idx, site) in dumb_sites.into_iter().enumerate() {
+        let (plus, minus) = match idx % 3 {
+            0 => (Species::Fe, Species::Fe),
+            1 => (Species::Fe, Species::Cr),
+            _ => (Species::Cr, Species::Fe),
+        };
+        defects.push(Defect::Dumbbell {
+            site,
+            axis: idx % 6,
+            plus,
+            minus,
+        });
+    }
+
+    let s_dense = m_dense.state_with_defects(occ, &defects, 7).unwrap();
+    let mut sim_dense = IncrementalSimulation::new(m_dense, s_dense, 0x5eed_0118).unwrap();
+    sim_dense
+        .model()
+        .check_invariants(sim_dense.state())
+        .unwrap();
+    assert_catalog_matches_rebuild(&sim_dense, false, "t18b init");
+
+    let mut saw_dense = false;
+    for step in 0..80 {
+        let (v, i) = sim_dense.state().defect_counts();
+        if v + i >= 128 && v >= 16 && i >= 16 {
+            saw_dense = true;
+        }
+        sim_dense.step().unwrap();
+        sim_dense
+            .model()
+            .check_invariants(sim_dense.state())
+            .unwrap();
+        assert_catalog_matches_rebuild(&sim_dense, false, &format!("t18b step {step}"));
+    }
+    assert!(saw_dense, "dense defect count regime was never active");
+    assert!(
+        sim_dense.state().recombined() > 0,
+        "expected dense recombination near x=8/12"
+    );
+
+    let m_outer = ris_model([8, 8, 8], 650.0, 0.0, 4, &[]);
+    let lat_o = m_outer.lattice();
+    let mut occ_o = vec![Species::Fe; lat_o.site_count()];
+    occ_o[pos_site(&m_outer, [15, 15, 15])] = Species::Cr;
+    occ_o[pos_site(&m_outer, [4, 0, 0])] = Species::Cr;
+    occ_o[pos_site(&m_outer, [6, 0, 0])] = Species::Cr;
+    let s0 = pos_site(&m_outer, [0, 0, 0]);
+    let s7 = pos_site(&m_outer, [7, 1, 1]);
+    let mut s_outer = m_outer
+        .state_with_defects(
+            occ_o,
+            &[Defect::Vacancy { site: s0 }, Defect::Vacancy { site: s7 }],
+            1,
+        )
+        .unwrap();
+    let s15 = pos_site(&m_outer, [15, 15, 15]);
+    let s6 = pos_site(&m_outer, [6, 0, 0]);
+    let dir_to_15 = (0..8).find(|&d| lat_o.neighbor(s0, d) == s15).unwrap();
+    let dir_to_6 = (0..8).find(|&d| lat_o.neighbor(s7, d) == s6).unwrap();
+    let slot_target = 8 + dir_to_6;
+    let before_rates: Vec<u64> = (0..m_outer.slot_count(&s_outer))
+        .map(|slot| m_outer.slot_rate(&s_outer, slot).to_bits())
+        .collect();
+    let ev_outer = FeCrRisEvent::VacancyJump {
+        rec: 0,
+        dir: dir_to_15,
+    };
+    m_outer.apply(&mut s_outer, &ev_outer).unwrap();
+    let after_rates: Vec<u64> = (0..m_outer.slot_count(&s_outer))
+        .map(|slot| m_outer.slot_rate(&s_outer, slot).to_bits())
+        .collect();
+    assert_ne!(
+        before_rates[slot_target], after_rates[slot_target],
+        "outer-shell [-7, -1, -1] displacement should change target slot rate"
+    );
+    let mut affected = Vec::new();
+    m_outer.affected_slots(&s_outer, &ev_outer, &mut affected);
+    assert!(
+        affected.contains(&slot_target),
+        "affected_slots must include outer-shell slot {slot_target}"
+    );
+    for (slot, (&b, &a)) in before_rates.iter().zip(&after_rates).enumerate() {
+        if b != a {
+            assert!(
+                affected.contains(&slot),
+                "changed slot {slot} missing from affected_slots"
+            );
+        }
+    }
+}
