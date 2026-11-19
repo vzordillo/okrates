@@ -37,49 +37,37 @@ Runs are reproducible in a strict sense. Every replica and every purpose (dynami
 A kinetic Monte Carlo code has two parts that change for different reasons. The physics, meaning which states exist, which transitions are possible and how fast they happen, changes with every material and mechanism. The algorithm, meaning how an event is chosen, how time advances and how the event list stays current, is the same for all of them. okrates keeps the two apart: a model describes physics only, and the engine owns selection, time, randomness and checkpoints. A new mechanism means writing a new model, and the engine's guarantees come with it.
 
 ```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 24, "rankSpacing": 38, "padding": 12, "curve": "basis"}, "themeVariables": {"fontSize": "14px"}}}%%
-flowchart TB
-    subgraph phys["Physics layer — changes with material and mechanism"]
-        builtin("Built-in models · okrates-models<br/>BCC vacancy · Fe–Cr (Martínez 2012, KRA) · RIS")
-        tables("Tabulated barriers · okrates-schema<br/>DFT NEB JSON adapters · detailed-balance checks")
-        custom("Custom model · Rust<br/>any state space, lattice or reaction network")
+%%{init: {"themeVariables": {"fontSize": "18px"}, "flowchart": {"nodeSpacing": 24, "rankSpacing": 50, "padding": 10}}}%%
+flowchart LR
+    lang(["🐍 Python<br>🦀 Rust"])
+    subgraph model["Your model"]
+        direction TB
+        states["States"]
+        moves["Transitions"]
+        rates["Rates"]
     end
-
-    seam("Model & IncrementalModel trait seam<br/>candidate rates · reversible apply · local affected slots")
-
-    subgraph core["Core engine · okrates-core — verified once, shared by every model"]
-        direct("DirectCatalog · O(M) per step<br/>full rate rebuild and linear scan")
-        sumtree("SumTreeCatalog · O(k log M) per step<br/>local slot updates and binary sum tree")
-        engine("Transactional BKL stepper<br/>ChaCha12 StreamRole RNG · TwoSum Clock · atomic rollback")
+    subgraph engine["okrates engine"]
+        direction TB
+        pick{{"Event selection"}}
+        clock{{"Clock"}}
+        rng{{"Random streams"}}
+        ckpt{{"Checkpoints"}}
     end
-
-    subgraph out["Execution, provenance and interfaces"]
-        ens("Parallel ensembles & estimators<br/>SampleGrid · D*, D_v, Onsager Λ, jackknife f")
-        ckpt("Exact checkpoints · schema v2<br/>bit-for-bit state, clock and RNG resume")
-        prov("RunManifest provenance · okrates-schema<br/>SHA-256 of parameters, barriers and checkpoints")
+    subgraph out["Results"]
+        direction TB
+        traj[/"Trajectories"/]
+        transport[/"Transport"/]
+        prov[/"Provenance"/]
     end
-
-    api(["Rust crates & typed Python bindings · okrates-python"])
-
-    builtin & tables & custom --> seam
-    seam --> direct & sumtree
-    direct & sumtree --> engine
-    engine --> ens & ckpt & prov
-    ens & ckpt & prov --> api
-
-    classDef physNode fill:#1f4e79,stroke:#2a78d6,stroke-width:1.5px,color:#ffffff
-    classDef seamNode fill:#8c3b1a,stroke:#d95926,stroke-width:1.8px,color:#ffffff
-    classDef coreNode fill:#2b303b,stroke:#787880,stroke-width:1.5px,color:#ffffff
-    classDef outNode fill:#1b5245,stroke:#2a9d7c,stroke-width:1.5px,color:#ffffff
-
-    class builtin,tables,custom physNode
-    class seam seamNode
-    class direct,sumtree,engine coreNode
-    class ens,ckpt,prov,api outNode
-
-    style phys fill:none,stroke:#2a78d6,stroke-width:1.2px,stroke-dasharray: 5 3
-    style core fill:none,stroke:#787880,stroke-width:1.2px,stroke-dasharray: 5 3
-    style out fill:none,stroke:#2a9d7c,stroke-width:1.2px,stroke-dasharray: 5 3
+    lang -.-> model ==> engine ==> out
+    classDef lang fill:#d95926,stroke:#8f3a18,color:#ffffff
+    classDef model fill:#2a78d6,stroke:#1b4f8f,color:#ffffff
+    classDef engine fill:#7a52c7,stroke:#4d3285,color:#ffffff
+    classDef result fill:#1f9e78,stroke:#13664d,color:#ffffff
+    class lang lang
+    class states,moves,rates model
+    class pick,clock,rng,ckpt engine
+    class traj,transport,prov result
 ```
 
 ## How a step works
@@ -87,34 +75,22 @@ flowchart TB
 With rates r₁ … r_M of the possible events and total rate R = Σ rᵢ, one step draws two uniform random numbers u₁ and u₂ in (0, 1). The first selects event i as the smallest index with u₁·R < r₁ + … + rᵢ. The second gives the waiting time Δt = −ln(u₂)/R. The event is applied and only the rates it changed are updated. If R = 0, nothing can happen and the run stops without drawing. A step either completes fully or leaves the simulation exactly as it was.
 
 ```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 28, "rankSpacing": 36, "padding": 12, "curve": "basis"}, "themeVariables": {"fontSize": "14px"}}}%%
-flowchart TB
-    prep("1. Prepare active rates r₁ … r_M<br/>validate finite rᵢ ≥ 0 · total rate R = Σ rᵢ")
-    zero{"R == 0 ?"}
-    absorbed(["Step::Absorbed<br/>stop · no RNG draw · clock unchanged"])
-    pick("2. Select event with u₁ ∈ (0, 1)<br/>Direct: first i with Σ rⱼ > u₁·R · SumTree: O(log M) descent")
-    wait("3. Draw waiting time with u₂ ∈ (0, 1)<br/>Δt = −ln(u₂) / R · validate TwoSum clock t + Δt")
-    apply("4. Apply transition & update rates<br/>Direct rebuild O(M) · SumTree affected_slots O(k log M)")
-    fired(["Step::Fired { event, dt }<br/>commit state, catalog, clock, RNG and step count"])
-    rollback(["Transactional rollback on Err<br/>undo state and tree · clock, RNG and steps unchanged"])
-
-    prep --> zero
-    zero -->|"Yes"| absorbed
-    zero -->|"No (R > 0)"| pick
-    pick --> wait --> apply
-    apply -->|"Ok"| fired
-    fired -->|"next step"| prep
-    apply -.->|"Err"| rollback
-
-    classDef stepNode fill:#1f4e79,stroke:#2a78d6,stroke-width:1.5px,color:#ffffff
-    classDef gateNode fill:#8c3b1a,stroke:#d95926,stroke-width:1.8px,color:#ffffff
-    classDef okNode fill:#1b5245,stroke:#2a9d7c,stroke-width:1.5px,color:#ffffff
-    classDef stopNode fill:#2b303b,stroke:#787880,stroke-width:1.5px,color:#ffffff
-
-    class prep,pick,wait,apply stepNode
-    class zero gateNode
-    class fired okNode
-    class absorbed,rollback stopNode
+%%{init: {"themeVariables": {"fontSize": "18px"}, "flowchart": {"nodeSpacing": 24, "rankSpacing": 50, "padding": 10}}}%%
+flowchart LR
+    s1["<b>1 · List events</b><br>each with its rate"]
+    s2{{"<b>2 · Pick one</b><br>faster = likelier"}}
+    s3["<b>3 · Advance clock</b><br>random waiting time"]
+    s4["<b>4 · Apply it</b><br>update changed rates"]
+    rest(["At rest:<br>no events left"])
+    s1 --> s2 --> s3 --> s4
+    s4 -->|"repeat"| s1
+    s1 -.->|"none possible"| rest
+    classDef step fill:#2a78d6,stroke:#1b4f8f,color:#ffffff
+    classDef key fill:#7a52c7,stroke:#4d3285,color:#ffffff
+    classDef rest fill:#787880,stroke:#4a4a50,color:#ffffff
+    class s1,s3,s4 step
+    class s2 key
+    class rest rest
 ```
 
 ## Getting started
