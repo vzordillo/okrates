@@ -176,11 +176,20 @@ fn parse() -> Args {
     }
 }
 
+fn open_output_file(path: &Path) -> Result<fs::File, std::io::Error> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
 fn write_timeseries_csv(
-    path: &Path,
+    file: fs::File,
     summary: &RisSegregationSummary,
 ) -> Result<(), std::io::Error> {
-    let mut f = BufWriter::new(fs::File::create(path)?);
+    file.set_len(0)?;
+    let mut f = BufWriter::new(file);
     writeln!(
         f,
         "dose_dpa,c_cr_gb,c_cr_gb_se,c_cr_bulk,c_cr_bulk_se,s_cr_tot_nm,s_cr_tot_nm_se,s_cr_linear_nm,s_cr_linear_nm_se"
@@ -203,8 +212,12 @@ fn write_timeseries_csv(
     f.flush()
 }
 
-fn write_profile_csv(path: &Path, summary: &RisSegregationSummary) -> Result<(), std::io::Error> {
-    let mut f = BufWriter::new(fs::File::create(path)?);
+fn write_profile_csv(
+    file: fs::File,
+    summary: &RisSegregationSummary,
+) -> Result<(), std::io::Error> {
+    file.set_len(0)?;
+    let mut f = BufWriter::new(file);
     writeln!(
         f,
         "d_planes,distance_nm,c_cr_mean,c_cr_se,c_v_mean,c_v_se,c_i_mean,c_i_se"
@@ -233,8 +246,20 @@ fn fmt_opt(v: Option<f64>) -> String {
     }
 }
 
+#[cfg(unix)]
+fn same_file_metadata(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
 fn same_output_destination(a: &Path, b: &Path) -> bool {
     if a == b {
+        return true;
+    }
+    #[cfg(unix)]
+    if let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b))
+        && same_file_metadata(&ma, &mb)
+    {
         return true;
     }
     if let (Ok(ca), Ok(cb)) = (fs::canonicalize(a), fs::canonicalize(b)) {
@@ -306,13 +331,35 @@ fn main() {
         0.0
     };
 
-    if let Some(ref path) = a.timeseries_out
-        && let Err(err) = write_timeseries_csv(path, &summary)
+    let ts_file = a.timeseries_out.as_deref().map(|path| {
+        let file = open_output_file(path)
+            .unwrap_or_else(|err| fail(format!("opening {}: {err}", path.display())));
+        (path, file)
+    });
+    let prof_file = a.profile_out.as_deref().map(|path| {
+        let file = open_output_file(path)
+            .unwrap_or_else(|err| fail(format!("opening {}: {err}", path.display())));
+        (path, file)
+    });
+    #[cfg(unix)]
+    if let (Some((ts_path, ts_f)), Some((prof_path, prof_f))) = (&ts_file, &prof_file) {
+        let ts_meta = ts_f
+            .metadata()
+            .unwrap_or_else(|err| fail(format!("inspecting {}: {err}", ts_path.display())));
+        let prof_meta = prof_f
+            .metadata()
+            .unwrap_or_else(|err| fail(format!("inspecting {}: {err}", prof_path.display())));
+        if same_file_metadata(&ts_meta, &prof_meta) {
+            fail("--timeseries-out and --profile-out must refer to different paths");
+        }
+    }
+    if let Some((path, file)) = ts_file
+        && let Err(err) = write_timeseries_csv(file, &summary)
     {
         fail(format!("writing {}: {err}", path.display()));
     }
-    if let Some(ref path) = a.profile_out
-        && let Err(err) = write_profile_csv(path, &summary)
+    if let Some((path, file)) = prof_file
+        && let Err(err) = write_profile_csv(file, &summary)
     {
         fail(format!("writing {}: {err}", path.display()));
     }

@@ -508,7 +508,8 @@ impl PlaneDefectTally {
     }
 
     /// Collects active `(plane_x, is_vacancy)` pairs from `state` into `buf`, reusing existing
-    /// buffer capacity.
+    /// buffer capacity; requires `state` to use the same `[nx, ny, nz]` lattice dimensions as this
+    /// tally.
     pub fn collect_active(&self, state: &FeCrRisState, buf: &mut Vec<(usize, bool)>) {
         buf.clear();
         let records = state.records();
@@ -543,6 +544,7 @@ impl PlaneDefectTally {
     ) -> Result<PlaneDefectProfile, RisSegregationError> {
         let nx = 2 * self.cells[0];
         if final_counts.plane_count() != nx
+            || final_counts.cr.len() != nx
             || self.v_sum.len() != nx
             || final_counts.sites_per_plane != self.sites_per_plane
         {

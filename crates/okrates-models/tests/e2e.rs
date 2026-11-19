@@ -467,44 +467,23 @@ fn fecr_ris_segregation_small() {
         without_timing_and_fit(&stdout),
         without_timing_and_fit(expected)
     );
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    assert_eq!(
-        segregation_fit_lines(&stdout),
-        segregation_fit_lines(expected),
-        "x86_64-linux relaxation fit output lines differ"
-    );
-    // aarch64-macos values printed by macOS CI (PR #25, run 44605084477);
-    // all 41 physics observable and counter lines match x86_64-linux bit-for-bit,
-    // while platform libm exp_m1/ln shifts the 1D golden-section SSE argmin by ~3e-8 relative.
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    assert_eq!(
-        segregation_fit_lines(&stdout),
-        vec![
-            "phi_rel_s_cr_tot=1.154588383693e-3",
-            "s_cr_tot_inf_nm=1.818526045640e-2",
-        ],
-        "aarch64-macos relaxation fit output lines differ"
-    );
-    #[cfg(not(any(
-        all(target_arch = "x86_64", target_os = "linux"),
-        all(target_arch = "aarch64", target_os = "macos")
-    )))]
-    {
-        let got = segregation_fit_lines(&stdout);
-        let exp = segregation_fit_lines(expected);
-        assert_eq!(got.len(), 2, "expected 2 fit lines in {stdout}");
-        assert_eq!(exp.len(), 2);
-        for (g_line, e_line) in got.iter().zip(&exp) {
-            let (gk, gv) = g_line.split_once('=').unwrap();
-            let (ek, ev) = e_line.split_once('=').unwrap();
-            assert_eq!(gk, ek);
-            let g: f64 = gv.parse().unwrap();
-            let e: f64 = ev.parse().unwrap();
-            assert!(
-                ((g - e) / e).abs() <= 1e-6,
-                "{gk} differs beyond 1e-6 relative: got {g}, expected {e}"
-            );
-        }
+    // All 41 simulation observable and counter lines match bit-for-bit above; the two post-hoc
+    // golden-section exponential fit values depend on platform libm exp_m1/ln rounding (~3e-8
+    // relative delta observed across targets), so check keys and 1e-6 relative tolerance.
+    let got = segregation_fit_lines(&stdout);
+    let exp = segregation_fit_lines(expected);
+    assert_eq!(got.len(), 2, "expected 2 fit lines in {stdout}");
+    assert_eq!(exp.len(), 2);
+    for (g_line, e_line) in got.iter().zip(&exp) {
+        let (gk, gv) = g_line.split_once('=').unwrap();
+        let (ek, ev) = e_line.split_once('=').unwrap();
+        assert_eq!(gk, ek);
+        let g: f64 = gv.parse().unwrap();
+        let e: f64 = ev.parse().unwrap();
+        assert!(
+            ((g - e) / e).abs() <= 1e-6,
+            "{gk} differs beyond 1e-6 relative: got {g}, expected {e}"
+        );
     }
 
     let ts_csv = std::fs::read_to_string(&ts_path).unwrap();
@@ -624,14 +603,14 @@ fn fecr_ris_segregation_bad_args() {
         usage,
     );
 
-    let same_path =
-        std::env::temp_dir().join(format!("okrates_seg_same_{}.csv", std::process::id()));
+    let pid = std::process::id();
+    let same_path = std::env::temp_dir().join(format!("okrates_seg_same_{pid}.csv"));
+    let sub_dir = std::env::temp_dir().join(format!("okrates_seg_sub_{pid}"));
     let _ = std::fs::remove_file(&same_path);
+    std::fs::create_dir_all(&sub_dir).unwrap();
     let same_arg = same_path.to_str().unwrap().to_string();
-    let eq_arg = same_path
-        .parent()
-        .unwrap()
-        .join(".")
+    let eq_arg = sub_dir
+        .join("..")
         .join(same_path.file_name().unwrap())
         .to_str()
         .unwrap()
@@ -667,4 +646,45 @@ fn fecr_ris_segregation_bad_args() {
         );
         assert!(!same_path.exists());
     }
+    #[cfg(unix)]
+    {
+        let hl_a = std::env::temp_dir().join(format!("okrates_seg_hla_{pid}.csv"));
+        let hl_b = std::env::temp_dir().join(format!("okrates_seg_hlb_{pid}.csv"));
+        let _ = std::fs::remove_file(&hl_a);
+        let _ = std::fs::remove_file(&hl_b);
+        std::fs::write(&hl_a, "keep\n").unwrap();
+        std::fs::hard_link(&hl_a, &hl_b).unwrap();
+        let (code, stdout, stderr) = run(example("fecr_ris_segregation").args([
+            "--temperature",
+            "773",
+            "--k0",
+            "1e3",
+            "--cr-count",
+            "43",
+            "--dpa-end",
+            "2e-3",
+            "--capacity",
+            "32",
+            "--runs",
+            "2",
+            "--samples",
+            "4",
+            "--seed",
+            "7",
+            "--timeseries-out",
+            hl_a.to_str().unwrap(),
+            "--profile-out",
+            hl_b.to_str().unwrap(),
+        ]));
+        assert_eq!(code, 1, "stderr: {stderr}");
+        assert_eq!(stdout, "");
+        assert!(
+            stderr.contains("must refer to different paths"),
+            "stderr: {stderr}"
+        );
+        assert_eq!(std::fs::read_to_string(&hl_a).unwrap(), "keep\n");
+        let _ = std::fs::remove_file(&hl_a);
+        let _ = std::fs::remove_file(&hl_b);
+    }
+    let _ = std::fs::remove_dir(&sub_dir);
 }

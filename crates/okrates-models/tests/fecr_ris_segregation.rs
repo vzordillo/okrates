@@ -531,6 +531,20 @@ fn t5_validation_and_error_guards() {
         ),
         Err(RisSegregationError::InvalidSummary(_))
     ));
+    let s_666 = m_ok
+        .state_with_defects(vec![Species::Fe; m_ok.lattice().site_count()], &[], 1)
+        .unwrap();
+    let mut bad_cr_counts = PlaneCounts::from_state(&m_ok, &s_666).unwrap();
+    bad_cr_counts.cr.clear();
+    assert!(matches!(
+        PlaneDefectTally::new([6, 6, 6]).unwrap().into_profile(
+            &bad_cr_counts,
+            0,
+            4,
+            DEFAULT_LATTICE_A_M
+        ),
+        Err(RisSegregationError::InvalidSummary(_))
+    ));
 
     assert!(matches!(
         RisSegregationConfig::uniform(1, f64::from_bits(1), 2, 0.0, 4, 1, 7),
