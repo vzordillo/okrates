@@ -21,5 +21,5 @@ d_cr_over_d_fe_se=3.010639314129e0
 mean_jumps=549.000000
 mean_floored_jumps=59.500000
 mean_initial_sro_alpha1=1.076978294617e-3
-mean_final_sro_alpha1=-1.756296127059e-2
-mean_delta_sro_alpha1=-1.863993956521e-2
+mean_final_sro_alpha1=-1.336297956420e-2
+mean_delta_sro_alpha1=-1.443995785882e-2

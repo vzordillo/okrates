@@ -28,7 +28,6 @@ use crate::fecr::Species;
 use crate::fecr_diffusion::{FitMethod, jackknife_ratio_mean_se, mean_se, ols_slope, origin_slope};
 use crate::fecr_ris::{Cell, Defect, FeCrRis, FeCrRisError, FeCrRisEvent, FeCrRisState, Record};
 
-/// Single-defect species for RIS bulk transport measurements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DefectKind {
     Vacancy,
@@ -44,7 +43,6 @@ impl DefectKind {
     }
 }
 
-/// Errors returned while configuring, sampling, or summarizing single-defect [`FeCrRis`] transport.
 #[derive(Debug)]
 pub enum RisTransportError {
     Model(FeCrRisError),
@@ -75,6 +73,8 @@ pub enum RisTransportError {
         fit_method: FitMethod,
         sample_count: usize,
     },
+    SampleAllocation(usize),
+    NonFiniteEstimate,
     InsufficientReplicas(usize),
 }
 
@@ -135,6 +135,12 @@ impl fmt::Display for RisTransportError {
                 fit_method.name(),
                 min_samples_for(*fit_method)
             ),
+            Self::SampleAllocation(count) => {
+                write!(f, "cannot allocate sample buffers for {count} points")
+            }
+            Self::NonFiniteEstimate => {
+                write!(f, "regression produced non-finite diffusivity estimate")
+            }
             Self::InsufficientReplicas(runs) => {
                 write!(
                     f,
@@ -199,13 +205,19 @@ fn validate_model(model: &FeCrRis) -> Result<(), RisTransportError> {
     Ok(())
 }
 
-fn validate_lattice_parameter(lattice_parameter: f64) -> Result<(), RisTransportError> {
-    if !lattice_parameter.is_finite() || lattice_parameter <= 0.0 {
+fn lattice_scale(lattice_parameter: f64) -> Result<f64, RisTransportError> {
+    let half = lattice_parameter / 2.0;
+    let scale = half * half;
+    if !lattice_parameter.is_finite()
+        || lattice_parameter <= 0.0
+        || !scale.is_finite()
+        || scale == 0.0
+    {
         return Err(RisTransportError::InvalidLatticeParameter(
             lattice_parameter,
         ));
     }
-    Ok(())
+    Ok(scale)
 }
 
 fn max_cr_count(defect: DefectKind, site_count: usize) -> usize {
@@ -281,7 +293,6 @@ pub struct RisObservables {
     pub cr_defect: f64,
 }
 
-/// Sampled single-defect transport trajectory with SRO and exact endpoint displacements.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RisSampledTrajectory {
     pub times: Vec<f64>,
@@ -304,7 +315,6 @@ pub struct RisReplicaEstimate {
     pub cr_defect: f64,
 }
 
-/// Output of one simulated replica in [`run_ris_transport`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct RisReplicaRun {
     pub estimate: RisReplicaEstimate,
@@ -342,8 +352,7 @@ fn dot_f64(a: [i64; 3], b: [i64; 3]) -> f64 {
     sum as f64
 }
 
-fn observables(d: &RisDisplacements, lattice_parameter: f64) -> RisObservables {
-    let scale = lattice_parameter * lattice_parameter / 4.0;
+fn observables(d: &RisDisplacements, scale: f64) -> RisObservables {
     RisObservables {
         defect_msd: dot_f64(d.defect, d.defect) * scale,
         fe_fe: dot_f64(d.fe, d.fe) * scale,
@@ -521,15 +530,19 @@ fn validate_single_defect_state(
     Ok(())
 }
 
-/// Samples right-continuous single-defect transport observables on `grid` without modifying
-/// [`FeCrRisState`] schema or R2 regression behavior.
+/// Samples right-continuous single-defect transport observables on `grid`.
+///
+/// Displacements start from zero at the engine state on entry, `final_displacements`,
+/// `final_sro_alpha1`, and `floored_jumps` reflect the state after events at or before `t_end`
+/// (before any strict crossing jump past `t_end`), and sampling errors leave previously
+/// completed steps applied in `engine`.
 pub fn sample_ris_transport<C: CatalogBackend<FeCrRis>>(
     engine: &mut Engine<FeCrRis, C>,
     grid: &SampleGrid,
     lattice_parameter: f64,
     max_steps: Option<u64>,
 ) -> Result<RisSampledTrajectory, RisTransportError> {
-    validate_lattice_parameter(lattice_parameter)?;
+    let scale = lattice_scale(lattice_parameter)?;
     validate_single_defect_state(engine.model(), engine.state())?;
 
     let times = grid.times();
@@ -545,13 +558,20 @@ pub fn sample_ris_transport<C: CatalogBackend<FeCrRis>>(
     let initial_sro_alpha1 = warren_cowley_alpha1_ris(engine.model().lattice(), engine.state())?;
     let initial_floored =
         engine.state().floored_vacancy_jumps() + engine.state().floored_dumbbell_jumps();
+    let t_end = times[times.len() - 1];
 
     let mut disp = RisDisplacements::default();
-    let mut values = Vec::with_capacity(times.len());
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(times.len())
+        .map_err(|_| RisTransportError::SampleAllocation(times.len()))?;
     let mut fired_steps = 0_u64;
+    let mut endpoint_disp: Option<RisDisplacements> = None;
+    let mut endpoint_sro: Option<Result<f64, FeCrRisError>> = None;
+    let mut endpoint_floored: Option<u64> = None;
 
     while values.len() < times.len() {
-        let current_obs = observables(&disp, lattice_parameter);
+        let current_obs = observables(&disp, scale);
         if engine.clock().cmp_f64(times[values.len()]).is_eq() {
             while values.len() < times.len() && engine.clock().cmp_f64(times[values.len()]).is_eq()
             {
@@ -586,11 +606,20 @@ pub fn sample_ris_transport<C: CatalogBackend<FeCrRis>>(
         let next_target = times[values.len()];
         let mut before_rec: Option<Record> = None;
         let mut crossed: Option<(RisObservables, Clock)> = None;
+        let mut crossed_t_end = false;
         let step = engine
-            .step_observing(|_model, state_before, next_clock| {
+            .step_observing(|model, state_before, next_clock| {
                 before_rec = Some(state_before.records()[0]);
                 if next_clock.cmp_f64(next_target).is_gt() {
                     crossed = Some((current_obs, next_clock));
+                }
+                if next_clock.cmp_f64(t_end).is_gt() {
+                    crossed_t_end = true;
+                    endpoint_sro = Some(warren_cowley_alpha1_ris(model.lattice(), state_before));
+                    endpoint_floored = Some(
+                        state_before.floored_vacancy_jumps()
+                            + state_before.floored_dumbbell_jumps(),
+                    );
                 }
             })
             .map_err(|source| SamplingError::Sim {
@@ -601,6 +630,9 @@ pub fn sample_ris_transport<C: CatalogBackend<FeCrRis>>(
 
         match step {
             Step::Fired { event, .. } => {
+                if crossed_t_end {
+                    endpoint_disp = Some(disp);
+                }
                 if let Some((held, clock_after)) = crossed {
                     while values.len() < times.len()
                         && clock_after.cmp_f64(times[values.len()]).is_gt()
@@ -662,15 +694,20 @@ pub fn sample_ris_transport<C: CatalogBackend<FeCrRis>>(
         }
     }
 
-    let final_sro_alpha1 = warren_cowley_alpha1_ris(engine.model().lattice(), engine.state())?;
-    let final_floored =
-        engine.state().floored_vacancy_jumps() + engine.state().floored_dumbbell_jumps();
+    let final_displacements = endpoint_disp.unwrap_or(disp);
+    let final_sro_alpha1 = match endpoint_sro {
+        Some(res) => res?,
+        None => warren_cowley_alpha1_ris(engine.model().lattice(), engine.state())?,
+    };
+    let final_floored = endpoint_floored.unwrap_or_else(|| {
+        engine.state().floored_vacancy_jumps() + engine.state().floored_dumbbell_jumps()
+    });
 
     Ok(RisSampledTrajectory {
         times: times.to_vec(),
         values,
         fired_steps,
-        final_displacements: disp,
+        final_displacements,
         initial_sro_alpha1,
         final_sro_alpha1,
         floored_jumps: final_floored - initial_floored,
@@ -682,23 +719,41 @@ pub fn estimate_ris(
     times: &[f64],
     samples: &[RisObservables],
     fit_method: FitMethod,
-) -> RisReplicaEstimate {
+) -> Result<RisReplicaEstimate, RisTransportError> {
+    let min_samples = min_samples_for(fit_method);
+    let count = times.len().min(samples.len());
+    if times.len() != samples.len() || count < min_samples {
+        return Err(RisTransportError::InsufficientSamples {
+            fit_method,
+            sample_count: count,
+        });
+    }
+    let t_scale = times.iter().map(|t| t.abs()).fold(0.0_f64, f64::max);
+    if !t_scale.is_finite() || t_scale == 0.0 {
+        return Err(RisTransportError::NonFiniteEstimate);
+    }
+    let scaled_times: Vec<f64> = times.iter().map(|&t| t / t_scale).collect();
     let slope: fn(&[f64], &[f64]) -> f64 = match fit_method {
         FitMethod::WindowedOls => ols_slope,
         FitMethod::OriginSlope => origin_slope,
     };
-    let fit = |extract: &dyn Fn(&RisObservables) -> f64| {
+    let fit = |extract: &dyn Fn(&RisObservables) -> f64| -> Result<f64, RisTransportError> {
         let series: Vec<f64> = samples.iter().map(extract).collect();
-        slope(times, &series) / 6.0
+        let coeff = (slope(&scaled_times, &series) / 6.0) / t_scale;
+        if coeff.is_finite() {
+            Ok(coeff)
+        } else {
+            Err(RisTransportError::NonFiniteEstimate)
+        }
     };
-    RisReplicaEstimate {
-        defect: fit(&|o| o.defect_msd),
-        fe_fe: fit(&|o| o.fe_fe),
-        fe_cr: fit(&|o| o.fe_cr),
-        cr_cr: fit(&|o| o.cr_cr),
-        fe_defect: fit(&|o| o.fe_defect),
-        cr_defect: fit(&|o| o.cr_defect),
-    }
+    Ok(RisReplicaEstimate {
+        defect: fit(&|o| o.defect_msd)?,
+        fe_fe: fit(&|o| o.fe_fe)?,
+        fe_cr: fit(&|o| o.fe_cr)?,
+        cr_cr: fit(&|o| o.cr_cr)?,
+        fe_defect: fit(&|o| o.fe_defect)?,
+        cr_defect: fit(&|o| o.cr_defect)?,
+    })
 }
 
 /// Runs `runs` parallel single-defect [`FeCrRis`] replicas with domain-separated RNG streams.
@@ -714,7 +769,7 @@ pub fn run_ris_transport(
         return Err(RisTransportError::InsufficientReplicas(runs as usize));
     }
     validate_model(model)?;
-    validate_lattice_parameter(config.lattice_parameter)?;
+    lattice_scale(config.lattice_parameter)?;
     let max = max_cr_count(defect, model.lattice().site_count());
     if cr_count > max {
         return Err(RisTransportError::InvalidCrCount {
@@ -730,6 +785,17 @@ pub fn run_ris_transport(
             sample_count: config.sample_count,
         });
     }
+    let mut times_probe = Vec::<f64>::new();
+    times_probe
+        .try_reserve_exact(config.sample_count)
+        .map_err(|_| RisTransportError::SampleAllocation(config.sample_count))?;
+    let mut values_probe = Vec::<RisObservables>::new();
+    values_probe
+        .try_reserve_exact(config.sample_count)
+        .map_err(|_| RisTransportError::SampleAllocation(config.sample_count))?;
+    drop(times_probe);
+    drop(values_probe);
+
     let grid = SampleGrid::windowed(config.t_equil, config.t_end, config.sample_count)?;
 
     run_ensemble(
@@ -756,7 +822,7 @@ pub fn run_ris_transport(
                 config.lattice_parameter,
                 config.max_steps,
             )?;
-            let estimate = estimate_ris(&traj.times, &traj.values, config.fit_method);
+            let estimate = estimate_ris(&traj.times, &traj.values, config.fit_method)?;
             Ok(RisReplicaRun {
                 estimate,
                 fired: traj.fired_steps,

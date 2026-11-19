@@ -1,4 +1,4 @@
-//! Integration tests (T1–T6 of `docs/r3-spec.md`) for single-defect [`FeCrRis`] transport.
+//! Integration tests for single-defect [`FeCrRis`] transport.
 
 use okrates_core::{
     DirectCatalog, Engine, KmcRng, SampleGrid, SamplingError, Simulation, Step, SumTreeCatalog,
@@ -10,12 +10,12 @@ use okrates_models::fecr_diffusion::{
 };
 use okrates_models::fecr_martinez::{Martinez2012, params as m12_params};
 use okrates_models::fecr_ris::{
-    Cell, Defect, DumbbellParams, FeCrRis, FeCrRisEvent, FeCrRisParams, Record,
+    Cell, DumbbellParams, FeCrRis, FeCrRisEvent, FeCrRisParams, Record,
 };
 use okrates_models::fecr_ris_transport::{
-    DefectKind, RisDisplacements, RisReplicaEstimate, RisReplicaRun, RisTransportConfig,
-    RisTransportError, random_single_defect_state, run_ris_transport, sample_ris_transport,
-    summarize_ris_transport,
+    DefectKind, RisDisplacements, RisObservables, RisReplicaEstimate, RisReplicaRun,
+    RisTransportConfig, RisTransportError, estimate_ris, random_single_defect_state,
+    run_ris_transport, sample_ris_transport, summarize_ris_transport,
 };
 
 const A_FE: f64 = 2.8665e-10;
@@ -122,21 +122,50 @@ fn t2_exact_integer_conservation() {
         }
 
         for obs in &traj.values {
+            let term_scale = obs.fe_fe + 2.0 * obs.fe_cr.abs() + obs.cr_cr + obs.defect_msd;
+            let tol = 1e-11 * term_scale;
             let sum_spec = obs.fe_fe + 2.0 * obs.fe_cr + obs.cr_cr;
             assert!(
-                (sum_spec - obs.defect_msd).abs() <= 1e-9 * obs.defect_msd.max(1.0),
+                (sum_spec - obs.defect_msd).abs() <= tol,
                 "{} quadratic identity mismatch: sum={sum_spec} vs defect={}",
                 defect.name(),
                 obs.defect_msd
             );
             assert!(
-                (obs.fe_defect - (sign as f64) * (obs.fe_fe + obs.fe_cr)).abs()
-                    <= 1e-9 * obs.defect_msd.max(1.0),
+                (obs.fe_defect - (sign as f64) * (obs.fe_fe + obs.fe_cr)).abs() <= tol,
                 "{} cross identity mismatch",
                 defect.name()
             );
         }
     }
+
+    // Strict crossing of `t_end` must report pre-jump endpoint displacements, SRO, and floored count.
+    let mut probe_rng = KmcRng::from_seed(94_001);
+    let init_cross =
+        random_single_defect_state(&model, DefectKind::Dumbbell, 102, &mut probe_rng, 94_001)
+            .unwrap();
+    let mut step_eng = Engine::<FeCrRis, DirectCatalog<FeCrRisEvent>>::new(
+        model.clone(),
+        init_cross.clone(),
+        94_002,
+    )
+    .unwrap();
+    let first_dt = match step_eng.step().unwrap() {
+        Step::Fired { dt, .. } => dt,
+        Step::Absorbed => panic!("expected fired first jump"),
+    };
+    assert!(first_dt > 0.0);
+    let mut cross_eng =
+        Engine::<FeCrRis, DirectCatalog<FeCrRisEvent>>::new(model.clone(), init_cross, 94_002)
+            .unwrap();
+    let half_grid = SampleGrid::from_origin(0.5 * first_dt, 2).unwrap();
+    let cross_traj = sample_ris_transport(&mut cross_eng, &half_grid, A_FE, None).unwrap();
+    assert_eq!(cross_traj.final_displacements, RisDisplacements::default());
+    assert_eq!(
+        cross_traj.final_sro_alpha1.to_bits(),
+        cross_traj.initial_sro_alpha1.to_bits()
+    );
+    assert_eq!(cross_traj.floored_jumps, 0);
 
     // Cross-check dumbbell jumper inference directly against `FeCrRis::jump_result`.
     let mut init_rng = KmcRng::from_seed(93_001);
@@ -245,7 +274,6 @@ fn check_vacancy_parity(runs: u64, ensemble_hops: f64) {
     let m12_model =
         FeCrModel::new(ris_model.lattice().clone(), m12, m12_params::NU_FE, temp).unwrap();
 
-    // 1. Direct trajectory parity on identical initial state and seed.
     let mut init_rng = KmcRng::from_seed(55_001);
     let ris_state = random_single_defect_state(
         &ris_model,
@@ -292,7 +320,6 @@ fn check_vacancy_parity(runs: u64, ensemble_hops: f64) {
         assert!((r.cr_cr - m.collective[2]).abs() <= 1e-12 * m.vacancy.max(1e-30));
     }
 
-    // 2. Ensemble summary parity against fecr_diffusion::run_transport.
     let t_end = ensemble_hops / total_rate;
     let ris_cfg = RisTransportConfig::windowed(0.1 * t_end, t_end, 10, A_FE);
     let m12_cfg = TransportConfig::windowed(0.1 * t_end, t_end, 10, A_FE);
@@ -354,7 +381,14 @@ fn t4_vacancy_parity_with_fecr_diffusion_full() {
 }
 
 #[test]
-fn t5_jackknife_ratio_unbiasedness_and_edge_cases() {
+fn t5_jackknife_ratio_mean_se_and_edge_cases() {
+    let (det_ratio, det_se) = jackknife_ratio_mean_se(&[1.0, 3.0], &[1.0, 2.0], 1.0);
+    assert!((det_ratio - 4.0 / 3.0).abs() < 1e-12);
+    assert!((det_se - 0.25).abs() < 1e-12);
+
+    let (zero_ratio, zero_se) = jackknife_ratio_mean_se(&[0.0], &[0.0], 1.0);
+    assert!(zero_ratio.is_nan() && zero_se.is_nan());
+
     let mut rng = KmcRng::from_seed(42_424);
     let n = 1000;
     let mut runs = Vec::with_capacity(n);
@@ -401,8 +435,6 @@ fn t5_jackknife_ratio_unbiasedness_and_edge_cases() {
     let pure_fe_sum = summarize_ris_transport(&runs[..4], DefectKind::Vacancy, 1024, 0).unwrap();
     assert!(pure_fe_sum.l_cr_d_over_l_cr_cr.0.is_nan());
     assert!(pure_fe_sum.d_cr_over_d_fe.0.is_nan());
-
-    let _ = jackknife_ratio_mean_se(&[0.0], &[0.0], 1.0);
 }
 
 #[test]
@@ -416,7 +448,6 @@ fn t6_validation_and_error_guards() {
         dumbbell: DumbbellParams::senninger2016_r1(),
     };
 
-    // 1. Non-zero k0 rejected.
     let mut k0_params = base_params.clone();
     k0_params.k0_dpa_per_s = 1e-4;
     let m_k0 = FeCrRis::new(k0_params).unwrap();
@@ -426,7 +457,6 @@ fn t6_validation_and_error_guards() {
         Err(RisTransportError::NonZeroCreationRate(_))
     ));
 
-    // 2. Non-empty sink planes rejected.
     let mut sink_params = base_params.clone();
     sink_params.sink_planes = vec![0];
     let m_sink = FeCrRis::new(sink_params).unwrap();
@@ -435,7 +465,6 @@ fn t6_validation_and_error_guards() {
         Err(RisTransportError::NonEmptySinkPlanes(1))
     ));
 
-    // 3. Capacity != 1 rejected.
     let mut cap_params = base_params.clone();
     cap_params.capacity = 2;
     let m_cap = FeCrRis::new(cap_params).unwrap();
@@ -444,7 +473,6 @@ fn t6_validation_and_error_guards() {
         Err(RisTransportError::InvalidCapacity { capacity: 2 })
     ));
 
-    // 4. Empty state (no defect) rejected by sample_ris_transport.
     let m_ok = FeCrRis::new(base_params).unwrap();
     let empty_state = m_ok.random_state(10, 1, 2).unwrap();
     let mut eng_empty =
@@ -458,11 +486,23 @@ fn t6_validation_and_error_guards() {
         })
     ));
 
-    // 5. Invalid lattice parameter, cr_count, replica count, and sample count rejected.
     assert!(matches!(
         run_ris_transport(&m_ok, DefectKind::Vacancy, 10, 1, 1, &cfg),
         Err(RisTransportError::InsufficientReplicas(1))
     ));
+    for bad_a in [0.0, 1e200, 1e-200] {
+        assert!(matches!(
+            run_ris_transport(
+                &m_ok,
+                DefectKind::Vacancy,
+                10,
+                1,
+                2,
+                &RisTransportConfig::windowed(0.1, 1.0, 4, bad_a)
+            ),
+            Err(RisTransportError::InvalidLatticeParameter(_))
+        ));
+    }
     assert!(matches!(
         run_ris_transport(
             &m_ok,
@@ -470,9 +510,9 @@ fn t6_validation_and_error_guards() {
             10,
             1,
             2,
-            &RisTransportConfig::windowed(0.1, 1.0, 4, 0.0)
+            &RisTransportConfig::windowed(0.1, 1.0, usize::MAX, A_FE)
         ),
-        Err(RisTransportError::InvalidLatticeParameter(_))
+        Err(RisTransportError::SampleAllocation(usize::MAX))
     ));
     let n = m_ok.lattice().site_count();
     assert!(matches!(
@@ -504,10 +544,37 @@ fn t6_validation_and_error_guards() {
         })
     ));
 
-    // 6. OriginSlope works with 1 sample, and max_steps guard triggers cleanly.
+    // Tiny time window avoids 0/0 underflow and produces exact 0.0; duplicate times return typed error.
+    let zero_obs = RisObservables {
+        defect_msd: 0.0,
+        fe_fe: 0.0,
+        fe_cr: 0.0,
+        cr_cr: 0.0,
+        fe_defect: 0.0,
+        cr_defect: 0.0,
+    };
+    let tiny_est = estimate_ris(
+        &[0.0, 1e-200],
+        &[zero_obs, zero_obs],
+        FitMethod::WindowedOls,
+    )
+    .expect("normalized OLS avoids underflow");
+    assert_eq!(tiny_est.defect, 0.0);
+    assert!(matches!(
+        estimate_ris(&[1.0, 1.0], &[zero_obs, zero_obs], FitMethod::WindowedOls),
+        Err(RisTransportError::NonFiniteEstimate)
+    ));
+
     let mut rng = KmcRng::from_seed(99);
     let init = random_single_defect_state(&m_ok, DefectKind::Vacancy, 10, &mut rng, 99).unwrap();
     let rate0: f64 = (0..8).map(|d| m_ok.rate(&init, 0, d)).sum();
+
+    let origin_cfg = RisTransportConfig::from_origin(20.0 / rate0, 1, A_FE);
+    let origin_runs =
+        run_ris_transport(&m_ok, DefectKind::Vacancy, 10, 99, 2, &origin_cfg).unwrap();
+    assert_eq!(origin_runs.len(), 2);
+    assert!(origin_runs.iter().all(|r| r.estimate.defect.is_finite()));
+
     let mut eng_cap = Engine::<FeCrRis, DirectCatalog<FeCrRisEvent>>::new(m_ok, init, 100).unwrap();
     let long_grid = SampleGrid::from_origin(10_000.0 / rate0, 4).unwrap();
     assert!(matches!(
@@ -516,6 +583,4 @@ fn t6_validation_and_error_guards() {
             SamplingError::MaxStepsExceeded { max_steps: 5, .. }
         ))
     ));
-    let _ = FitMethod::OriginSlope;
-    let _ = Defect::Vacancy { site: 0 };
 }

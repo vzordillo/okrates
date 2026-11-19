@@ -1,9 +1,4 @@
 //! Ensemble bulk single-defect transport driver for the Fe–Cr RIS model.
-//!
-//! Usage:
-//! `fecr_ris_transport --defect <vacancy|dumbbell> --temperature K --cr-count N --runs R \
-//! --t-end s --samples K --seed S [--t-equil s] [--cells nx ny nz] [--lattice-a m] \
-//! [--max-steps N] [--fit <ols|origin>]`.
 
 use std::env;
 use std::process::exit;
