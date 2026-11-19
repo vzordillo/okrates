@@ -34,20 +34,22 @@ pub struct BccLattice {
 }
 
 impl BccLattice {
-    /// Requires at least 2 conventional cells per axis (`2 * lx * ly * lz` sites).
-    pub fn new(cells: [usize; 3]) -> Result<Self, LatticeError> {
+    pub(crate) fn checked_site_count(cells: [usize; 3]) -> Result<usize, LatticeError> {
         if cells.iter().any(|&dimension| dimension < 2) {
             return Err(LatticeError::TooSmall { cells });
         }
         let max_axis = (i64::MAX as usize) / 2;
-        let Some(site_count) = 2_usize
+        2_usize
             .checked_mul(cells[0])
             .and_then(|n| n.checked_mul(cells[1]))
             .and_then(|n| n.checked_mul(cells[2]))
-            .filter(|_| cells.iter().all(|&d| d <= max_axis))
-        else {
-            return Err(LatticeError::TooLarge { cells });
-        };
+            .filter(|&n| u32::try_from(n).is_ok() && cells.iter().all(|&d| d <= max_axis))
+            .ok_or(LatticeError::TooLarge { cells })
+    }
+
+    /// Requires at least 2 conventional cells per axis and `2 * lx * ly * lz <= u32::MAX`.
+    pub fn new(cells: [usize; 3]) -> Result<Self, LatticeError> {
+        let site_count = Self::checked_site_count(cells)?;
 
         let mut neighbors = Vec::new();
         let mut second_neighbors = Vec::new();
@@ -181,6 +183,27 @@ mod tests {
             );
         }
         for cells in [[usize::MAX, 2, 2], [1 << 30, 1 << 30, 2]] {
+            assert_eq!(
+                BccLattice::new(cells).unwrap_err(),
+                LatticeError::TooLarge { cells }
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_site_counts_exceeding_u32_before_allocating() {
+        assert_eq!(
+            BccLattice::checked_site_count([2, 3, 357_913_941]),
+            Ok(4_294_967_292)
+        );
+        let oversized = [[65536, 16384, 2], [65536, 65536, 6], [2, 3, 357_913_942]];
+        for cells in oversized {
+            assert_eq!(
+                BccLattice::checked_site_count(cells),
+                Err(LatticeError::TooLarge { cells })
+            );
+        }
+        for cells in oversized {
             assert_eq!(
                 BccLattice::new(cells).unwrap_err(),
                 LatticeError::TooLarge { cells }
