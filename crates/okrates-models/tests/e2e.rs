@@ -153,6 +153,20 @@ fn fecr_diffusion_bad_anneal_sweeps() {
 }
 
 #[test]
+fn fecr_diffusion_reports_anneal_allocation_error() {
+    let (code, stdout, stderr) = run(example("fecr_diffusion")
+        .env("RUNS_F", "2")
+        .env("RUNS", "2")
+        .env("ANNEAL_SWEEPS", u64::MAX.to_string()));
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.starts_with("error: cannot allocate anneal trace"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn fecr_observables_small() {
     let (code, stdout, stderr) = run(example("fecr_observables").args(["22", "7", "2", "20"]));
     assert_eq!(code, 0, "stderr: {stderr}");
