@@ -246,14 +246,15 @@ pub fn ols_slope(times: &[f64], values: &[f64]) -> f64 {
         return f64::NAN;
     }
     let n = times.len() as f64;
-    let mean_t = times.iter().sum::<f64>() / n;
+    let t0 = times[0];
+    let mean_dt = times.iter().map(|&t| t - t0).sum::<f64>() / n;
     let mean_v = values.iter().sum::<f64>() / n;
     let num: f64 = times
         .iter()
         .zip(values)
-        .map(|(t, v)| (t - mean_t) * (v - mean_v))
+        .map(|(&t, &v)| ((t - t0) - mean_dt) * (v - mean_v))
         .sum();
-    let den: f64 = times.iter().map(|t| (t - mean_t).powi(2)).sum();
+    let den: f64 = times.iter().map(|&t| ((t - t0) - mean_dt).powi(2)).sum();
     num / den
 }
 
@@ -366,6 +367,14 @@ pub fn run_transport<E: Energetics + Clone + Sync>(
     if cr_count >= model.lattice().site_count() {
         return Err(TransportError::Model(FeCrError::TooManyAtoms));
     }
+    if anneal_sweeps > 0 {
+        let additional = usize::try_from(anneal_sweeps)
+            .map_err(|_| FeCrError::SweepAllocation(anneal_sweeps))?;
+        let mut probe = Vec::<f64>::new();
+        probe
+            .try_reserve(additional)
+            .map_err(|_| FeCrError::SweepAllocation(anneal_sweeps))?;
+    }
     let grid = SampleGrid::windowed(config.t_equil, config.t_end, config.sample_count)?;
     let slope_fn: fn(&[f64], &[f64]) -> f64 = match config.fit_method {
         FitMethod::WindowedOls => ols_slope,
@@ -396,11 +405,19 @@ pub fn run_transport<E: Energetics + Clone + Sync>(
             let traj =
                 sample_fecr_run(&mut sim, &grid, config.lattice_parameter, config.max_steps)?;
             let est = estimate(&traj.times, &traj.values, slope_fn);
+            let fit_half = |ts: &[f64], vs: &[Observables]| -> Option<f64> {
+                if ts.len() < 2 || ts.first() >= ts.last() {
+                    return None;
+                }
+                let d = estimate(ts, vs, ols_slope).tracer_all;
+                d.is_finite().then_some(d)
+            };
             let (early_tracer_all, late_tracer_all) = if traj.times.len() >= 4 {
                 let mid = traj.times.len() / 2;
-                let early = estimate(&traj.times[..mid], &traj.values[..mid], ols_slope).tracer_all;
-                let late = estimate(&traj.times[mid..], &traj.values[mid..], ols_slope).tracer_all;
-                (Some(early), Some(late))
+                (
+                    fit_half(&traj.times[..mid], &traj.values[..mid]),
+                    fit_half(&traj.times[mid..], &traj.values[mid..]),
+                )
             } else {
                 (None, None)
             };

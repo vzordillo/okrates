@@ -313,3 +313,38 @@ fn transport_rejects_oversized_cr_count_and_handles_extreme_displacements() {
     let s = summarize(&big_runs, 1, 2);
     assert!((s.mean_jumps - u64::MAX as f64).abs() <= 4096.0);
 }
+
+#[test]
+fn ols_slope_preserves_accuracy_on_one_ulp_timestamps_and_omits_flat_halves() {
+    use okrates_models::fecr::FeCrError;
+    use okrates_models::fecr_diffusion::{TransportError, ols_slope};
+
+    for ys in [&[0.0, f64::EPSILON][..], &[1.0, 1.0 + f64::EPSILON][..]] {
+        let slope = ols_slope(&[1.0, 1.0 + f64::EPSILON], ys);
+        assert!((slope - 1.0).abs() <= 1e-12, "slope = {slope}");
+    }
+
+    let model = equal_energy_model();
+    let cfg_five = TransportConfig::windowed(1.0, 1.0 + f64::EPSILON, 5, 1.0);
+    let runs_five = run_transport(&model, 8, 5, 2, &cfg_five, 0).unwrap();
+    assert!(runs_five.iter().all(|r| r.early_tracer_all.is_none()));
+    assert!(
+        runs_five
+            .iter()
+            .all(|r| r.late_tracer_all.is_some_and(f64::is_finite))
+    );
+
+    let cfg_four = TransportConfig::windowed(1.0, 1.0 + f64::EPSILON, 4, 1.0);
+    let runs_four = run_transport(&model, 8, 5, 2, &cfg_four, 0).unwrap();
+    assert!(
+        runs_four
+            .iter()
+            .all(|r| r.early_tracer_all.is_none() && r.late_tracer_all.is_none())
+    );
+
+    let cfg_ok = TransportConfig::windowed(5.0, 25.0, 8, 1.0);
+    assert!(matches!(
+        run_transport(&model, 8, 5, 2, &cfg_ok, u64::MAX),
+        Err(TransportError::Model(FeCrError::SweepAllocation(u64::MAX)))
+    ));
+}

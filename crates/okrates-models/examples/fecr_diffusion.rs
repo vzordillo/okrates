@@ -35,6 +35,22 @@ fn env_anneal_sweeps() -> u64 {
     }
 }
 
+fn check_anneal_allocation(sweeps: u64) {
+    if sweeps == 0 {
+        return;
+    }
+    let ok = usize::try_from(sweeps)
+        .ok()
+        .is_some_and(|n| Vec::<f64>::new().try_reserve(n).is_ok());
+    if !ok {
+        eprintln!(
+            "error: {}",
+            okrates_models::fecr::FeCrError::SweepAllocation(sweeps)
+        );
+        std::process::exit(1);
+    }
+}
+
 fn report(name: &str, values: &[f64]) {
     let (mean, se) = mean_se(values);
     println!("{name} = {mean:.12e}");
@@ -116,7 +132,7 @@ fn illustrative(anneal_sweeps: u64) {
         println!("anneal_sweeps = {anneal_sweeps}");
     }
     for n_cr in [0_usize, 22, 43, 86] {
-        let replicas = run_composition(
+        let replicas = match run_composition(
             &model,
             n_cr,
             seed_base,
@@ -125,8 +141,13 @@ fn illustrative(anneal_sweeps: u64) {
             k_count,
             1.0,
             anneal_sweeps,
-        )
-        .expect("valid run");
+        ) {
+            Ok(replicas) => replicas,
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+        };
         let estimates: Vec<ReplicaEstimate> = replicas.iter().map(|r| r.estimate).collect();
         let total_fired: u64 = replicas.iter().map(|r| r.fired).sum();
         let column =
@@ -171,6 +192,7 @@ fn illustrative(anneal_sweeps: u64) {
 
 fn main() {
     let anneal_sweeps = env_anneal_sweeps();
+    check_anneal_allocation(anneal_sweeps);
     correlation_factor();
     illustrative(anneal_sweeps);
     eprintln!("threads = {}", thread_count());
