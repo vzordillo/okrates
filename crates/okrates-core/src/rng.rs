@@ -1,4 +1,6 @@
-//! Seeded ChaCha12 streams with domain-separated replica substreams.
+//! Seeded ChaCha12 streams with domain-separated replica substreams
+//! (Bernstein, "ChaCha, a variant of Salsa20", *Workshop Record of SASC 2008*, pp. 273–278 (2008),
+//! <https://cr.yp.to/chacha.html>).
 
 use rand_chacha::ChaCha12Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};

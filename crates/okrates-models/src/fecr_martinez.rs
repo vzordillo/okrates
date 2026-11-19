@@ -1,6 +1,7 @@
 //! Fe–Cr pair-interaction energetics of Martínez, Senninger, Fu, and Soisson,
-//! *Phys. Rev. B* **86**, 224109 (2012) ("M12"), with Ω(x) from Levesque et al.,
-//! arXiv:1307.7561 (PWSCF-PAW Table I).
+//! *Phys. Rev. B* **86**, 224109 (2012), doi:10.1103/PhysRevB.86.224109 ("M12"),
+//! with `Ω(x, T)` from Levesque, Martínez, Fu, Nastar, and Soisson,
+//! *Phys. Rev. B* **84**, 184205 (2011), doi:10.1103/PhysRevB.84.184205 (PWSCF-PAW Table I).
 //!
 //! Model conventions:
 //! - 1NN and 2NN bonds (`g_2NN = 0.5 * g_1NN`); Einstein + linear `c_P` from M12 Table I,

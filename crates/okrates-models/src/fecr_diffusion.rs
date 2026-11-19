@@ -4,7 +4,13 @@
 //! is `D_v = slope(|dR_v|^2) / 6`, and collective Onsager-related coefficients per vacancy
 //! (`Lambda = L k_B T Omega / c_v`, `c_v = 1/N`) are `Lambda_ab = slope(dR_a . dR_b) / 6`.
 //! The correlation factor `f = N_atoms * mean(D*_all) / mean(D_v)` is estimated as a ratio
-//! of ensemble means with delete-1 jackknife standard error.
+//! of ensemble means with delete-1 jackknife standard error (Quenouille, *J. R. Stat. Soc. B*
+//! **11**, 68–84 (1949), doi:10.1111/j.2517-6161.1949.tb00023.x; Quenouille, *Biometrika* **43**,
+//! 353–360 (1956), doi:10.1093/biomet/43.3-4.353; Tukey, *Ann. Math. Stat.* **29**, 614 (1958)).
+//! For pure BCC vacancy-mediated self-diffusion with equivalent nearest-neighbor jumps on an
+//! infinite lattice, the geometric correlation factor is `f_0 = 0.72722` (Compaan and Haven,
+//! *Trans. Faraday Soc.* **52**, 786–801 (1956), doi:10.1039/TF9565200786); species-dependent
+//! Fe–Cr jump barriers shift the effective alloy correlation factor away from `f_0`.
 
 use std::collections::BTreeMap;
 use std::error::Error;

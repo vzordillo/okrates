@@ -1,6 +1,9 @@
-//! The running peak and time-weighted mean of a count, shared by the `fecr_ris_pilot`
-//! example and `tests/fecr_ris_pilot_tally.rs` (included with `#[path]`, not part of the
-//! crate's API).
+//! Neumaier-compensated running peak and time-weighted mean of a count, shared by the
+//! `fecr_ris_pilot` example and `tests/fecr_ris_pilot_tally.rs` (included with `#[path]`,
+//! not part of the crate's API).
+//!
+//! Summation reference: A. Neumaier, *Z. Angew. Math. Mech.* **54**, 39–51 (1974),
+//! doi:10.1002/zamm.19740540106.
 
 /// Running peak and time-weighted mean of a count.
 #[derive(Default)]
