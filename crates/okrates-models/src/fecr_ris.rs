@@ -9,6 +9,8 @@
 //! 175503 (2004), doi:10.1103/PhysRevLett.92.175503). Positions are in half-lattice units (`a/2`).
 //!
 //! Thermal vacancy and dumbbell jumps use local energy differences obeying detailed balance to rounding;
+//! per Senninger et al. Eq. (3), each of the four compression-site dumbbell jump branches splits its
+//! transition rate equally (`1/2`) between the two symmetry-equivalent 60° final orientations (`z_eff = 4`).
 //! Frenkel-pair creation, I–V recombination, and sink absorption are driven or irreversible.
 //! When a jump lands on a sink site within [`RC_OFFSETS`] of an opposite defect, recombination takes
 //! precedence over sink absorption.
@@ -1401,6 +1403,10 @@ impl FeCrRis {
     }
 
     /// The jump rate in s⁻¹; 0 for an empty record or a blocked jump.
+    ///
+    /// Dumbbell jumps allocate `0.5 * nu0 * exp(ds_mig_kb) * exp(-barrier / kT)` to each of the
+    /// two symmetry-equivalent 60° final orientations per compression-site target (`z_eff = 4`),
+    /// preserving exact detailed balance while matching Senninger et al. Eq. (3) per neighbor branch.
     pub fn rate(&self, s: &FeCrRisState, rec: usize, jump: usize) -> f64 {
         let Some(mv) = self.jump_move(s, rec, jump) else {
             return 0.0;
@@ -1412,7 +1418,7 @@ impl FeCrRis {
             (-barrier / self.kt).exp()
         };
         match mv {
-            Move::Dumbbell { .. } => self.params.dumbbell.prefactor() * boltzmann,
+            Move::Dumbbell { .. } => 0.5 * self.params.dumbbell.prefactor() * boltzmann,
             Move::Vacancy { atom, .. } => {
                 let nu = self
                     .energetics

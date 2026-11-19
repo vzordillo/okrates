@@ -1845,3 +1845,49 @@ fn failed_apply_clears_last_changed_and_last_records() {
     assert!(s.last_changed().is_empty());
     assert!(s.last_records().is_empty());
 }
+
+#[test]
+fn t17_dumbbell_rate_splits_equally_across_two_orientations() {
+    let m = model([6, 6, 6], 650.0, 1);
+    let occ = vec![Species::Fe; m.lattice().site_count()];
+    let d = Defect::Dumbbell {
+        site: 0,
+        axis: 0,
+        plus: Species::Fe,
+        minus: Species::Fe,
+    };
+    let s = m.state_with_defects(occ, &[d], 1).unwrap();
+    let gamma_ff = 1e13 * 2.1_f64.exp() * (-0.34 / (BOLTZMANN_EV_PER_K * 650.0)).exp();
+    let expected_slot = 0.5 * gamma_ff;
+
+    let mut total = 0.0;
+    for c in 0..4 {
+        let r0 = m.rate(&s, 0, 2 * c);
+        let r1 = m.rate(&s, 0, 2 * c + 1);
+        assert!(
+            (r0 - r1).abs() <= 1e-14 * r0,
+            "pair {c} rates differ: {r0} vs {r1}"
+        );
+        assert!(
+            ((r0 / expected_slot) - 1.0).abs() < 1e-11,
+            "slot {} rate {r0} != {expected_slot}",
+            2 * c
+        );
+        assert!(
+            ((r1 / expected_slot) - 1.0).abs() < 1e-11,
+            "slot {} rate {r1} != {expected_slot}",
+            2 * c + 1
+        );
+        assert!(
+            (((r0 + r1) / gamma_ff) - 1.0).abs() < 1e-11,
+            "C-site branch {c} sum {} != {gamma_ff}",
+            r0 + r1
+        );
+        total += r0 + r1;
+    }
+    assert!(
+        ((total / (4.0 * gamma_ff)) - 1.0).abs() < 1e-11,
+        "total dumbbell rate {total} != {}",
+        4.0 * gamma_ff
+    );
+}

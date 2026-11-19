@@ -17,6 +17,7 @@ use okrates_models::fecr_ris_transport::{
     RisTransportConfig, RisTransportError, estimate_ris, random_single_defect_state,
     run_ris_transport, sample_ris_transport, summarize_ris_transport,
 };
+use okrates_models::vacancy::BOLTZMANN_EV_PER_K;
 
 const A_FE: f64 = 2.8665e-10;
 const Z_GATE: f64 = 4.5;
@@ -38,10 +39,19 @@ fn check_pure_fe_defect(defect: DefectKind, runs: u64, target_hops: f64, seed_ba
     let mut rng = KmcRng::from_seed(seed_base);
     let probe = random_single_defect_state(&model, defect, 0, &mut rng, seed_base).unwrap();
     let total_rate: f64 = (0..8).map(|j| model.rate(&probe, 0, j)).sum();
-    assert!(total_rate > 0.0);
-    // All 8 vacancy jumps (or 8 C-site rotational dumbbell slots) share identical pure-Fe rate.
-    let single_rate = total_rate / 8.0;
-    let d_analytic = A_FE * A_FE * single_rate;
+    let kt = BOLTZMANN_EV_PER_K * 650.0;
+    let nu_eff = 1e13 * 2.1_f64.exp();
+    let expected_total_rate = match defect {
+        DefectKind::Vacancy => 8.0 * nu_eff * (-0.69 / kt).exp(),
+        DefectKind::Dumbbell => 4.0 * nu_eff * (-0.34 / kt).exp(),
+    };
+    assert!(
+        ((total_rate / expected_total_rate) - 1.0).abs() < 1e-11,
+        "{}: total_rate {total_rate:e} != expected {expected_total_rate:e}",
+        defect.name()
+    );
+    // Vacancy has 8 NN jumps (Gamma_V each); dumbbell has 4 C-site branches split across 2 orientations (0.5 * Gamma_I per slot).
+    let d_analytic = A_FE * A_FE * (total_rate / 8.0);
 
     let t_end = target_hops / total_rate;
     let config = RisTransportConfig::windowed(0.1 * t_end, t_end, 10, A_FE);

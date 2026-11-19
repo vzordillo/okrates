@@ -372,15 +372,15 @@ const FECR_ESTIMATORS_REDUCED: &[u64] = &[
     4714297785282910612,
     4698817579328050235,
 ];
-const FECR_RIS_EVENTS: u64 = 12945959152933995592;
-const FECR_RIS_COUNTERS: &[u64] = &[333, 313, 19, 19];
-const FECR_RIS_TIME_BITS: u64 = 4649587576939108234;
+const FECR_RIS_EVENTS: u64 = 3311104404065515709;
+const FECR_RIS_COUNTERS: &[u64] = &[301, 278, 22, 23];
+const FECR_RIS_TIME_BITS: u64 = 4649199847678246177;
 // The dt digest is per target (ADR-0006 rule 4, PR #9): the event sequence, counters and
 // final time bits agree on x86_64 Linux and aarch64 macOS, but the last bits of single
 // dt values differ with the platform ln/exp, so the digest over their bits does too.
 // A target is architecture plus OS (the maths library comes with the OS); other targets skip only the dt check.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-const FECR_RIS_DTS: u64 = 12745560918834596932;
-// aarch64 value printed by macOS CI (PR #9, run 44330880606); events, counters and time bits match x86_64.
+const FECR_RIS_DTS: u64 = 1061706550594519766;
+// Pending macOS CI update after D11 (`z_eff = 4`, 0.5 orientation rate split).
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 const FECR_RIS_DTS: u64 = 9886202463999487029;
