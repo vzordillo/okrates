@@ -3,6 +3,7 @@
 The expected output was produced by running the script; never edit it by hand.
 """
 
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -40,3 +41,25 @@ def test_fecr_martinez_comparison_example_small():
     assert len(row) == 20
     assert row[:3] == ["2", "1000.00", "1.00"]
     assert float(row[4]) > 0 and float(row[6]) > 0  # D_Fe, D_Cr
+
+
+def test_fecr_martinez_comparison_zero_diffusivities():
+    # 2 expected jumps in 432 sites (2 Cr): Fe moves (D_Fe > 0), Cr stays unmoved (D_Cr == 0).
+    unmoved_cr = subprocess.run(
+        [sys.executable, str(FECR_EXAMPLE), "2", "2", "1"],
+        check=True, capture_output=True, text=True,
+    )
+    row = unmoved_cr.stdout.splitlines()[2].split()
+    assert len(row) == 20
+    assert float(row[4]) > 0.0 and float(row[6]) == 0.0
+    assert float(row[12]) == 0.0 and float(row[13]) == 0.0
+
+    # Negligible window: neither species moves (D_Fe == 0, D_Cr == 0), ratio is NaN.
+    unmoved_all = subprocess.run(
+        [sys.executable, str(FECR_EXAMPLE), "1e-9", "2", "1"],
+        check=True, capture_output=True, text=True,
+    )
+    row_zero = unmoved_all.stdout.splitlines()[2].split()
+    assert len(row_zero) == 20
+    assert float(row_zero[4]) == 0.0
+    assert math.isnan(float(row_zero[12])) and math.isnan(float(row_zero[13]))
