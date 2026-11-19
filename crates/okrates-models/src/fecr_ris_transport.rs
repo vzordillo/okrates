@@ -728,11 +728,19 @@ pub fn estimate_ris(
             sample_count: count,
         });
     }
-    let t_scale = times.iter().map(|t| t.abs()).fold(0.0_f64, f64::max);
+    if times.iter().any(|t| !t.is_finite()) {
+        return Err(RisTransportError::NonFiniteEstimate);
+    }
+    let t0 = match fit_method {
+        FitMethod::WindowedOls => times[0],
+        FitMethod::OriginSlope => 0.0,
+    };
+    let shifted: Vec<f64> = times.iter().map(|&t| t - t0).collect();
+    let t_scale = shifted.iter().map(|t| t.abs()).fold(0.0_f64, f64::max);
     if !t_scale.is_finite() || t_scale == 0.0 {
         return Err(RisTransportError::NonFiniteEstimate);
     }
-    let scaled_times: Vec<f64> = times.iter().map(|&t| t / t_scale).collect();
+    let scaled_times: Vec<f64> = shifted.iter().map(|&t| t / t_scale).collect();
     let slope: fn(&[f64], &[f64]) -> f64 = match fit_method {
         FitMethod::WindowedOls => ols_slope,
         FitMethod::OriginSlope => origin_slope,

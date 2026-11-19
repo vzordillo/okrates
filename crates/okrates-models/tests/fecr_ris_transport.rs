@@ -560,8 +560,27 @@ fn t6_validation_and_error_guards() {
     )
     .expect("normalized OLS avoids underflow");
     assert_eq!(tiny_est.defect, 0.0);
+    let obs_msd = |defect_msd| RisObservables {
+        defect_msd,
+        ..zero_obs
+    };
+    let offset_est = estimate_ris(
+        &[1e16, 1e16 + 2.0, 1e16 + 4.0],
+        &[obs_msd(0.0), obs_msd(12.0), obs_msd(24.0)],
+        FitMethod::WindowedOls,
+    )
+    .expect("shifted OLS preserves small spacing on large-offset timestamps");
+    assert!((offset_est.defect - 1.0).abs() < 1e-12);
     assert!(matches!(
         estimate_ris(&[1.0, 1.0], &[zero_obs, zero_obs], FitMethod::WindowedOls),
+        Err(RisTransportError::NonFiniteEstimate)
+    ));
+    assert!(matches!(
+        estimate_ris(
+            &[1.0, f64::NAN, 2.0],
+            &[zero_obs, zero_obs, zero_obs],
+            FitMethod::WindowedOls,
+        ),
         Err(RisTransportError::NonFiniteEstimate)
     ));
 
