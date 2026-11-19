@@ -9,6 +9,7 @@ use crate::model::{Model, ReversibleModel};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotError {
     OutOfRange { slot: usize, slot_count: usize },
+    TooLarge { slot_count: usize },
 }
 
 impl fmt::Display for SlotError {
@@ -16,6 +17,9 @@ impl fmt::Display for SlotError {
         match self {
             Self::OutOfRange { slot, slot_count } => {
                 write!(f, "slot {slot} out of range for {slot_count} slots")
+            }
+            Self::TooLarge { slot_count } => {
+                write!(f, "slot count {slot_count} exceeds sum-tree capacity")
             }
         }
     }

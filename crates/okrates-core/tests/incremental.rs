@@ -6,7 +6,7 @@ use std::fmt;
 use okrates_core::reference::{GraphRandomWalk, Hop};
 use okrates_core::{
     Checkpointable, IncrementalModel, IncrementalSimulation, Model, ReversibleModel, SimError,
-    Simulation, Step, SumTree,
+    Simulation, SlotError, Step, SumTree,
 };
 
 fn star() -> GraphRandomWalk {
@@ -243,5 +243,52 @@ fn failed_incremental_steps_roll_back_state_tree_clock_and_rng_atomically() {
         assert_eq!(sim.steps(), 0, "mode={mode:?}");
         assert_eq!(sim.time(), 0.0, "mode={mode:?}");
         assert_eq!(sim.checkpoint(), ckpt_before, "mode={mode:?}");
+    }
+}
+
+struct OversizedSlotsModel(usize);
+
+impl Model for OversizedSlotsModel {
+    type State = ();
+    type Event = ();
+    type Error = FaultError;
+
+    fn enumerate_events(&self, _: &(), _: &mut dyn FnMut((), f64)) {}
+    fn apply(&self, _: &mut (), _: &()) -> Result<(), FaultError> {
+        Ok(())
+    }
+}
+
+impl ReversibleModel for OversizedSlotsModel {
+    type Undo = ();
+
+    fn apply_reversible(&self, _: &mut (), _: &()) -> Result<(), FaultError> {
+        Ok(())
+    }
+    fn undo(&self, _: &mut (), _: ()) {}
+}
+
+impl IncrementalModel for OversizedSlotsModel {
+    fn slot_count(&self, _: &()) -> usize {
+        self.0
+    }
+    fn slot_rate(&self, _: &(), _: usize) -> f64 {
+        0.0
+    }
+    fn slot_event(&self, _: &(), _: usize) {}
+    fn affected_slots(&self, _: &(), _: &(), _: &mut Vec<usize>) {}
+}
+
+#[test]
+fn oversized_slot_count_returns_catalog_too_large_error() {
+    for count in [usize::MAX, (usize::MAX >> 1) + 2] {
+        assert_eq!(
+            SumTree::try_with_len(count),
+            Err(SlotError::TooLarge { slot_count: count })
+        );
+        assert!(matches!(
+            IncrementalSimulation::new(OversizedSlotsModel(count), (), 1),
+            Err(SimError::CatalogTooLarge { slot_count }) if slot_count == count
+        ));
     }
 }
