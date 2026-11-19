@@ -20,17 +20,60 @@ pub struct SumTree {
 }
 
 impl SumTree {
+    /// Checks `len` against power-of-two capacity and addressable `f64` tree buffer limits.
+    pub fn check_len(len: usize) -> Result<(usize, usize), SlotError> {
+        let cap = len
+            .max(1)
+            .checked_next_power_of_two()
+            .ok_or(SlotError::TooLarge { slot_count: len })?;
+        let node_count = cap
+            .checked_mul(2)
+            .ok_or(SlotError::TooLarge { slot_count: len })?;
+        node_count
+            .checked_mul(std::mem::size_of::<f64>())
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .ok_or(SlotError::TooLarge { slot_count: len })?;
+        Ok((cap, node_count))
+    }
+
+    pub fn try_with_len(len: usize) -> Result<Self, SlotError> {
+        let (cap, node_count) = Self::check_len(len)?;
+        let mut nodes = Vec::new();
+        nodes
+            .try_reserve_exact(node_count)
+            .map_err(|_| SlotError::TooLarge { slot_count: len })?;
+        nodes.resize(node_count, 0.0);
+        Ok(Self { len, cap, nodes })
+    }
+
+    pub fn try_new(rates: &[f64]) -> Result<Self, SlotError> {
+        debug_assert!(rates.iter().all(|r| r.is_finite() && *r >= 0.0));
+        let mut tree = Self::try_with_len(rates.len())?;
+        tree.nodes[tree.cap..tree.cap + tree.len].copy_from_slice(rates);
+        tree.recompute_internal_sums();
+        Ok(tree)
+    }
+
     /// Builds a tree from finite non-negative slot `rates`.
     pub fn new(rates: &[f64]) -> Self {
-        debug_assert!(rates.iter().all(|r| r.is_finite() && *r >= 0.0));
-        let len = rates.len();
-        let cap = len.max(1).next_power_of_two();
-        let mut nodes = vec![0.0; 2 * cap];
-        nodes[cap..cap + len].copy_from_slice(rates);
-        for k in (1..cap).rev() {
-            nodes[k] = nodes[2 * k] + nodes[2 * k + 1];
+        Self::try_new(rates).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn recompute_internal_sums(&mut self) {
+        for k in (1..self.cap).rev() {
+            self.nodes[k] = self.nodes[2 * k] + self.nodes[2 * k + 1];
         }
-        Self { len, cap, nodes }
+    }
+
+    pub(crate) fn init_from_fn<E>(
+        &mut self,
+        mut f: impl FnMut(usize) -> Result<f64, E>,
+    ) -> Result<(), E> {
+        for slot in 0..self.len {
+            self.nodes[self.cap + slot] = f(slot)?;
+        }
+        self.recompute_internal_sums();
+        Ok(())
     }
 
     pub fn len(&self) -> usize {

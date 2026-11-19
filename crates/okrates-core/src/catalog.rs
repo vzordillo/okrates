@@ -167,23 +167,30 @@ impl SumTreeCatalog {
     }
 }
 
+fn map_slot_error<ME>(err: SlotError) -> SimError<ME> {
+    match err {
+        SlotError::OutOfRange { slot, slot_count } => SimError::InvalidSlot { slot, slot_count },
+        SlotError::TooLarge { slot_count } => SimError::CatalogTooLarge { slot_count },
+    }
+}
+
 impl<M: IncrementalModel> CatalogBackend<M> for SumTreeCatalog {
     type Selection = usize;
 
     fn build(model: &M, state: &M::State) -> Result<Self, SimError<M::Error>> {
         let count = model.slot_count(state);
-        let mut rates = Vec::with_capacity(count);
-        for slot in 0..count {
-            let rate = Rate::new(model.slot_rate(state, slot)).map_err(|source| {
-                SimError::InvalidRate {
+        let mut tree = SumTree::try_with_len(count)
+            .map_err(|_| SimError::CatalogTooLarge { slot_count: count })?;
+        tree.init_from_fn(|slot| {
+            Rate::new(model.slot_rate(state, slot))
+                .map(Rate::get)
+                .map_err(|source| SimError::InvalidRate {
                     index: slot,
                     source,
-                }
-            })?;
-            rates.push(rate.get());
-        }
+                })
+        })?;
         Ok(Self {
-            tree: SumTree::new(&rates),
+            tree,
             scratch: Vec::new(),
             staged: Vec::new(),
         })
@@ -241,9 +248,9 @@ impl<M: IncrementalModel> CatalogBackend<M> for SumTreeCatalog {
         for &affected in &self.scratch {
             let prev = match self.tree.try_rate(affected) {
                 Ok(prev) => prev,
-                Err(SlotError::OutOfRange { slot, slot_count }) => {
+                Err(err) => {
                     model.undo(state, undo);
-                    return Err(SimError::InvalidSlot { slot, slot_count });
+                    return Err(map_slot_error(err));
                 }
             };
             match Rate::new(model.slot_rate(state, affected)) {
@@ -259,14 +266,12 @@ impl<M: IncrementalModel> CatalogBackend<M> for SumTreeCatalog {
         }
 
         for (applied, &(affected, _, rate)) in self.staged.iter().enumerate() {
-            if let Err(SlotError::OutOfRange { slot, slot_count }) =
-                self.tree.try_set(affected, rate)
-            {
+            if let Err(err) = self.tree.try_set(affected, rate) {
                 for &(prev_slot, prev_rate, _) in self.staged[..applied].iter().rev() {
                     let _ = self.tree.try_set(prev_slot, prev_rate);
                 }
                 model.undo(state, undo);
-                return Err(SimError::InvalidSlot { slot, slot_count });
+                return Err(map_slot_error(err));
             }
         }
         Ok(event)

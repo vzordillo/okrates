@@ -21,6 +21,7 @@ pub enum SimError<ME> {
     InvalidRate { index: usize, source: RateError },
     TotalRateNotFinite,
     InvalidSlot { slot: usize, slot_count: usize },
+    CatalogTooLarge { slot_count: usize },
     SlotCountChanged { expected: usize, found: usize },
     StepCounterOverflow,
     Clock(ClockError),
@@ -36,6 +37,9 @@ impl<ME: Error> fmt::Display for SimError<ME> {
             Self::TotalRateNotFinite => write!(f, "total event rate is not finite"),
             Self::InvalidSlot { slot, slot_count } => {
                 write!(f, "slot {slot} out of range for {slot_count} slots")
+            }
+            Self::CatalogTooLarge { slot_count } => {
+                write!(f, "catalog of {slot_count} slots exceeds capacity")
             }
             Self::SlotCountChanged { expected, found } => {
                 write!(f, "slot count changed from {expected} to {found}")
@@ -53,6 +57,7 @@ impl<ME: Error + 'static> Error for SimError<ME> {
             Self::InvalidRate { source, .. } => Some(source),
             Self::TotalRateNotFinite
             | Self::InvalidSlot { .. }
+            | Self::CatalogTooLarge { .. }
             | Self::SlotCountChanged { .. }
             | Self::StepCounterOverflow => None,
             Self::Clock(source) => Some(source),
