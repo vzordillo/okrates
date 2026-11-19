@@ -1,4 +1,6 @@
-//! Simulation clock using exact TwoSum compensated summation.
+//! Simulation clock using exact TwoSum compensated summation
+//! (Møller, *BIT* **5**, 37–50 (1965), doi:10.1007/BF01975722;
+//! Knuth, *The Art of Computer Programming*, Vol. 2, 3rd ed. (1997), §4.2.2, Theorem B).
 
 use std::cmp::Ordering;
 use std::error::Error;

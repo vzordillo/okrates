@@ -1,5 +1,8 @@
 //! Kawasaki (Fe↔Cr swap) Metropolis equilibration and 1NN Warren–Cowley SRO diagnostics.
 //!
+//! Spin-exchange kinetics follow Kawasaki, *Phys. Rev.* **145**, 224–230 (1966),
+//! doi:10.1103/PhysRev.145.224, with Metropolis acceptance (Metropolis, Rosenbluth, Rosenbluth,
+//! Teller, and Teller, *J. Chem. Phys.* **21**, 1087–1092 (1953), doi:10.1063/1.1699114).
 //! Composition and vacancy site remain fixed, sampling the canonical Boltzmann
 //! distribution conditional on the vacancy position.
 
@@ -8,7 +11,9 @@ use okrates_core::KmcRng;
 use crate::bcc::BccLattice;
 use crate::fecr::{Energetics, FeCrError, FeCrModel, Species};
 
-/// Warren–Cowley 1NN short-range order `alpha_1 = 1 - P(Cr | Fe) / x_Cr` over atom–atom 1NN bonds.
+/// Warren–Cowley 1NN short-range order `alpha_1 = 1 - P(Cr | Fe) / x_Cr` over atom–atom 1NN bonds
+/// (Cowley, *Phys. Rev.* **77**, 669–675 (1950), doi:10.1103/PhysRev.77.669;
+/// Warren, *X-Ray Diffraction* (1969)).
 ///
 /// Positive values indicate Fe–Cr clustering/phase separation; negative values indicate ordering.
 pub fn warren_cowley_alpha1(lattice: &BccLattice, occupancy: &[Species]) -> Result<f64, FeCrError> {
@@ -72,6 +77,7 @@ pub struct Anneal {
     pub diagnostics: AnnealDiagnostics,
 }
 
+// Møller–Knuth TwoSum (Møller, BIT 5, 37–50 (1965); Knuth, TAOCP Vol. 2, 3rd ed. (1997), §4.2.2, Theorem B).
 fn two_sum(a: f64, b: f64) -> (f64, f64) {
     let s = a + b;
     let v = s - a;

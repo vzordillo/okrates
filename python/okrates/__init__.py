@@ -43,7 +43,8 @@ class PairEnergeticsConfig:
 
 @dataclass(frozen=True, slots=True)
 class Martinez2012Config:
-    """Martínez et al. PRB 86, 224109 (2012) Fe–Cr energetics (requires cells >= 3 per axis)."""
+    """Martínez et al., PRB 86, 224109 (2012), doi:10.1103/PhysRevB.86.224109 Fe–Cr energetics
+    with Levesque et al., PRB 84, 184205 (2011), doi:10.1103/PhysRevB.84.184205 mixing (cells >= 3)."""
 
     barrier_policy: BarrierPolicyName = "symmetric_floor"
     attempt_frequencies_hz: tuple[float, float] | None = None
@@ -52,7 +53,7 @@ class Martinez2012Config:
 
 @dataclass(frozen=True, slots=True)
 class BarrierTableConfig:
-    """Tabulated Fe–Cr NEB barrier set validated for forward/reverse detailed balance."""
+    """Tabulated Fe–Cr NEB barrier set validated for forward/reverse detailed balance (CI-NEB: Henkelman et al., J. Chem. Phys. 113, 9901 (2000), doi:10.1063/1.1329672)."""
 
     barrier_set_json: str
 
@@ -64,7 +65,7 @@ EnergeticsConfig: TypeAlias = (
 
 @dataclass(frozen=True, slots=True)
 class AnnealConfig:
-    """Pre-dynamics Kawasaki Metropolis equilibration (`N_Fe + N_Cr` swap proposals per sweep)."""
+    """Pre-dynamics Kawasaki (Phys. Rev. 145, 224 (1966), doi:10.1103/PhysRev.145.224) Metropolis (J. Chem. Phys. 21, 1087 (1953), doi:10.1063/1.1699114) equilibration (`N_Fe + N_Cr` swap proposals per sweep)."""
 
     sweeps: int = 0
 
@@ -259,7 +260,7 @@ class RunManifest:
 
 @dataclass(frozen=True, slots=True)
 class DiffusionResult:
-    """Fe–Cr transport coefficients in `m^2/s`, jackknife correlation factor `f`, and provenance manifest."""
+    """Fe–Cr transport coefficients in `m^2/s`, delete-1 jackknife correlation factor `f` (Quenouille, J. R. Stat. Soc. B 11, 68 (1949), Biometrika 43, 353 (1956); Tukey, Ann. Math. Stat. 29, 614 (1958)), and provenance manifest."""
 
     D_v: float
     D_v_se: float
@@ -302,7 +303,7 @@ class DiffusionResult:
 
 @dataclass(frozen=True, slots=True)
 class AnnealResult:
-    """Kawasaki equilibration energy trajectory (eV), Warren–Cowley 1NN `alpha_1` trajectory, and diagnostics."""
+    """Kawasaki equilibration energy trajectory (eV), Warren–Cowley 1NN `alpha_1` trajectory (Cowley, Phys. Rev. 77, 669 (1950), doi:10.1103/PhysRev.77.669; Warren, 1969), and diagnostics."""
 
     energy: npt.NDArray[np.float64]
     sro_alpha1: npt.NDArray[np.float64]
@@ -469,7 +470,7 @@ def run_anneal(
     sweeps: int,
     seed: int,
 ) -> AnnealResult:
-    """Run Kawasaki Fe↔Cr Metropolis equilibration and return energy, 1NN SRO `alpha_1`, and diagnostics."""
+    """Run Kawasaki Fe↔Cr Metropolis equilibration (Kawasaki, Phys. Rev. 145, 224 (1966), doi:10.1103/PhysRev.145.224; Metropolis et al., J. Chem. Phys. 21, 1087 (1953), doi:10.1063/1.1699114) and return energy, 1NN SRO `alpha_1`, and diagnostics."""
     kwargs = _unpack_energetics(energetics)
     (
         energy,

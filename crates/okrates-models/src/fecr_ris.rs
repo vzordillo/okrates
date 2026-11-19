@@ -1,8 +1,12 @@
 //! Fe–Cr radiation-induced segregation model: lattice atoms, ⟨110⟩ dumbbells, and vacancies.
 //!
 //! Lattice bonds and vacancy saddle interactions come from [`Martinez2012`]; dumbbell
-//! parameters follow Senninger et al., Acta Mater. 103, 1 (2016)
-//! ([`DumbbellParams::senninger2016_r1`]). Positions are in half-lattice units (`a/2`).
+//! parameters follow O. Senninger, F. Soisson, E. Martínez, M. Nastar, C.-C. Fu, and
+//! Y. Bréchet, *Acta Mater.* **103**, 1–11 (2016), doi:10.1016/j.actamat.2015.09.058
+//! ([`DumbbellParams::senninger2016_r1`]), with ⟨110⟩ dumbbell migration via Johnson's 60°
+//! rotation–translation jump (Johnson, *Phys. Rev.* **134**, A1329–A1336 (1964),
+//! doi:10.1103/PhysRev.134.A1329; Fu, Willaime, and Ordejón, *Phys. Rev. Lett.* **92**,
+//! 175503 (2004), doi:10.1103/PhysRevLett.92.175503). Positions are in half-lattice units (`a/2`).
 //!
 //! Thermal vacancy and dumbbell jumps use local energy differences obeying detailed balance to rounding;
 //! Frenkel-pair creation, I–V recombination, and sink absorption are driven or irreversible.
@@ -74,7 +78,8 @@ pub struct DumbbellParams {
 }
 
 impl DumbbellParams {
-    /// The R1 minimax fit to Senninger et al. 2016, copied from `tests/data/fecr_ris_r1.txt`.
+    /// The R1 minimax fit to Senninger et al., *Acta Mater.* **103**, 1–11 (2016),
+    /// doi:10.1016/j.actamat.2015.09.058, copied from `tests/data/fecr_ris_r1.txt`.
     pub fn senninger2016_r1() -> Self {
         Self {
             g: [-8.880000000000827, -8.737909004145983, -6.719999999999268],
@@ -147,7 +152,12 @@ pub struct FeCrRisParams {
     pub sink_planes: Vec<i64>,
     /// Temperature in K (finite, at least 0).
     pub temperature_k: f64,
-    /// Frenkel-pair creation rate per site in s⁻¹ (finite, at least 0).
+    /// Frenkel-pair creation rate per lattice site in s⁻¹ (finite, >= 0).
+    ///
+    /// Follows Senninger et al. (2016), Eq. (7)–(8) & Sec. 3.3, defining `dpa` directly as one
+    /// Frenkel pair per site (electron irradiation), without an NRT cascade factor
+    /// (cf. Norgett, Robinson, and Torrens, *Nucl. Eng. Des.* **33**, 50–54 (1975),
+    /// doi:10.1016/0029-5493(75)90035-7).
     pub k0_dpa_per_s: f64,
     /// Defect record capacity `P` (at least 1).
     pub capacity: usize,

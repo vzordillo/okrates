@@ -19,22 +19,22 @@
     <td width="50%"><img src="assets/fecr-ris.gif" width="100%" alt="Fe-10% Cr box under irradiation: vacancies (red rings) and self-interstitial dumbbells (green) appear in pairs, migrate, recombine or are absorbed at a sink plane (pink)"></td>
   </tr>
   <tr>
-    <td>Thermal ageing of Fe–20 % Cr (Martínez 2012 energetics, 432 BCC sites, 769 K): Cr atoms cluster during 400 Kawasaki Monte Carlo sweeps, then a single vacancy makes 4,000 kinetic Monte Carlo jumps through the alloy.</td>
-    <td>Irradiation of Fe–10 % Cr (432 BCC sites, 573 K, accelerated damage rate of 3×10⁴ dpa/s): Frenkel pairs of vacancies and self-interstitial dumbbells are created, the dumbbells migrate quickly, and the defects recombine or are absorbed at the sink plane (pink). Over 6,000 events (1.5 dpa), 560 of 588 pairs recombine and the rest reach the sink.</td>
+    <td>Thermal ageing of Fe–20 % Cr (Martínez et al., 2012 energetics, 432 BCC sites, 769 K): Cr atoms cluster during 400 Kawasaki Monte Carlo sweeps (Kawasaki, 1966), then a single vacancy makes 4,000 kinetic Monte Carlo jumps through the alloy.</td>
+    <td>Irradiation of Fe–10 % Cr (Senninger et al., 2016; 432 BCC sites, 573 K, accelerated damage rate of 3×10⁴ dpa/s): Frenkel pairs of vacancies and self-interstitial dumbbells are created, the dumbbells migrate quickly, and the defects recombine or are absorbed at the sink plane (pink). Over 6,000 events (1.5 dpa), 560 of 588 pairs recombine and the rest reach the sink.</td>
   </tr>
 </table>
 
 ## What it does
 
-okrates simulates continuous-time Markov chains in the residence-time form of Bortz, Kalos and Lebowitz. You describe a system by its states, the transitions that can leave each state, and their rates. The engine draws each event with probability proportional to its rate, advances a continuous clock by an exponentially distributed waiting time, and applies the event. Nothing in the engine assumes a lattice, a material or a particular kind of event.
+okrates simulates continuous-time Markov chains in the residence-time form of Bortz, Kalos and Lebowitz (1975). You describe a system by its states, the transitions that can leave each state, and their rates. The engine draws each event with probability proportional to its rate, advances a continuous clock by an exponentially distributed waiting time, and applies the event. Nothing in the engine assumes a lattice, a material or a particular kind of event.
 
 Two event catalogs give identical statistics at different cost. The direct catalog recomputes every rate each step. The sum-tree catalog updates only the rates an event actually changes, which keeps a step cheap even with hundreds of thousands of possible events.
 
-Runs are reproducible in a strict sense. Every replica and every purpose (dynamics, initial state, defect creation) draws from its own seeded random stream, so an ensemble gives the same numbers on any number of threads. A checkpoint stores the full generator and clock state, and a resumed run continues bit for bit. Run manifests record hashes of the parameters, barrier tables and checkpoints behind each result.
+Runs are reproducible in a strict sense. Every replica and every purpose (dynamics, initial state, defect creation) draws from its own seeded ChaCha12 random stream (Bernstein, 2008), so an ensemble gives the same numbers on any number of threads. A checkpoint stores the full generator and TwoSum compensated clock state (Møller, 1965; Knuth, 1997), and a resumed run continues bit for bit. Run manifests record hashes of the parameters, barrier tables and checkpoints behind each result.
 
 ## Design
 
-A kinetic Monte Carlo code has two parts that change for different reasons. The physics, meaning which states exist, which transitions are possible and how fast they happen, changes with every material and mechanism. The algorithm, meaning how an event is chosen, how time advances and how the event list stays current, is the same for all of them. okrates keeps the two apart: a model describes physics only, and the engine owns selection, time, randomness and checkpoints. A new mechanism means writing a new model, and the engine's guarantees come with it.
+A kinetic Monte Carlo code has two parts that change for different reasons. The physics, meaning which states exist, which transitions are possible and how fast they happen, changes with every material and mechanism. The algorithm, meaning how an event is chosen, how time advances and how the event list stays current, is the same for all of them. okrates keeps the two apart: a model describes physics only (using built-in energetics or barriers imported via NEB adapters; Henkelman et al., 2000), and the engine owns selection, time, randomness and checkpoints. A new mechanism means writing a new model, and the engine's guarantees come with it.
 
 ```mermaid
 %%{init: {"flowchart": {"nodeSpacing": 18, "rankSpacing": 34, "padding": 8, "curve": "basis"}, "themeVariables": {"fontSize": "15px"}}}%%
@@ -157,7 +157,7 @@ runs = 2000
 
 ### 2. Vacancy diffusion in Fe–Cr alloys
 
-**Reference.** E. Martínez, O. Senninger, C.-C. Fu and F. Soisson, "Decomposition kinetics of Fe–Cr solid solutions during thermal aging", Phys. Rev. B 86, 224109 (2012), [doi:10.1103/PhysRevB.86.224109](https://doi.org/10.1103/PhysRevB.86.224109). The paper builds an atomistic kMC model of vacancy diffusion in Fe–Cr from DFT: pair interactions that depend on the local composition (their Table I), saddle-point interactions, and migration barriers for vacancy–solute configurations (their Table II).
+**Reference.** E. Martínez, O. Senninger, C.-C. Fu and F. Soisson, "Decomposition kinetics of Fe–Cr solid solutions during thermal aging", Phys. Rev. B 86, 224109 (2012), [doi:10.1103/PhysRevB.86.224109](https://doi.org/10.1103/PhysRevB.86.224109), using the concentration-dependent Fe–Cr mixing interaction of M. Levesque, E. Martínez, C.-C. Fu, M. Nastar and F. Soisson, Phys. Rev. B 84, 184205 (2011), [doi:10.1103/PhysRevB.84.184205](https://doi.org/10.1103/PhysRevB.84.184205). The model builds an atomistic kMC treatment of vacancy diffusion in Fe–Cr from DFT: pair interactions that depend on the local composition (Martínez et al., 2012, Table I; Levesque et al., 2011, Eq. 9 and Sec. III B), saddle-point interactions, and migration barriers for vacancy–solute configurations (Martínez et al., 2012, Table II).
 
 **What the source reports.** Twenty migration barriers in Table II, given to 0.01 eV, and in Fig. 4 the model tracer diffusivities of Fe and Cr in dilute alloys against 1000/T. Read from the figure, the ratio D*_Cr/D*_Fe is 2.03, 2.12, 2.21 and 2.31 at 1000/T = 1.0, 1.1, 1.2 and 1.3.
 
@@ -166,7 +166,7 @@ runs = 2000
 1. We transcribed Tables I and II and wrote the energy model (`crates/okrates-models/src/fecr_martinez.rs`): composition-dependent first- and second-neighbour pair energies, local composition measured around each bond, and saddle-point energies refitted at the run temperature.
 2. Where the paper is ambiguous we chose the reading that reproduces Table II. Table I prints the sign of one pair term in a way that contradicts the paper's own equation; with the equation's sign, Table II is reproduced to 0.005 eV, and with the printed sign it is off by about 0.06 eV.
 3. We added one rule the paper does not state. In annealed alloys at high Cr content a few configurations give a slightly negative barrier. We floor the saddle energy at the higher of the initial and final energies, which keeps detailed balance exact, and we count every activation. It never triggers in the dilute runs below.
-4. The diffusion runs use a box of 432 sites with one vacancy, a Kawasaki (Fe↔Cr swap) anneal of the Cr arrangement before the dynamics, 64 replicas of about 10⁶ jumps each, and tracer diffusivities from the slope of the mean squared displacement.
+4. The diffusion runs use a box of 432 sites with one vacancy, a Kawasaki (1966) spin-exchange anneal with Metropolis (1953) acceptance of the Cr arrangement before the dynamics, 64 replicas of about 10⁶ jumps each, and tracer diffusivities from the slope of the mean squared displacement.
 
 **How to run it.** The barrier comparison is a test, and the diffusion calculations run from Python after `maturin develop --release`:
 
@@ -174,7 +174,7 @@ runs = 2000
 cargo test --locked -p okrates-models --test fecr_martinez
 ```
 
-The comparison with the paper's Fig. 4 is a script. It takes about 6 minutes for the four dilute points on our 18-core Linux x86_64 workstation (measured), and it prints one row per point with the diffusivities, their ratio, the all-atom correlation factor `f` (`431 · mean(D*_all) / mean(D_v)`), their standard errors, and the Fe tracer factor `f_kmc = N · D*_Fe / Γ₀`. These rows are the numbers in the result below:
+The comparison with the paper's Fig. 4 is a script. It takes about 6 minutes for the four dilute points on our 18-core Linux x86_64 workstation (measured), and it prints one row per point with the diffusivities, their ratio, the all-atom correlation factor `f` (`431 · mean(D*_all) / mean(D_v)`, with delete-1 jackknife standard error; Quenouille, 1949, 1956; Tukey, 1958), their standard errors, and the Fe tracer factor `f_kmc = N · D*_Fe / Γ₀`. These rows are the numbers in the result below:
 
 ```text
 python examples/python/fecr_martinez_comparison.py 1e6 64 4
@@ -204,13 +204,13 @@ D*_Cr = 1.118e-11 +/- 6.0e-13 m^2/s
 D*_Fe = 2.364e-12 +/- 7.6e-14 m^2/s
 ```
 
-**Result.** Nineteen of the twenty Table II barriers agree within half the last printed digit (0.005 eV); the twentieth, H5 in Cr, is off by 0.0052 eV. In dilute alloys (2 Cr in 431 atoms, 769–1000 K) the ratio D*_Cr/D*_Fe is 1.97, 2.08, 2.08 and 2.35 (standard errors 0.11–0.15) at 1000/T = 1.0, 1.1, 1.2 and 1.3, against 2.03, 2.12, 2.21 and 2.31 from the paper's figure; every point lies within 1.2 standard errors. The dilute Fe tracer factor `f_kmc = N · D*_Fe / Γ₀` (distinct from the script's all-atom factor `f` over the sampled `D_v`) comes out at 0.728–0.736, consistent with the equal-energy correlation factor 0.7286 ± 0.0026 that okrates gives for the same 432-site box. The figure repeats the calculation in a smaller dilute run (4 Cr in 432 sites, 128 runs) from 700 to 1100 K and shows Cr diffusing about twice as fast as Fe throughout.
+**Result.** Nineteen of the twenty Table II barriers agree within half the last printed digit (0.005 eV); the twentieth, H5 in Cr, is off by 0.0052 eV. In dilute alloys (2 Cr in 431 atoms, 769–1000 K) the ratio D*_Cr/D*_Fe is 1.97, 2.08, 2.08 and 2.35 (standard errors 0.11–0.15) at 1000/T = 1.0, 1.1, 1.2 and 1.3, against 2.03, 2.12, 2.21 and 2.31 from the paper's figure; every point lies within 1.2 standard errors. The dilute Fe tracer factor `f_kmc = N · D*_Fe / Γ₀` (distinct from the script's all-atom factor `f` over the sampled `D_v`) comes out at 0.728–0.736, consistent with the equal-energy correlation factor 0.7286 ± 0.0026 that okrates gives for the same 432-site box (against the infinite-BCC monovacancy limit f₀ = 0.72722; Compaan and Haven, 1956, quoted as 0.727 in Martínez et al., 2012). The figure repeats the calculation in a smaller dilute run (4 Cr in 432 sites, 128 runs) from 700 to 1100 K and shows Cr diffusing about twice as fast as Fe throughout.
 
 <p align="center"><img src="assets/fecr-arrhenius.svg" width="640" alt="Tracer diffusivities of Cr and Fe against 1000/T on a log axis; Cr is about twice Fe at every temperature"></p>
 
 ### 3. Self-interstitials and radiation damage in Fe–Cr
 
-**Reference.** O. Senninger et al., "Modeling radiation induced segregation in iron–chromium alloys", Acta Mater. 103, 1–11 (2016), [doi:10.1016/j.actamat.2015.09.058](https://doi.org/10.1016/j.actamat.2015.09.058). The paper adds ⟨110⟩ self-interstitial dumbbells to the Martínez vacancy model, creates Frenkel pairs at a damage rate, and studies Cr segregation at a grain boundary treated as a perfect sink.
+**Reference.** O. Senninger, F. Soisson, E. Martínez, M. Nastar, C.-C. Fu and Y. Bréchet, "Modeling radiation induced segregation in iron–chromium alloys", Acta Mater. 103, 1–11 (2016), [doi:10.1016/j.actamat.2015.09.058](https://doi.org/10.1016/j.actamat.2015.09.058). The paper adds ⟨110⟩ self-interstitial dumbbells migrating by Johnson's 60° rotation–translation jump (Johnson, 1964; confirmed by DFT in Fu et al., 2004) to the Martínez vacancy model, creates Frenkel pairs at a damage rate, and studies Cr segregation at a grain boundary treated as a perfect sink.
 
 **What the source reports.** Binding energies of dumbbell–solute configurations from their own kMC model (their Table 2, 14 configurations), dumbbell migration barriers of 0.34 eV (Fe–Fe), 0.23 eV (mixed Fe–Cr) and about 0.05 eV (Cr–Cr), a distribution of barriers near one Cr atom (their Fig. 2), and the RIS results of their Sec. 4.
 
@@ -219,7 +219,7 @@ D*_Fe = 2.364e-12 +/- 7.6e-14 m^2/s
 1. The fitted dumbbell interaction values are not published, so we reconstructed them. We fitted the model of their Eq. 3 to Table 2 and to the three barriers, minimising the largest residual. Twelve of the fourteen configurations are dumbbells in an Fe matrix, and these are reproduced within 0.0086 eV. That is the best any fit of this model can do, because the published values themselves violate one of the model's linear relations by 0.069 eV. The two configurations in a Cr matrix are not reproduced.
 2. The 0.34 and 0.23 eV barriers are reproduced exactly. The saddle term for an Fe atom jumping next to Cr was fitted to the largest single-Cr barrier in Fig. 2 (0.440 eV); the median of our 22 single-Cr barriers is then 0.336 eV, against 0.337–0.340 eV read from the figure.
 3. The lattice energies depend on temperature as in Martínez et al., so the dumbbell saddle terms are refitted at the run temperature. This keeps the pure-Fe barriers at their fitted values at every temperature.
-4. The model (`crates/okrates-models/src/fecr_ris.rs`) creates a Frenkel pair at a random site with the interstitial placed at the end of a straight 10-step ⟨111⟩ replacement chain, recombines a vacancy and an interstitial within the fourth neighbour shell, and absorbs defects that reach a sink plane. The pool of defect records has a fixed size, so the fast sum-tree catalog applies.
+4. The model (`crates/okrates-models/src/fecr_ris.rs`) creates a Frenkel pair at a random site with the interstitial placed at the end of a straight 10-step ⟨111⟩ replacement chain, recombines a vacancy and an interstitial within the fourth neighbour shell, and absorbs defects that reach a sink plane. Following Senninger et al. (2016), the damage rate `K0` (in dpa/s) directly specifies Frenkel-pair creations per lattice site per second (an electron-irradiation model, without an NRT cascade efficiency factor; cf. Norgett et al., 1975). The pool of defect records has a fixed size, so the fast sum-tree catalog applies.
 
 **How to run it.**
 
@@ -258,6 +258,27 @@ pytest -q python/tests                       # Python, after maturin develop
 ```
 
 Regression tests pin results bit for bit. Where platform maths libraries differ in the last bit, we pin values per target (architecture and operating system).
+
+## References
+
+- D. J. Bernstein, "ChaCha, a variant of Salsa20", *Workshop Record of SASC 2008: The State of the Art of Stream Ciphers*, pp. 273–278 (2008), [cr.yp.to/chacha.html](https://cr.yp.to/chacha.html)
+- A. B. Bortz, M. H. Kalos and J. L. Lebowitz, "A new algorithm for Monte Carlo simulation of Ising spin systems", *J. Comput. Phys.* 17, 10–18 (1975), [doi:10.1016/0021-9991(75)90060-1](https://doi.org/10.1016/0021-9991(75)90060-1)
+- K. Compaan and Y. Haven, "Correlation factors for diffusion in solids", *Trans. Faraday Soc.* 52, 786–801 (1956), [doi:10.1039/TF9565200786](https://doi.org/10.1039/TF9565200786)
+- J. M. Cowley, "An Approximate Theory of Order in Alloys", *Phys. Rev.* 77, 669–675 (1950), [doi:10.1103/PhysRev.77.669](https://doi.org/10.1103/PhysRev.77.669)
+- C.-C. Fu, F. Willaime and P. Ordejón, "Stability and Mobility of Mono- and Di-Interstitials in α-Fe", *Phys. Rev. Lett.* 92, 175503 (2004), [doi:10.1103/PhysRevLett.92.175503](https://doi.org/10.1103/PhysRevLett.92.175503)
+- G. Henkelman, B. P. Uberuaga and H. Jónsson, "A climbing image nudged elastic band method for finding saddle points and minimum energy paths", *J. Chem. Phys.* 113, 9901–9904 (2000), [doi:10.1063/1.1329672](https://doi.org/10.1063/1.1329672)
+- R. A. Johnson, "Interstitials and Vacancies in α Iron", *Phys. Rev.* 134, A1329–A1336 (1964), [doi:10.1103/PhysRev.134.A1329](https://doi.org/10.1103/PhysRev.134.A1329)
+- K. Kawasaki, "Diffusion Constants near the Critical Point for Time-Dependent Ising Models. I", *Phys. Rev.* 145, 224–230 (1966), [doi:10.1103/PhysRev.145.224](https://doi.org/10.1103/PhysRev.145.224)
+- D. E. Knuth, *The Art of Computer Programming, Volume 2: Seminumerical Algorithms*, 3rd ed. (Addison-Wesley, 1997), Section 4.2.2, Theorem B
+- M. Levesque, E. Martínez, C.-C. Fu, M. Nastar and F. Soisson, "Simple concentration-dependent pair interaction model for large-scale simulations of Fe-Cr alloys", *Phys. Rev. B* 84, 184205 (2011), [doi:10.1103/PhysRevB.84.184205](https://doi.org/10.1103/PhysRevB.84.184205)
+- E. Martínez, O. Senninger, C.-C. Fu and F. Soisson, "Decomposition kinetics of Fe–Cr solid solutions during thermal aging", *Phys. Rev. B* 86, 224109 (2012), [doi:10.1103/PhysRevB.86.224109](https://doi.org/10.1103/PhysRevB.86.224109)
+- N. Metropolis, A. W. Rosenbluth, M. N. Rosenbluth, A. H. Teller and E. Teller, "Equation of State Calculations by Fast Computing Machines", *J. Chem. Phys.* 21, 1087–1092 (1953), [doi:10.1063/1.1699114](https://doi.org/10.1063/1.1699114)
+- O. Møller, "Quasi double-precision in floating point addition", *BIT* 5, 37–50 (1965), [doi:10.1007/BF01975722](https://doi.org/10.1007/BF01975722)
+- A. Neumaier, "Rundungsfehleranalyse einiger Verfahren zur Summation endlicher Summen", *Z. Angew. Math. Mech.* 54, 39–51 (1974), [doi:10.1002/zamm.19740540106](https://doi.org/10.1002/zamm.19740540106)
+- M. J. Norgett, M. T. Robinson and I. M. Torrens, "A proposed method of calculating displacement dose rates", *Nucl. Eng. Des.* 33, 50–54 (1975), [doi:10.1016/0029-5493(75)90035-7](https://doi.org/10.1016/0029-5493(75)90035-7)
+- M. H. Quenouille, "Approximate Tests of Correlation in Time-Series", *J. R. Stat. Soc. B* 11, 68–84 (1949), [doi:10.1111/j.2517-6161.1949.tb00023.x](https://doi.org/10.1111/j.2517-6161.1949.tb00023.x); M. H. Quenouille, "Notes on bias in estimation", *Biometrika* 43, 353–360 (1956), [doi:10.1093/biomet/43.3-4.353](https://doi.org/10.1093/biomet/43.3-4.353); J. W. Tukey, "Bias and confidence in not-quite large samples" (abstract), *Ann. Math. Stat.* 29, 614 (1958)
+- O. Senninger, F. Soisson, E. Martínez, M. Nastar, C.-C. Fu and Y. Bréchet, "Modeling radiation induced segregation in iron–chromium alloys", *Acta Mater.* 103, 1–11 (2016), [doi:10.1016/j.actamat.2015.09.058](https://doi.org/10.1016/j.actamat.2015.09.058)
+- B. E. Warren, *X-Ray Diffraction* (Addison-Wesley, 1969)
 
 ## License
 

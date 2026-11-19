@@ -1,5 +1,8 @@
 //! JSON data-contract adapters for `pymatgen`/`atomate2` (VASP NEB) and `AiiDA-QuantumESPRESSO`,
 //! preserving optional `temp_range_k` validity windows and barrier uncertainties across import and export.
+//!
+//! Climbing-image NEB reference: Henkelman, Uberuaga, and Jónsson,
+//! *J. Chem. Phys.* **113**, 9901–9904 (2000), doi:10.1063/1.1329672.
 
 use std::error::Error;
 use std::fmt;

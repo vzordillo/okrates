@@ -1,4 +1,7 @@
 //! Unified catalog backends and transactional KMC stepping engine.
+//!
+//! Residence-time (BKL) selection follows Bortz, Kalos, and Lebowitz,
+//! *J. Comput. Phys.* **17**, 10–18 (1975), doi:10.1016/0021-9991(75)90060-1.
 
 use crate::checkpoint::{self, CheckpointError, Checkpointable};
 use crate::clock::Clock;
