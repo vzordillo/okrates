@@ -381,6 +381,6 @@ const FECR_RIS_TIME_BITS: u64 = 4649199847678246177;
 // A target is architecture plus OS (the maths library comes with the OS); other targets skip only the dt check.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 const FECR_RIS_DTS: u64 = 1061706550594519766;
-// Pending macOS CI update after D11 (`z_eff = 4`, 0.5 orientation rate split).
+// aarch64 value printed by macOS CI (PR #23, run 44487941776); events, counters and time bits match x86_64.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const FECR_RIS_DTS: u64 = 9886202463999487029;
+const FECR_RIS_DTS: u64 = 6502606022688962115;
