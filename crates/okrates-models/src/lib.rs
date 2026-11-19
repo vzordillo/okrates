@@ -8,6 +8,7 @@ pub mod fecr_anneal;
 pub mod fecr_diffusion;
 pub mod fecr_martinez;
 pub mod fecr_ris;
+pub mod fecr_ris_transport;
 pub mod multi_vacancy;
 pub mod tabulated;
 pub mod vacancy;

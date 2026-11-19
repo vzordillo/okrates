@@ -320,3 +320,86 @@ fn multi_vacancy_scaling_bad_environment() {
         "STEP_BUDGET must be an integer >= 1",
     );
 }
+
+fn without_wall_s(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.starts_with("wall_s="))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn fecr_ris_transport_small() {
+    let (code, stdout, stderr) = run(example("fecr_ris_transport").args([
+        "--defect",
+        "dumbbell",
+        "--temperature",
+        "650",
+        "--cr-count",
+        "43",
+        "--runs",
+        "4",
+        "--t-end",
+        "5e-11",
+        "--samples",
+        "8",
+        "--seed",
+        "7",
+        "--cells",
+        "6",
+        "6",
+        "6",
+    ]));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("wall_s="));
+    assert_eq!(
+        without_wall_s(&stdout),
+        without_wall_s(include_str!("data/fecr_ris_transport_small.txt"))
+    );
+}
+
+#[test]
+fn fecr_ris_transport_bad_args() {
+    let usage = "usage: fecr_ris_transport --defect <vacancy|dumbbell> --temperature K --cr-count N --runs R --t-end s --samples K --seed S [--t-equil s] [--cells nx ny nz] [--lattice-a m] [--max-steps N] [--fit <ols|origin>]";
+    assert_usage_error(&mut example("fecr_ris_transport"), usage);
+    assert_usage_error(
+        example("fecr_ris_transport").args([
+            "--defect",
+            "void",
+            "--temperature",
+            "650",
+            "--cr-count",
+            "43",
+            "--runs",
+            "4",
+            "--t-end",
+            "5e-11",
+            "--samples",
+            "8",
+            "--seed",
+            "7",
+        ]),
+        usage,
+    );
+    assert_usage_error(
+        example("fecr_ris_transport").args([
+            "--defect",
+            "vacancy",
+            "--temperature",
+            "650",
+            "--cr-count",
+            "43",
+            "--runs",
+            "4",
+            "--t-end",
+            "5e-11",
+            "--samples",
+            "8",
+            "--seed",
+            "7",
+            "--max-steps",
+            "0",
+        ]),
+        usage,
+    );
+}
