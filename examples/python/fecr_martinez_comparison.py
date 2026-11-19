@@ -3,7 +3,8 @@
 Computes, for 2 Cr atoms in a 432-site bcc box with one vacancy, the tracer
 diffusivities of Fe and Cr and their ratio D_Cr/D_Fe at 1000/T = 1.0, 1.1, 1.2
 and 1.3 (T in K), after a Kawasaki anneal of the Cr arrangement. It also
-computes the Fe self-diffusion correlation factor f. Larger Cr contents
+reports the all-atom correlation factor f = 431 * mean(D*_all) / mean(D_v) and
+the Fe tracer factor f_kmc = N * D*_Fe / Gamma0. Larger Cr contents
 (x = 0.10 and 0.20, at 1000/T = 1.1 and 1.3) follow the four dilute points.
 
 Reference: E. Martinez, O. Senninger, C.-C. Fu and F. Soisson, Phys. Rev. B 86,
@@ -77,8 +78,12 @@ def main() -> None:
             anneal_sweeps=ANNEAL_SWEEPS,
             energetics="martinez2012",
         )
-        ratio = r["D_Cr"] / r["D_Fe"]
-        ratio_se = ratio * math.hypot(r["D_Cr_se"] / r["D_Cr"], r["D_Fe_se"] / r["D_Fe"])
+        if r["D_Fe"] == 0.0:
+            ratio = math.nan
+            ratio_se = math.nan
+        else:
+            ratio = r["D_Cr"] / r["D_Fe"]
+            ratio_se = math.hypot(r["D_Cr_se"], ratio * r["D_Fe_se"]) / r["D_Fe"]
         print(
             f"{cr} {temp:.2f} {1000 / temp:.2f} {gamma0:.6e} "
             f"{r['D_Fe']:.6e} {r['D_Fe_se']:.2e} {r['D_Cr']:.6e} {r['D_Cr_se']:.2e} "
