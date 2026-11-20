@@ -292,3 +292,159 @@ fn oversized_slot_count_returns_catalog_too_large_error() {
         ));
     }
 }
+
+#[test]
+fn sum_tree_rejects_invalid_and_overflowing_rates_with_rollback() {
+    use okrates_core::RateError;
+
+    assert_eq!(
+        SumTree::try_new(&[1.0, -0.5]),
+        Err(SlotError::InvalidRate {
+            slot: 1,
+            source: RateError::Negative(-0.5),
+        })
+    );
+    assert_eq!(
+        SumTree::try_new(&[f64::NAN]),
+        Err(SlotError::InvalidRate {
+            slot: 0,
+            source: RateError::NaN,
+        })
+    );
+    assert_eq!(
+        SumTree::try_new(&[f64::INFINITY]),
+        Err(SlotError::InvalidRate {
+            slot: 0,
+            source: RateError::Infinite(f64::INFINITY),
+        })
+    );
+    assert_eq!(
+        SumTree::try_new(&[f64::MAX, f64::MAX]),
+        Err(SlotError::TotalNotFinite)
+    );
+
+    let mut tree = SumTree::try_new(&[1.0, f64::MAX]).unwrap();
+    let before = tree.clone();
+    assert_eq!(tree.try_set(0, f64::MAX), Err(SlotError::TotalNotFinite));
+    assert_eq!(tree, before, "tree must roll back after sum overflow");
+    assert_eq!(
+        tree.try_set(0, -1.0),
+        Err(SlotError::InvalidRate {
+            slot: 0,
+            source: RateError::Negative(-1.0),
+        })
+    );
+    assert_eq!(tree, before);
+}
+
+#[test]
+fn coupled_model_with_rate_dependencies_and_parity_checker() {
+    use okrates_core::{
+        CatalogBackend, CoupledModel, EnumeratedTopology, RateDependencies, RateModel,
+        SlottedTopology, SumTreeCatalog, TopologyOnlyDependencies, TransitionTopology,
+        verify_incremental_step_parity,
+    };
+    use std::convert::Infallible;
+
+    #[derive(Clone, Copy)]
+    struct TwoSlotTopology;
+
+    impl TransitionTopology for TwoSlotTopology {
+        type State = [u64; 2];
+        type Event = usize;
+        type Undo = usize;
+        type Error = Infallible;
+
+        fn apply(&self, state: &mut Self::State, event: &Self::Event) -> Result<usize, Infallible> {
+            state[*event] += 1;
+            Ok(*event)
+        }
+
+        fn undo(&self, state: &mut Self::State, undo: usize) {
+            state[undo] -= 1;
+        }
+    }
+
+    impl EnumeratedTopology for TwoSlotTopology {
+        fn enumerate_candidates(&self, _state: &Self::State, emit: &mut dyn FnMut(usize)) {
+            emit(0);
+            emit(1);
+        }
+    }
+
+    impl SlottedTopology for TwoSlotTopology {
+        fn slot_count(&self, _state: &Self::State) -> usize {
+            2
+        }
+
+        fn slot_event(&self, _state: &Self::State, slot: usize) -> usize {
+            slot
+        }
+
+        fn affected_slots(&self, _state: &Self::State, event: &usize, out: &mut Vec<usize>) {
+            // Topology claims only the fired channel's own slot depends on its counter.
+            out.push(*event);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct CrossCoupledRates;
+
+    impl RateModel<TwoSlotTopology> for CrossCoupledRates {
+        fn rate(&self, _: &TwoSlotTopology, state: &[u64; 2], event: &usize) -> f64 {
+            // Slot 1 rate depends non-topologically on state[0] + state[1].
+            if *event == 0 {
+                1.0
+            } else {
+                1.0 + (state[0] + state[1]) as f64
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct AllRateDeps;
+
+    impl RateDependencies<TwoSlotTopology> for AllRateDeps {
+        fn affected_rate_slots(
+            &self,
+            _: &TwoSlotTopology,
+            _: &[u64; 2],
+            _: &usize,
+            out: &mut Vec<usize>,
+        ) {
+            out.push(0);
+            out.push(1);
+        }
+    }
+
+    // Without RateDependencies, TopologyOnlyDependencies omits slot 1 when slot 0 fires.
+    let incomplete =
+        CoupledModel::<_, _, TopologyOnlyDependencies>::new(TwoSlotTopology, CrossCoupledRates);
+    let mut s_before = [0, 0];
+    let mut cat_bad = SumTreeCatalog::build(&incomplete, &s_before).unwrap();
+    let mut s_after = s_before;
+    cat_bad
+        .apply_and_update(&incomplete, &mut s_after, 0)
+        .unwrap();
+    let parity_err =
+        verify_incremental_step_parity(&incomplete, &s_before, &s_after, &0, cat_bad.tree(), 0.0)
+            .unwrap_err();
+    assert!(
+        parity_err.contains("affected_slots omitted slot 1"),
+        "unexpected error: {parity_err}"
+    );
+
+    // With RateDependencies, slot 1 is invalidated and parity holds across repeated steps.
+    let complete = CoupledModel::with_dependencies(TwoSlotTopology, CrossCoupledRates, AllRateDeps);
+    let mut cat_ok = SumTreeCatalog::build(&complete, &s_before).unwrap();
+    s_before = [0, 0];
+    for slot in [0_usize, 1, 0, 0, 1] {
+        let mut s_next = s_before;
+        let event = cat_ok
+            .apply_and_update(&complete, &mut s_next, slot)
+            .unwrap();
+        verify_incremental_step_parity(&complete, &s_before, &s_next, &event, cat_ok.tree(), 1e-12)
+            .unwrap();
+        s_before = s_next;
+    }
+}

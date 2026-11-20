@@ -460,6 +460,7 @@ fn t6_validation_and_error_guards() {
 
     let mut k0_params = base_params.clone();
     k0_params.k0_dpa_per_s = 1e-4;
+    k0_params.capacity = 2;
     let m_k0 = FeCrRis::new(k0_params).unwrap();
     let cfg = RisTransportConfig::windowed(1e-12, 1e-11, 4, A_FE).with_max_steps(Some(10));
     assert!(matches!(

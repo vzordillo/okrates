@@ -756,6 +756,10 @@ fn constructor_validation() {
     assert!(bad(&|p| p.temperature_k = f64::NAN));
     assert!(bad(&|p| p.k0_dpa_per_s = -1.0));
     assert!(bad(&|p| p.capacity = 0));
+    assert!(bad(&|p| {
+        p.k0_dpa_per_s = 1e-6;
+        p.capacity = 1;
+    }));
     assert!(bad(&|p| p.sink_planes = vec![12]));
     assert!(bad(&|p| p.dumbbell.e[0][2][0] = 0.1));
     assert!(bad(&|p| p.dumbbell.e[2][2][1] = 0.1));

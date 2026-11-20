@@ -265,9 +265,14 @@ pub fn ols_slope(times: &[f64], values: &[f64]) -> f64 {
 }
 
 /// Sample mean and standard error `s / sqrt(n)` with Bessel correction `n - 1`.
+///
+/// Returns `(NaN, NaN)` when empty and `(values[0], NaN)` when `values.len() == 1`.
 pub fn mean_se(values: &[f64]) -> (f64, f64) {
     if values.is_empty() {
         return (f64::NAN, f64::NAN);
+    }
+    if values.len() == 1 {
+        return (values[0], f64::NAN);
     }
     let n = values.len() as f64;
     let mean = values.iter().sum::<f64>() / n;

@@ -421,8 +421,14 @@ def test_run_manifest_immutability_and_schema_validation():
     assert cond.composition["Fe"] == 48
 
     base_doc = json.loads(manifest.to_json())
+    assert manifest.build_target is not None
     no_est_doc = {**base_doc, "estimator": None}
-    assert okrates.RunManifest.from_json(json.dumps(no_est_doc)).estimator is None
+    no_est_doc.pop("git_dirty", None)
+    no_est_doc.pop("build_target", None)
+    legacy_manifest = okrates.RunManifest.from_json(json.dumps(no_est_doc))
+    assert legacy_manifest.estimator is None
+    assert legacy_manifest.git_dirty is None
+    assert legacy_manifest.build_target is None
 
     for bad_ver in (0, 2, -1, 999, True, "1"):
         with pytest.raises(ValueError, match="schema"):
@@ -439,6 +445,7 @@ def test_run_manifest_immutability_and_schema_validation():
             {**base_doc, "conditions": {**base_doc["conditions"], "cells": [3, 3]}}
         ),
         json.dumps({**base_doc, "estimator": "bad"}),
+        json.dumps({**base_doc, "git_dirty": "yes"}),
     ):
         with pytest.raises(ValueError):
             okrates.RunManifest.from_json(bad_raw)

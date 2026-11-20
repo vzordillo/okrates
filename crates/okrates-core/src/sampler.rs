@@ -244,7 +244,13 @@ impl<ME> From<GridError> for SamplingError<ME> {
 pub struct SampledTrajectory<T> {
     pub times: Vec<f64>,
     pub values: Vec<T>,
+    /// Total simulator transitions fired to observe every grid time up to `t_last`.
+    ///
+    /// Includes the single crossing event into `t > t_last` when one occurs, so this can
+    /// exceed [`Self::steps_in_window`] by `1`.
     pub fired_steps: u64,
+    /// Transitions whose post-jump timestamp fell on or before the final grid time `t_last`.
+    pub steps_in_window: u64,
 }
 
 pub type ModelStepResult<M> = Result<Step<<M as Model>::Event>, SimError<<M as Model>::Error>>;
@@ -406,8 +412,10 @@ where
         });
     }
 
+    let t_last = *times.last().expect("SampleGrid is non-empty");
     let mut values = Vec::with_capacity(times.len());
     let mut fired_steps = 0_u64;
+    let mut steps_in_window = 0_u64;
 
     while values.len() < times.len() {
         if sim.clock().cmp_f64(times[values.len()]).is_eq() {
@@ -465,6 +473,9 @@ where
         match step {
             Step::Fired { .. } => {
                 fired_steps += 1;
+                if sim.clock().cmp_f64(t_last).is_le() {
+                    steps_in_window += 1;
+                }
                 if let Some((held, clock_after)) = crossed {
                     while values.len() < times.len()
                         && clock_after.cmp_f64(times[values.len()]).is_gt()
@@ -492,5 +503,6 @@ where
         times: times.to_vec(),
         values,
         fired_steps,
+        steps_in_window,
     })
 }

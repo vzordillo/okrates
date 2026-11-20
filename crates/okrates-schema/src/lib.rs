@@ -13,7 +13,8 @@ pub use adapters::{
     import_pymatgen_vasp_json,
 };
 pub use barrier::{
-    BARRIER_SCHEMA_VERSION, BarrierProvenance, BarrierRecord, BarrierSet, BarrierValidationError,
+    BARRIER_SCHEMA_VERSION, BarrierJsonError, BarrierProvenance, BarrierRecord, BarrierSet,
+    BarrierValidationError,
 };
 pub use digest::sha256_hex;
 pub use manifest::{

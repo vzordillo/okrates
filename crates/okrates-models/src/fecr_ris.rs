@@ -348,7 +348,12 @@ pub struct FeCrRisParams {
     /// (cf. Norgett, Robinson, and Torrens, *Nucl. Eng. Des.* **33**, 50–54 (1975),
     /// doi:10.1016/0029-5493(75)90035-7).
     pub k0_dpa_per_s: f64,
-    /// Defect record capacity `P` (at least 1).
+    /// Defect record capacity `P` (at least 1, and at least 2 when `k0_dpa_per_s > 0`).
+    ///
+    /// Empty slots carry rate `0` under the ADR-0007 fixed-capacity defect pool contract; when
+    /// `k0_dpa_per_s > 0`, Frenkel-pair creation retains its full physical hazard `K0 * N` rather
+    /// than suppressing creation silently, returning [`FeCrRisError::PoolExhausted`] if fewer
+    /// than two records are free.
     pub capacity: usize,
     pub dumbbell: DumbbellParams,
 }
@@ -425,22 +430,50 @@ impl From<Defect> for Record {
 pub enum FeCrRisError {
     Lattice(LatticeError),
     Energetics(FeCrError),
-    CellsTooSmall { cells: [usize; 3] },
+    CellsTooSmall {
+        cells: [usize; 3],
+    },
     Parameter(&'static str),
     SinkPlane(i64),
-    SiteCount { expected: usize, found: usize },
-    VacancyInOccupancy { site: usize },
+    SiteCount {
+        expected: usize,
+        found: usize,
+    },
+    VacancyInOccupancy {
+        site: usize,
+    },
     TooManyAtoms,
-    TooManyDefects { capacity: usize, defects: usize },
-    DuplicateDefect { site: usize },
-    DefectOutOfRange { site: usize },
-    DefectOnSink { site: usize },
-    InvalidDefect { site: usize },
-    WithinRecombinationRadius { vacancy: usize, dumbbell: usize },
+    TooManyDefects {
+        capacity: usize,
+        defects: usize,
+    },
+    DuplicateDefect {
+        site: usize,
+    },
+    DefectOutOfRange {
+        site: usize,
+    },
+    DefectOnSink {
+        site: usize,
+    },
+    InvalidDefect {
+        site: usize,
+    },
+    WithinRecombinationRadius {
+        vacancy: usize,
+        dumbbell: usize,
+    },
     Inconsistent(&'static str),
-    PoolExhausted { capacity: usize, defects: usize },
+    /// Creation was selected with fewer than two free defect records (ADR-0007).
+    PoolExhausted {
+        capacity: usize,
+        defects: usize,
+    },
     CreationFailed,
-    NoSuchJump { rec: usize, jump: usize },
+    NoSuchJump {
+        rec: usize,
+        jump: usize,
+    },
 }
 
 impl fmt::Display for FeCrRisError {
@@ -635,9 +668,15 @@ impl FeCrRisState {
     pub fn creation_attempts(&self) -> u64 {
         self.creation_attempts
     }
+    /// Number of executed dumbbell jumps whose raw barrier fell below `max(0, dE)`.
+    ///
+    /// Recomputes `raw < max(0, dE)` on cache miss when [`Model::apply`] is called without a prior [`FeCrRis::rate`] query.
     pub fn floored_dumbbell_jumps(&self) -> u64 {
         self.floored_dumbbell_jumps
     }
+    /// Number of executed vacancy jumps whose raw barrier fell below `max(0, dE)`.
+    ///
+    /// Recomputes `raw < max(0, dE)` on cache miss when [`Model::apply`] is called without a prior [`FeCrRis::rate`] query.
     pub fn floored_vacancy_jumps(&self) -> u64 {
         self.floored_vacancy_jumps
     }
@@ -1115,6 +1154,11 @@ impl FeCrRis {
         }
         if params.capacity == 0 {
             return Err(FeCrRisError::Parameter("capacity must be at least 1"));
+        }
+        if params.k0_dpa_per_s > 0.0 && params.capacity < 2 {
+            return Err(FeCrRisError::Parameter(
+                "capacity must be at least 2 when K0 > 0",
+            ));
         }
         if params.capacity >= NO_RECORD as usize {
             return Err(FeCrRisError::Parameter(
@@ -2712,12 +2756,12 @@ impl Model for FeCrRis {
                     Record::Dumbbell { .. } => FeCrRisEvent::DumbbellJump { rec, jump },
                 };
                 let rate = self.rate(state, rec, jump);
-                if rate > 0.0 {
+                if rate != 0.0 {
                     emit(event, rate);
                 }
             }
         }
-        if self.params.k0_dpa_per_s > 0.0 {
+        if self.params.k0_dpa_per_s != 0.0 {
             emit(FeCrRisEvent::Create, self.creation_rate());
         }
     }
