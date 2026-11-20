@@ -58,11 +58,19 @@ fn watch_repo_worktree(repo_root: &Path) {
     }
 }
 
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=OKRATES_GIT_SHA");
     println!("cargo:rerun-if-env-changed=OKRATES_GIT_DIRTY");
     let repo_root = Path::new("../..");
+    let dirty_override = non_empty_env("OKRATES_GIT_DIRTY");
     let dot_git = repo_root.join(".git");
     if dot_git.is_file() {
         watch_if_exists(&dot_git);
@@ -79,14 +87,11 @@ fn main() {
         {
             watch_if_exists(&common_dir.join(ref_path));
         }
-        if env::var_os("OKRATES_GIT_DIRTY").is_none() {
+        if dirty_override.is_none() {
             watch_repo_worktree(repo_root);
         }
     }
-    let sha = env::var("OKRATES_GIT_SHA")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let sha = non_empty_env("OKRATES_GIT_SHA")
         .or_else(|| {
             Command::new("git")
                 .current_dir(repo_root)
@@ -99,10 +104,7 @@ fn main() {
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| "unknown".to_string());
-    let dirty = env::var("OKRATES_GIT_DIRTY")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let dirty = dirty_override
         .or_else(|| {
             git_dirs.as_ref().and_then(|_| {
                 Command::new("git")
@@ -122,11 +124,7 @@ fn main() {
             })
         })
         .unwrap_or_else(|| "unknown".to_string());
-    let target = env::var("TARGET")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
+    let target = non_empty_env("TARGET").unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=OKRATES_GIT_SHA={sha}");
     println!("cargo:rustc-env=OKRATES_GIT_DIRTY={dirty}");
     println!("cargo:rustc-env=OKRATES_TARGET={target}");
