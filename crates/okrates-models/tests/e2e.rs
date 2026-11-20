@@ -788,3 +788,80 @@ fn reaction_network_bad_args() {
         "expected rate constant error on stderr, got: {stderr}"
     );
 }
+
+#[test]
+fn ionic_diffusion_small() {
+    let (code, stdout, stderr) = run(example("ionic_diffusion").args([
+        "--lattice",
+        "fcc",
+        "--cells",
+        "2",
+        "2",
+        "2",
+        "--ions",
+        "8",
+        "--rate",
+        "1000.0",
+        "--lattice-a",
+        "3.6e-10",
+        "--t-end",
+        "5e-3",
+        "--runs",
+        "8",
+        "--seed",
+        "42",
+    ]));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stderr, "");
+    assert_eq!(
+        stdout,
+        "lattice = fcc dim = 3 cells = [2, 2, 2] sites = 32 ions = 8 theta = 0.250000\n\
+         rate = 1000 a_m = 3.6e-10 t_end = 0.005 runs = 8 seed = 42\n\
+         mean_tracer_msd_m2 = 3.072937500000e-18 mean_collective_msd_m2 = 2.467462500000e-18\n\
+         D_tracer_m2_s = 1.024312500000e-16 D_collective_m2_s = 8.224875000000e-17 H_R = 1.245384 mean_steps = 369.875000\n\
+         invariants = verified\n"
+    );
+}
+
+#[test]
+fn ionic_diffusion_bad_args() {
+    let usage = "usage: ionic_diffusion --lattice (sc|fcc|square2d) --cells nx ny nz --ions N --rate F --lattice-a M --t-end F --runs R --seed S";
+    assert_usage_error(&mut example("ionic_diffusion"), usage);
+    assert_usage_error(example("ionic_diffusion").arg("--unknown"), usage);
+    let base = [
+        "--lattice",
+        "fcc",
+        "--cells",
+        "2",
+        "2",
+        "2",
+        "--ions",
+        "8",
+        "--rate",
+        "1000.0",
+        "--lattice-a",
+        "3.6e-10",
+        "--t-end",
+        "5e-3",
+        "--runs",
+        "8",
+        "--seed",
+        "42",
+    ];
+    for (flag, bad_val) in [("--lattice", "bcc"), ("--runs", "0"), ("--t-end", "0")] {
+        let mut args = base;
+        let idx = args.iter().position(|&a| a == flag).unwrap();
+        args[idx + 1] = bad_val;
+        assert_usage_error(example("ionic_diffusion").args(args), usage);
+    }
+    let mut bad_sq = base;
+    bad_sq[1] = "square2d";
+    assert_usage_error(example("ionic_diffusion").args(bad_sq), usage);
+
+    let mut bad_rate = base;
+    bad_rate[9] = "-10.0";
+    let (code, stdout, stderr) = run(example("ionic_diffusion").args(bad_rate));
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("jump rate"), "stderr: {stderr}");
+}
