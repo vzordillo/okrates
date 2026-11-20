@@ -10,6 +10,7 @@ pub mod fecr_martinez;
 pub mod fecr_ris;
 pub mod fecr_ris_segregation;
 pub mod fecr_ris_transport;
+pub mod lattice_hopping;
 pub mod multi_vacancy;
 pub mod reaction_network;
 pub mod tabulated;
