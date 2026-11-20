@@ -1,7 +1,3 @@
-//! Verification tests for [`ReactionNetwork`]: exact finite-state CTMC oracles,
-//! Direct vs SumTree incremental parity, conservation invariants, reversible undo,
-//! checkpoint/restart bitwise determinism, and validation errors.
-
 use okrates_core::testing::{chi2_statistic, chi2_upper_quantile, mat_exp, solve_stationary_ctmc};
 use okrates_core::{
     AbsorptionPolicy, CheckpointError, Checkpointable, IncrementalModel, IncrementalSimulation,
@@ -199,7 +195,6 @@ fn t2_catalytic_michaelis_menten_direct_vs_incremental_parity_and_conservation()
     loop {
         let before = inc.state().clone();
 
-        // Check enumerate_events vs IncrementalModel::slot_rate before stepping.
         let mut enum_rates = vec![0.0; model.channel_count()];
         model.enumerate_events(&before, &mut |ReactionEvent(ch), r| {
             assert_eq!(enum_rates[ch], 0.0);
@@ -248,7 +243,12 @@ fn t2_catalytic_michaelis_menten_direct_vs_incremental_parity_and_conservation()
     assert_eq!(inc.state().fired_counts()[2], 42);
     assert_eq!(
         inc.state().total_firings(),
-        inc.state().fired_counts().iter().sum::<u64>()
+        inc.state()
+            .fired_counts()
+            .iter()
+            .copied()
+            .map(u128::from)
+            .sum::<u128>()
     );
     assert_eq!(inc_events, direct_events);
     assert_eq!(
@@ -256,7 +256,6 @@ fn t2_catalytic_michaelis_menten_direct_vs_incremental_parity_and_conservation()
         inc.state().fired_counts()[1] + inc.state().fired_counts()[2]
     );
 
-    // Also verify ensemble mean completion time agrees between Direct and Incremental.
     let n_runs = 400_u64;
     let direct_times = run_ensemble(70_001, n_runs, |ctx| {
         let mut sim =
@@ -294,7 +293,6 @@ fn t2_catalytic_michaelis_menten_direct_vs_incremental_parity_and_conservation()
 
 #[test]
 fn t3_reversible_undo_checkpoint_roundtrip_and_validation_errors() {
-    // 1. Constructor & conservation validation errors.
     let valid_ch = ReactionChannel::new(vec![(0, 1)], vec![(1, 1)], 1.0);
     assert_eq!(
         ReactionNetwork::new(0, vec![valid_ch.clone()]).unwrap_err(),
@@ -431,7 +429,6 @@ fn t3_reversible_undo_checkpoint_roundtrip_and_validation_errors() {
         }
     );
 
-    // 2. State validation, rollback on failed apply/apply_reversible, and undo.
     let (model, init) = michaelis_menten_model();
     assert_eq!(model.species_count(), 4);
     assert_eq!(model.channel_count(), 3);
@@ -489,7 +486,6 @@ fn t3_reversible_undo_checkpoint_roundtrip_and_validation_errors() {
         }
     );
 
-    // Undo restores counts and fired_counts bitwise.
     let mut work = init.clone();
     for ch in 0..model.channel_count() {
         let before = work.clone();
@@ -502,7 +498,6 @@ fn t3_reversible_undo_checkpoint_roundtrip_and_validation_errors() {
         assert_eq!(work, before);
     }
 
-    // 3. Checkpoint/resume bitwise round-trip for both Simulation and IncrementalSimulation.
     let seed = 0xcafe_babe;
     let total_steps = 40;
     let split = 17;
@@ -543,7 +538,6 @@ fn t3_reversible_undo_checkpoint_roundtrip_and_validation_errors() {
     assert_eq!(resumed_inc.steps(), full_inc.steps());
     assert_eq!(resumed_inc.checkpoint(), full_inc.checkpoint());
 
-    // Model parameter mismatch & corrupted checkpoint rejection.
     let (other_model, _) = dimerization_model();
     assert!(matches!(
         Simulation::resume(other_model, &ckpt_sim),
@@ -555,10 +549,117 @@ fn t3_reversible_undo_checkpoint_roundtrip_and_validation_errors() {
     ));
     let mut bad_state_bytes = Vec::new();
     model.encode_state(full_sim.state(), &mut bad_state_bytes);
-    // Corrupt the last byte by truncation so decode_state rejects it.
     assert!(
         model
             .decode_state(&bad_state_bytes[..bad_state_bytes.len() - 1])
             .is_err()
     );
+}
+
+#[test]
+fn t4_extreme_scale_propensities_large_species_counters_and_checkpoint_dimensions() {
+    // C(1000, 20) * 1e-40 overflows u128 (~3.4e41 > u128::MAX) while true propensity is ~33.948.
+    let high_order = ReactionNetwork::new(
+        2,
+        vec![ReactionChannel::new(vec![(0, 20)], vec![(1, 1)], 1e-40)],
+    )
+    .unwrap();
+    let s_high = high_order.initial_state(vec![1_000, 0]).unwrap();
+    let p_high = high_order.propensity(&s_high, 0);
+    let mut expected_c = 1.0_f64;
+    for i in 1..=20_u32 {
+        expected_c *= f64::from(1_000 - 20 + i) / f64::from(i);
+    }
+    let expected_p = expected_c * 1e-40;
+    assert!(
+        p_high.is_finite(),
+        "expected finite propensity, got {p_high}"
+    );
+    assert!(
+        (p_high - expected_p).abs() <= 1e-12 * expected_p,
+        "got {p_high}, expected {expected_p}"
+    );
+    let mut sim_high = Simulation::new(high_order, s_high, 77);
+    assert!(matches!(sim_high.step().unwrap(), Step::Fired { dt, .. } if dt.is_finite()));
+
+    // Product of 26 species at 2^40 copies reaches 2^1040 > f64::MAX before rate_constant = 2^-1000.
+    let n_many = 26;
+    let reactants: Vec<(usize, u32)> = (0..n_many).map(|sp| (sp, 1)).collect();
+    let rescaled = ReactionNetwork::new(
+        n_many + 1,
+        vec![ReactionChannel::new(
+            reactants,
+            vec![(n_many, 1)],
+            2.0_f64.powi(-1000),
+        )],
+    )
+    .unwrap();
+    let mut many_counts = vec![1_u64 << 40; n_many];
+    many_counts.push(0);
+    let s_many = rescaled.initial_state(many_counts).unwrap();
+    let p_many = rescaled.propensity(&s_many, 0);
+    assert_eq!(p_many, 2.0_f64.powi(40));
+
+    // Zero-reactant impossible huge order with finite or overflowing other terms stays 0.0, never NaN/inf.
+    let extreme_order = ReactionNetwork::new(
+        2,
+        vec![ReactionChannel::new(
+            vec![(0, 3_000), (1, 1)],
+            vec![],
+            1e-10,
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        extreme_order.propensity(&extreme_order.initial_state(vec![6_000, 1]).unwrap(), 0),
+        f64::INFINITY
+    );
+    assert_eq!(
+        extreme_order.propensity(&extreme_order.initial_state(vec![6_000, 0]).unwrap(), 0),
+        0.0
+    );
+
+    // Sparse species index space up to usize::MAX constructs without capacity panic.
+    let sparse = ReactionNetwork::new(
+        usize::MAX,
+        vec![ReactionChannel::new(vec![(0, 1)], vec![(1, 1)], 1.0)],
+    )
+    .unwrap();
+    assert_eq!(sparse.species_count(), usize::MAX);
+
+    // total_firings represents sums above u64::MAX cleanly without wrapping or panicking.
+    let two_ch = ReactionNetwork::new(
+        2,
+        vec![
+            ReactionChannel::new(vec![(0, 1)], vec![(1, 1)], 0.0),
+            ReactionChannel::new(vec![(0, 1)], vec![(1, 1)], 1.0),
+        ],
+    )
+    .unwrap();
+    let mut big_counters = ReactionState {
+        counts: vec![5, 0],
+        fired_counts: vec![u64::MAX, 0],
+    };
+    two_ch.apply(&mut big_counters, &ReactionEvent(1)).unwrap();
+    assert_eq!(big_counters.total_firings(), u128::from(u64::MAX) + 1);
+
+    // Mismatched ReactionState dimensions with matching total word count must fail checkpoint decode/resume.
+    let dim_model = ReactionNetwork::new(
+        2,
+        vec![ReactionChannel::new(vec![(0, 1)], vec![(1, 1)], 1.0)],
+    )
+    .unwrap();
+    let malformed = ReactionState {
+        counts: vec![4],
+        fired_counts: vec![7, 9],
+    };
+    let sim_bad = Simulation::new(dim_model.clone(), malformed.clone(), 9);
+    let bad_ckpt = sim_bad.checkpoint();
+    assert!(matches!(
+        Simulation::resume(dim_model.clone(), &bad_ckpt),
+        Err(CheckpointError::InvalidState(_))
+    ));
+    let mut encoded_bad = Vec::new();
+    dim_model.encode_state(&malformed, &mut encoded_bad);
+    assert!(dim_model.decode_state(&encoded_bad).is_err());
 }

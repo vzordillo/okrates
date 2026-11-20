@@ -10,7 +10,6 @@ use std::fmt;
 
 use okrates_core::{Checkpointable, IncrementalModel, Model, ReversibleModel, SumTree};
 
-/// Specifies whether stoichiometry validation failed on reactants or products.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoichiometryRole {
     Reactant,
@@ -26,7 +25,6 @@ impl fmt::Display for StoichiometryRole {
     }
 }
 
-/// Errors returned by [`ReactionNetwork`] construction, state initialization, conservation checks, or event application.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReactionError {
     ZeroSpecies,
@@ -229,7 +227,6 @@ pub struct ReactionChannel {
 }
 
 impl ReactionChannel {
-    /// Builds an irreversible or unpaired reaction channel (`reverse_channel = None`).
     pub fn new(
         reactants: Vec<(usize, u32)>,
         products: Vec<(usize, u32)>,
@@ -243,7 +240,7 @@ impl ReactionChannel {
         }
     }
 
-    /// Marks `reverse_channel` as the thermodynamic reverse reaction index for this channel.
+    /// Sets the reverse channel index; [`ReactionNetwork::new`] enforces that the pair is reciprocal.
     pub fn with_reverse(mut self, reverse_channel: usize) -> Self {
         self.reverse_channel = Some(reverse_channel);
         self
@@ -259,17 +256,18 @@ struct CompiledChannel {
     reverse_channel: Option<usize>,
 }
 
-/// Reaction event identifying the index of the fired channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ReactionEvent(pub usize);
 
-/// Undo record enabling allocation-free state restoration on rollback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Allocation-free rollback token for [`ReversibleModel::undo`].
+///
+/// Must be consumed once on the exact state produced by its matching
+/// [`ReversibleModel::apply_reversible`] call before any other mutation.
+#[derive(Debug, PartialEq, Eq)]
 pub struct ReactionUndo {
     channel: usize,
 }
 
-/// Discrete-population state vector and cumulative per-channel firing counters.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReactionState {
     pub counts: Vec<u64>,
@@ -285,12 +283,11 @@ impl ReactionState {
         &self.fired_counts
     }
 
-    pub fn total_firings(&self) -> u64 {
-        self.fired_counts.iter().copied().sum()
+    pub fn total_firings(&self) -> u128 {
+        self.fired_counts.iter().copied().map(u128::from).sum()
     }
 }
 
-/// Well-mixed stochastic chemical reaction network implementing [`Model`], [`ReversibleModel`], and [`IncrementalModel`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReactionNetwork {
     species_count: usize,
@@ -372,8 +369,87 @@ fn checked_binom_u128(n: u64, k: u32) -> Option<u128> {
     Some(acc)
 }
 
+const POW2_POS_512: f64 = f64::from_bits((1023_u64 + 512) << 52);
+const POW2_NEG_512: f64 = f64::from_bits((1023_u64 - 512) << 52);
+const POW2_64: f64 = f64::from_bits((1023_u64 + 64) << 52);
+const MANTISSA_MASK: u64 = (1_u64 << 52) - 1;
+const EXP_ONE_BITS: u64 = 1023_u64 << 52;
+// C(2k, k) >= 2^(2k)/(2k+1); for k >= 1060 this exceeds f64::MAX / f64::MIN_POSITIVE (~2^2098).
+const MAX_SCALED_BINOM_K: u64 = 1060;
+
+fn normalize_pos_f64(mut x: f64) -> (f64, i64) {
+    let mut exp = 0_i64;
+    if x < f64::MIN_POSITIVE {
+        x *= POW2_64;
+        exp -= 64;
+    }
+    let bits = x.to_bits();
+    let e = ((bits >> 52) & 0x7ff) as i64 - 1023;
+    exp += e;
+    let mant = f64::from_bits((bits & MANTISSA_MASK) | EXP_ONE_BITS);
+    (mant, exp)
+}
+
+fn scale_exp2(mut mant: f64, mut exp: i64) -> f64 {
+    if mant.is_nan() {
+        return f64::NAN;
+    }
+    if mant <= 0.0 {
+        return 0.0;
+    }
+    if mant.is_infinite() {
+        return f64::INFINITY;
+    }
+    let (m, e) = normalize_pos_f64(mant);
+    mant = m;
+    exp = exp.saturating_add(e);
+    if exp >= 1024 {
+        return f64::INFINITY;
+    }
+    if exp <= -2048 {
+        return 0.0;
+    }
+    while exp > 512 {
+        mant *= POW2_POS_512;
+        exp -= 512;
+    }
+    while exp < -512 {
+        mant *= POW2_NEG_512;
+        exp += 512;
+    }
+    let pow = f64::from_bits(((1023_i64 + exp) as u64) << 52);
+    mant * pow
+}
+
+fn mul_scaled(lhs: (f64, i64), rhs: (f64, i64)) -> (f64, i64) {
+    let (mant, me) = normalize_pos_f64(lhs.0 * rhs.0);
+    (mant, lhs.1.saturating_add(rhs.1).saturating_add(me))
+}
+
+fn binom_scaled(n: u64, k: u32) -> Option<(f64, i64)> {
+    let k = u64::from(k);
+    if k > n {
+        return None;
+    }
+    let k = k.min(n - k);
+    if k == 0 {
+        return Some((1.0, 0));
+    }
+    if k >= MAX_SCALED_BINOM_K {
+        return None;
+    }
+    let mut acc = (1.0_f64, 0_i64);
+    for i in 1..=k {
+        let (nm, ne) = normalize_pos_f64((n - k + i) as f64);
+        let (dm, de) = normalize_pos_f64(i as f64);
+        let (pm, pe) = normalize_pos_f64(acc.0 * (nm / dm));
+        acc = (pm, acc.1.saturating_add(ne - de + pe));
+    }
+    Some(acc)
+}
+
 impl ReactionNetwork {
-    /// Builds and validates a reaction network, precomputing channel rate dependencies.
+    /// Builds and validates a reaction network, enforcing reciprocal reverse pairs and precomputing dependencies.
     pub fn new(
         species_count: usize,
         channels: Vec<ReactionChannel>,
@@ -388,7 +464,7 @@ impl ReactionNetwork {
             .map_err(|_| ReactionError::TooManyChannels(channels.len()))?;
 
         let mut compiled = Vec::with_capacity(channels.len());
-        let mut by_reactant_species = vec![Vec::new(); species_count];
+        let mut by_reactant_species: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
 
         for (idx, ch) in channels.iter().enumerate() {
             if !ch.rate_constant.is_finite() || ch.rate_constant < 0.0 {
@@ -411,7 +487,7 @@ impl ReactionNetwork {
             let products =
                 validate_stoich_list(idx, StoichiometryRole::Product, &ch.products, species_count)?;
             for &(species, _) in &reactants {
-                by_reactant_species[species].push(idx);
+                by_reactant_species.entry(species).or_default().push(idx);
             }
             let net_delta = compile_net_delta(&reactants, &products);
             compiled.push(CompiledChannel {
@@ -452,9 +528,11 @@ impl ReactionNetwork {
             seen.clear();
             let mut deps = Vec::new();
             for &(species, _) in &ch.net_delta {
-                for &dep_channel in &by_reactant_species[species] {
-                    if seen.insert(dep_channel) {
-                        deps.push(dep_channel);
+                if let Some(consumers) = by_reactant_species.get(&species) {
+                    for &dep_channel in consumers {
+                        if seen.insert(dep_channel) {
+                            deps.push(dep_channel);
+                        }
                     }
                 }
             }
@@ -508,7 +586,6 @@ impl ReactionNetwork {
         self.channels.len()
     }
 
-    /// Creates an initial state with `counts` and zero firing counters.
     pub fn initial_state(&self, counts: Vec<u64>) -> Result<ReactionState, ReactionError> {
         if counts.len() != self.species_count {
             return Err(ReactionError::StateSpeciesMismatch {
@@ -522,7 +599,6 @@ impl ReactionNetwork {
         })
     }
 
-    /// Checks that all attached conservation invariants hold between `initial` and `current`.
     pub fn check_conservation(
         &self,
         initial: &ReactionState,
@@ -578,33 +654,54 @@ impl ReactionNetwork {
             return f64::NAN;
         }
         let mut factor_u128 = 1_u128;
-        let mut overflowed_factor = None;
+        let mut scaled_factor: Option<(f64, i64)> = None;
+        let mut overflowed_inf = false;
         for &(species, req) in &ch.reactants {
             let avail = state.counts[species];
             if avail < u64::from(req) {
                 return 0.0;
             }
-            match (overflowed_factor, checked_binom_u128(avail, req)) {
+            if overflowed_inf {
+                continue;
+            }
+            match (scaled_factor, checked_binom_u128(avail, req)) {
                 (None, Some(comb)) => {
                     if let Some(next) = factor_u128.checked_mul(comb) {
                         factor_u128 = next;
                     } else {
-                        overflowed_factor = Some((factor_u128 as f64) * (comb as f64));
+                        let lhs = normalize_pos_f64(factor_u128 as f64);
+                        let rhs = normalize_pos_f64(comb as f64);
+                        scaled_factor = Some(mul_scaled(lhs, rhs));
                     }
                 }
+                (None, None) => match binom_scaled(avail, req) {
+                    Some(rhs) => {
+                        let lhs = normalize_pos_f64(factor_u128 as f64);
+                        scaled_factor = Some(mul_scaled(lhs, rhs));
+                    }
+                    None => overflowed_inf = true,
+                },
                 (Some(prev), Some(comb)) => {
-                    overflowed_factor = Some(prev * (comb as f64));
+                    scaled_factor = Some(mul_scaled(prev, normalize_pos_f64(comb as f64)));
                 }
-                _ => {
-                    overflowed_factor = Some(f64::INFINITY);
-                }
+                (Some(prev), None) => match binom_scaled(avail, req) {
+                    Some(rhs) => scaled_factor = Some(mul_scaled(prev, rhs)),
+                    None => overflowed_inf = true,
+                },
             }
         }
         if ch.rate_constant == 0.0 {
             return 0.0;
         }
-        let factor = overflowed_factor.unwrap_or(factor_u128 as f64);
-        ch.rate_constant * factor
+        if overflowed_inf {
+            return f64::INFINITY;
+        }
+        if let Some(scaled) = scaled_factor {
+            let rate = normalize_pos_f64(ch.rate_constant);
+            let total = mul_scaled(scaled, rate);
+            return scale_exp2(total.0, total.1);
+        }
+        (factor_u128 as f64) * ch.rate_constant
     }
 }
 
@@ -657,7 +754,6 @@ impl ReversibleModel for ReactionNetwork {
             });
         }
 
-        // Validate reactants, fired counter, and net changes before mutating state.
         for &(species, req) in &ch.reactants {
             let available = state.counts[species];
             if available < u64::from(req) {
@@ -767,6 +863,8 @@ impl Checkpointable for ReactionNetwork {
     }
 
     fn encode_state(&self, state: &Self::State, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(state.counts.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(state.fired_counts.len() as u64).to_le_bytes());
         for &c in &state.counts {
             out.extend_from_slice(&c.to_le_bytes());
         }
@@ -776,9 +874,18 @@ impl Checkpointable for ReactionNetwork {
     }
 
     fn decode_state(&self, bytes: &[u8]) -> Result<Self::State, Box<dyn Error + Send + Sync>> {
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        if !remainder.is_empty() {
+            return Err(format!(
+                "reaction state byte length {} is not a multiple of 8",
+                bytes.len()
+            )
+            .into());
+        }
         let total_words = self
             .species_count
             .checked_add(self.channels.len())
+            .and_then(|n| n.checked_add(2))
             .ok_or("reaction state word count overflow")?;
         let expected_bytes = total_words
             .checked_mul(8)
@@ -790,12 +897,33 @@ impl Checkpointable for ReactionNetwork {
             )
             .into());
         }
-        let read_u64 = |idx: usize| -> u64 {
-            let start = idx * 8;
-            u64::from_le_bytes(bytes[start..start + 8].try_into().unwrap())
-        };
-        let counts = (0..self.species_count).map(read_u64).collect();
-        let fired_counts = (self.species_count..total_words).map(read_u64).collect();
+        let mut words = chunks.iter().copied().map(u64::from_le_bytes);
+        let counts_len = words
+            .next()
+            .ok_or("missing reaction counts length header")?;
+        let fired_len = words.next().ok_or("missing reaction fired length header")?;
+        if counts_len != self.species_count as u64 {
+            return Err(format!(
+                "reaction state counts length {counts_len} does not match expected {}",
+                self.species_count
+            )
+            .into());
+        }
+        if fired_len != self.channels.len() as u64 {
+            return Err(format!(
+                "reaction state fired length {fired_len} does not match expected {}",
+                self.channels.len()
+            )
+            .into());
+        }
+        let mut counts = Vec::with_capacity(self.species_count);
+        for _ in 0..self.species_count {
+            counts.push(words.next().ok_or("truncated reaction counts payload")?);
+        }
+        let mut fired_counts = Vec::with_capacity(self.channels.len());
+        for _ in 0..self.channels.len() {
+            fired_counts.push(words.next().ok_or("truncated reaction fired payload")?);
+        }
         Ok(ReactionState {
             counts,
             fired_counts,
