@@ -4,6 +4,7 @@ use crate::catalog::{Engine, SumTreeCatalog};
 use crate::checkpoint::{CheckpointError, Checkpointable};
 use crate::clock::Clock;
 use crate::model::ReversibleModel;
+use crate::rate::Rate;
 use crate::rng::KmcRng;
 use crate::simulation::{RunSummary, SimError, Step};
 use crate::topology::SlotError;
@@ -47,10 +48,15 @@ impl SumTree {
     }
 
     pub fn try_new(rates: &[f64]) -> Result<Self, SlotError> {
-        debug_assert!(rates.iter().all(|r| r.is_finite() && *r >= 0.0));
         let mut tree = Self::try_with_len(rates.len())?;
-        tree.nodes[tree.cap..tree.cap + tree.len].copy_from_slice(rates);
+        for (slot, &raw) in rates.iter().enumerate() {
+            let rate = Rate::new(raw).map_err(|source| SlotError::InvalidRate { slot, source })?;
+            tree.nodes[tree.cap + slot] = rate.get();
+        }
         tree.recompute_internal_sums();
+        if !tree.total().is_finite() {
+            return Err(SlotError::TotalNotFinite);
+        }
         Ok(tree)
     }
 
@@ -106,6 +112,15 @@ impl SumTree {
         &self.nodes
     }
 
+    fn set_unchecked(&mut self, slot: usize, rate: f64) {
+        self.nodes[self.cap + slot] = rate;
+        let mut k = (self.cap + slot) / 2;
+        while k >= 1 {
+            self.nodes[k] = self.nodes[2 * k] + self.nodes[2 * k + 1];
+            k /= 2;
+        }
+    }
+
     pub fn try_set(&mut self, slot: usize, rate: f64) -> Result<(), SlotError> {
         if slot >= self.len {
             return Err(SlotError::OutOfRange {
@@ -113,12 +128,14 @@ impl SumTree {
                 slot_count: self.len,
             });
         }
-        debug_assert!(rate.is_finite() && rate >= 0.0);
-        self.nodes[self.cap + slot] = rate;
-        let mut k = (self.cap + slot) / 2;
-        while k >= 1 {
-            self.nodes[k] = self.nodes[2 * k] + self.nodes[2 * k + 1];
-            k /= 2;
+        let rate = Rate::new(rate)
+            .map_err(|source| SlotError::InvalidRate { slot, source })?
+            .get();
+        let prev = self.nodes[self.cap + slot];
+        self.set_unchecked(slot, rate);
+        if !self.total().is_finite() {
+            self.set_unchecked(slot, prev);
+            return Err(SlotError::TotalNotFinite);
         }
         Ok(())
     }
@@ -245,6 +262,69 @@ impl<M: IncrementalModel + Checkpointable> IncrementalSimulation<M> {
             engine: Engine::resume(model, bytes)?,
         })
     }
+}
+
+/// Verifies that [`IncrementalModel::affected_slots`] and `tree` match a fresh slot-by-slot evaluation of `after`.
+///
+/// Checks that every slot whose rate changed between `before` and `after` was reported by
+/// `model.affected_slots(after, event, &mut affected)`, and that every slot rate and `tree.total()`
+/// match `model.slot_rate(after, ..)` within `tol`.
+pub fn verify_incremental_step_parity<M: IncrementalModel>(
+    model: &M,
+    before: &M::State,
+    after: &M::State,
+    event: &M::Event,
+    tree: &SumTree,
+    tol: f64,
+) -> Result<(), String> {
+    if !tol.is_finite() || tol < 0.0 {
+        return Err(format!("invalid tolerance {tol}"));
+    }
+    let slot_count = model.slot_count(after);
+    if slot_count != tree.len() {
+        return Err(format!(
+            "slot count mismatch: model has {slot_count}, tree has {}",
+            tree.len()
+        ));
+    }
+    let mut affected = Vec::new();
+    model.affected_slots(after, event, &mut affected);
+    affected.sort_unstable();
+    affected.dedup();
+
+    let mut after_rates = Vec::with_capacity(slot_count);
+    for slot in 0..slot_count {
+        let before_rate = Rate::new(model.slot_rate(before, slot))
+            .map_err(|e| format!("invalid rate before step at slot {slot}: {e}"))?
+            .get();
+        let after_rate = Rate::new(model.slot_rate(after, slot))
+            .map_err(|e| format!("invalid rate after step at slot {slot}: {e}"))?
+            .get();
+        if before_rate != after_rate && affected.binary_search(&slot).is_err() {
+            return Err(format!(
+                "affected_slots omitted slot {slot} whose rate changed from {before_rate} to {after_rate}"
+            ));
+        }
+        let tree_rate = tree
+            .try_rate(slot)
+            .map_err(|e| format!("tree read failed at slot {slot}: {e}"))?;
+        if (tree_rate - after_rate).abs() > tol {
+            return Err(format!(
+                "slot {slot} rate mismatch: tree={tree_rate}, expected={after_rate}"
+            ));
+        }
+        after_rates.push(after_rate);
+    }
+    let expected_tree =
+        SumTree::try_new(&after_rates).map_err(|e| format!("fresh sum-tree build failed: {e}"))?;
+    if (tree.total() - expected_tree.total()).abs() > tol {
+        return Err(format!(
+            "total rate mismatch: tree={}, expected={}",
+            tree.total(),
+            expected_tree.total()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

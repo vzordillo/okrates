@@ -375,6 +375,7 @@ fn sampler_handles_exact_ties_compensated_clock_limits_and_mid_run_errors() {
     .unwrap();
     assert_eq!(out.values, vec![7]);
     assert_eq!(out.fired_steps, 1);
+    assert_eq!(out.steps_in_window, 1);
 
     let mut tie_abs = ScriptedClockSource {
         state: 0,
@@ -393,6 +394,7 @@ fn sampler_handles_exact_ties_compensated_clock_limits_and_mid_run_errors() {
     .unwrap();
     assert_eq!(out.values, vec![9]);
     assert_eq!(out.fired_steps, 1);
+    assert_eq!(out.steps_in_window, 1);
 
     let g_zero = SampleGrid::explicit(vec![0.0]).unwrap();
     let mut tie_origin = ScriptedClockSource {
@@ -412,6 +414,7 @@ fn sampler_handles_exact_ties_compensated_clock_limits_and_mid_run_errors() {
     .unwrap();
     assert_eq!(out.values, vec![42]);
     assert_eq!(out.fired_steps, 0);
+    assert_eq!(out.steps_in_window, 0);
 
     let g_ten = SampleGrid::explicit(vec![10.0]).unwrap();
     let mut hold_at_cap = ScriptedClockSource {
@@ -431,6 +434,7 @@ fn sampler_handles_exact_ties_compensated_clock_limits_and_mid_run_errors() {
     .unwrap();
     assert_eq!(out.values, vec![5]);
     assert_eq!(out.fired_steps, 1);
+    assert_eq!(out.steps_in_window, 1);
 
     let mut past_clock = ScriptedClockSource {
         state: 0,
@@ -467,6 +471,7 @@ fn sampler_handles_exact_ties_compensated_clock_limits_and_mid_run_errors() {
     .unwrap();
     assert_eq!(out.values, vec![3]);
     assert_eq!(out.fired_steps, 1);
+    assert_eq!(out.steps_in_window, 0);
 
     let mut mid_err = ScriptedClockSource {
         state: 0,
@@ -688,4 +693,64 @@ fn ctmc_solvers_and_statistics_handle_extreme_scales_and_stiff_generators() {
         std::panic::catch_unwind(|| solve_stationary_ctmc(&[vec![0.0, 0.0], vec![1.0, 0.0]]))
             .is_err()
     );
+}
+
+#[test]
+fn direct_catalog_clears_partial_state_on_validation_error() {
+    use okrates_core::{CatalogBackend, DirectCatalog, RateError};
+    use std::convert::Infallible;
+
+    struct PartialBadRateModel;
+
+    impl Model for PartialBadRateModel {
+        type State = ();
+        type Event = usize;
+        type Error = Infallible;
+
+        fn enumerate_events(&self, _: &(), emit: &mut dyn FnMut(usize, f64)) {
+            emit(0, 2.0);
+            emit(1, -1.0);
+        }
+
+        fn apply(&self, _: &mut (), _: &usize) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    let mut catalog = DirectCatalog::new();
+    let err = catalog
+        .prepare_total(&PartialBadRateModel, &())
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        SimError::InvalidRate {
+            index: 1,
+            source: RateError::Negative(-1.0)
+        }
+    ));
+    assert_eq!(catalog.len(), 0);
+    assert!(catalog.is_empty());
+
+    struct InfiniteSumModel;
+
+    impl Model for InfiniteSumModel {
+        type State = ();
+        type Event = usize;
+        type Error = Infallible;
+
+        fn enumerate_events(&self, _: &(), emit: &mut dyn FnMut(usize, f64)) {
+            emit(0, f64::MAX);
+            emit(1, f64::MAX);
+        }
+
+        fn apply(&self, _: &mut (), _: &usize) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    assert!(matches!(
+        catalog.prepare_total(&InfiniteSumModel, &()),
+        Err(SimError::TotalRateNotFinite)
+    ));
+    assert!(catalog.is_empty());
 }

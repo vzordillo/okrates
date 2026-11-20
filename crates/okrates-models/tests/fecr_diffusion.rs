@@ -272,6 +272,9 @@ fn transport_rejects_oversized_cr_count_and_handles_extreme_displacements() {
     assert!(origin_slope(&[], &[]).is_nan());
     assert!(ols_slope(&[1.0], &[2.0]).is_nan());
     assert!(mean_se(&[]).0.is_nan());
+    let single = mean_se(&[3.5]);
+    assert_eq!(single.0, 3.5);
+    assert!(single.1.is_nan());
 
     let init = model.random_state(0, 7).unwrap();
     let mut raw = Vec::new();

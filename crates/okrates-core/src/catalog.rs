@@ -58,6 +58,14 @@ impl<E> DirectCatalog<E> {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
     pub fn allocated_bytes(&self) -> usize {
         self.events.capacity() * std::mem::size_of::<E>()
             + self.rates.capacity() * std::mem::size_of::<Rate>()
@@ -115,6 +123,8 @@ impl<M: Model> CatalogBackend<M> for DirectCatalog<M::Event> {
             }
         });
         if let Some(error) = validation_error {
+            self.events.clear();
+            self.rates.clear();
             return Err(error);
         }
 
@@ -123,6 +133,8 @@ impl<M: Model> CatalogBackend<M> for DirectCatalog<M::Event> {
             total += rate.get();
         }
         if !total.is_finite() {
+            self.events.clear();
+            self.rates.clear();
             return Err(SimError::TotalRateNotFinite);
         }
         if self.events.is_empty() {
@@ -174,6 +186,11 @@ fn map_slot_error<ME>(err: SlotError) -> SimError<ME> {
     match err {
         SlotError::OutOfRange { slot, slot_count } => SimError::InvalidSlot { slot, slot_count },
         SlotError::TooLarge { slot_count } => SimError::CatalogTooLarge { slot_count },
+        SlotError::InvalidRate { slot, source } => SimError::InvalidRate {
+            index: slot,
+            source,
+        },
+        SlotError::TotalNotFinite => SimError::TotalRateNotFinite,
     }
 }
 
@@ -268,6 +285,7 @@ impl<M: IncrementalModel> CatalogBackend<M> for SumTreeCatalog {
             }
         }
 
+        self.staged.sort_by_key(|&(_, prev, rate)| rate > prev);
         for (applied, &(affected, _, rate)) in self.staged.iter().enumerate() {
             if let Err(err) = self.tree.try_set(affected, rate) {
                 for &(prev_slot, prev_rate, _) in self.staged[..applied].iter().rev() {
@@ -358,7 +376,8 @@ impl<M: Model, C: CatalogBackend<M>> Engine<M, C> {
             .is_none())
     }
 
-    /// Fires one transition atomically; on `Err`, `state`, `catalog`, `clock`, `steps`, and `rng` are unchanged.
+    /// Fires one transition atomically; on `Err`, `state`, `clock`, `steps`, `rng`, and
+    /// sum-tree weights are unchanged (`DirectCatalog` scratch buffers may be cleared on validation error).
     pub fn step(&mut self) -> Result<Step<M::Event>, SimError<M::Error>> {
         self.step_observing(|_, _, _| {})
     }

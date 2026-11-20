@@ -123,6 +123,11 @@ pub fn import_pymatgen_vasp_json(json: &str) -> Result<BarrierSet, AdapterError>
     Ok(BarrierSet::new(doc.name, doc.tolerance_ev, records)?)
 }
 
+/// Exports a validated [`BarrierSet`] as a three-point NEB image summary (`[0.0, E_fwd, dE]`).
+///
+/// This is a lossy external format projection: `reverse_attempt_frequency_hz`, full multi-image
+/// pathways, and distinct per-task workflows are omitted. Use [`BarrierSet::to_json_pretty`] and
+/// [`BarrierSet::from_json_str`] for lossless barrier persistence.
 pub fn export_pymatgen_vasp_json(set: &BarrierSet) -> Result<String, AdapterError> {
     set.validate()?;
     let tasks = set

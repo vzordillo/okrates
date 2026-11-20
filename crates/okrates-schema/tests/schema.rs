@@ -3,9 +3,10 @@
 use std::collections::BTreeMap;
 
 use okrates_schema::{
-    AdapterError, AiidaQeNebExport, BarrierRecord, BarrierSet, BarrierValidationError, Conditions,
-    EstimatorSpec, ManifestError, RngPolicy, RunManifest, export_aiida_qe_json,
-    export_pymatgen_vasp_json, import_aiida_qe_json, import_pymatgen_vasp_json, sha256_hex,
+    AdapterError, AiidaQeNebExport, BarrierJsonError, BarrierRecord, BarrierSet,
+    BarrierValidationError, Conditions, EstimatorSpec, ManifestError, RngPolicy, RunManifest,
+    export_aiida_qe_json, export_pymatgen_vasp_json, import_aiida_qe_json,
+    import_pymatgen_vasp_json, sha256_hex,
 };
 
 #[test]
@@ -40,6 +41,7 @@ fn run_manifest_round_trips_and_tracks_checkpoint_lineage() {
     let json = manifest.to_json_pretty().unwrap();
     let decoded = RunManifest::from_json(&json).unwrap();
     assert_eq!(manifest, decoded);
+    assert!(decoded.build_target().is_some_and(|t| !t.is_empty()));
     assert_eq!(manifest.reproducibility_tier, "bitwise_same_crate_same_fp");
     assert_eq!(manifest.params_sha256, sha256_hex(b"encoded-params-bytes"));
     assert_eq!(
@@ -50,6 +52,14 @@ fn run_manifest_round_trips_and_tracks_checkpoint_lineage() {
         manifest.manifest_sha256().unwrap(),
         decoded.manifest_sha256().unwrap()
     );
+
+    // Legacy manifests omitting optional `git_dirty` and `build_target` remain valid.
+    let mut legacy_val: serde_json::Value = serde_json::from_str(&json).unwrap();
+    legacy_val.as_object_mut().unwrap().remove("git_dirty");
+    legacy_val.as_object_mut().unwrap().remove("build_target");
+    let legacy = RunManifest::from_json(&legacy_val.to_string()).unwrap();
+    assert_eq!(legacy.git_dirty(), None);
+    assert_eq!(legacy.build_target(), None);
 
     let bad_ver = json.replace("\"schema_version\": 1", "\"schema_version\": 99");
     assert!(matches!(
@@ -260,5 +270,76 @@ fn pymatgen_vasp_and_aiida_qe_adapters_round_trip_and_reject_unphysical_paths() 
         Err(AdapterError::Validation(
             BarrierValidationError::DetailedBalanceViolation { .. }
         ))
+    ));
+}
+
+#[test]
+fn lossless_barrier_json_and_equilibrium_rate_ratio() {
+    let mut rec = BarrierRecord {
+        id: "db_check".to_string(),
+        migrating_species: "Cr".to_string(),
+        env_key: "pair=1".to_string(),
+        forward_barrier_ev: 0.65,
+        reverse_barrier_ev: 0.55,
+        delta_energy_ev: 0.10,
+        attempt_frequency_hz: 1.0e13,
+        reverse_attempt_frequency_hz: Some(2.0e13),
+        barrier_std_ev: Some(0.01),
+        temp_range_k: Some([500.0, 1000.0]),
+        provenance: None,
+    };
+
+    // Asymmetric reverse attempt frequency keeps rate ratio = nu_fwd / nu_rev when energies are reciprocal.
+    let asym = rec.equilibrium_rate_ratio(750.0).unwrap();
+    assert!((asym - 0.5).abs() < 1e-14, "got {asym}");
+
+    rec.reverse_attempt_frequency_hz = None;
+    let exact = rec.equilibrium_rate_ratio(750.0).unwrap();
+    assert!((exact - 1.0).abs() < 1e-14, "got {exact}");
+
+    // Combined log-space prefactor and barrier factor stays finite when individual factors would overflow.
+    let stiff_rec = BarrierRecord {
+        id: "log_space_overflow_guard".to_string(),
+        migrating_species: "Cr".to_string(),
+        env_key: "stiff=1".to_string(),
+        forward_barrier_ev: 0.0,
+        reverse_barrier_ev: 0.612,
+        delta_energy_ev: 0.0,
+        attempt_frequency_hz: 1.0e12,
+        reverse_attempt_frequency_hz: Some(1.0e13),
+        barrier_std_ev: None,
+        temp_range_k: None,
+        provenance: None,
+    };
+    let stiff_ratio = stiff_rec.equilibrium_rate_ratio(10.0).unwrap();
+    assert!(
+        stiff_ratio.is_finite() && stiff_ratio > 1.0e300,
+        "got {stiff_ratio}"
+    );
+
+    // Export preserves reverse_attempt_frequency_hz losslessly; validation runs on import and export.
+    rec.reverse_attempt_frequency_hz = Some(2.0e13);
+    let set = BarrierSet::new("lossless-test", 1e-12, vec![rec.clone()]).unwrap();
+    let json = set.to_json_pretty().unwrap();
+    let roundtrip = BarrierSet::from_json_str(&json).unwrap();
+    assert_eq!(roundtrip, set);
+    assert_eq!(
+        roundtrip.records[0].reverse_attempt_frequency_hz,
+        Some(2.0e13)
+    );
+
+    let broken_json = json.replace(
+        "\"reverse_barrier_ev\": 0.55",
+        "\"reverse_barrier_ev\": -0.1",
+    );
+    assert!(matches!(
+        BarrierSet::from_json_str(&broken_json),
+        Err(BarrierJsonError::Validation(
+            BarrierValidationError::NegativeBarrier { .. }
+        ))
+    ));
+    assert!(matches!(
+        rec.equilibrium_rate_ratio(0.0),
+        Err(BarrierValidationError::InvalidTemperature(0.0))
     ));
 }

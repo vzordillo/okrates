@@ -51,6 +51,10 @@ pub struct RunManifest {
     pub schema_version: u32,
     pub crate_version: String,
     pub git_sha: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_dirty: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_target: Option<String>,
     pub reproducibility_tier: String,
     pub model_id: String,
     pub params_sha256: String,
@@ -103,10 +107,21 @@ impl RunManifest {
         rng: RngPolicy,
         conditions: Conditions,
     ) -> Self {
+        let git_dirty = match option_env!("OKRATES_GIT_DIRTY") {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
+        };
+        let build_target = option_env!("OKRATES_TARGET")
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "unknown")
+            .map(str::to_string);
         Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
             crate_version: env!("CARGO_PKG_VERSION").to_string(),
             git_sha: env!("OKRATES_GIT_SHA").to_string(),
+            git_dirty,
+            build_target,
             reproducibility_tier: "bitwise_same_crate_same_fp".to_string(),
             model_id: model_id.into(),
             params_sha256: sha256_hex(encoded_params),
@@ -117,6 +132,14 @@ impl RunManifest {
             conditions,
             estimator: None,
         }
+    }
+
+    pub fn git_dirty(&self) -> Option<bool> {
+        self.git_dirty
+    }
+
+    pub fn build_target(&self) -> Option<&str> {
+        self.build_target.as_deref()
     }
 
     pub fn with_parent_checkpoint(mut self, checkpoint_bytes: &[u8]) -> Self {

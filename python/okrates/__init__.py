@@ -174,6 +174,8 @@ class RunManifest:
     conditions: ManifestConditions
     estimator: EstimatorSpec | None
     raw_json: str
+    git_dirty: bool | None = None
+    build_target: str | None = None
 
     @classmethod
     def from_json(cls, raw_json: str) -> RunManifest:
@@ -238,6 +240,10 @@ class RunManifest:
         else:
             raise ValueError("manifest.estimator must be a JSON object or null")
 
+        raw_dirty = data.get("git_dirty")
+        if raw_dirty is not None and not isinstance(raw_dirty, bool):
+            raise ValueError("manifest.git_dirty must be a boolean or null")
+
         return cls(
             schema_version=version,
             crate_version=_req_str(data, "crate_version", "manifest"),
@@ -252,6 +258,8 @@ class RunManifest:
             conditions=conditions,
             estimator=estimator,
             raw_json=raw_json,
+            git_dirty=raw_dirty,
+            build_target=_opt_str(data, "build_target", "manifest"),
         )
 
     def to_json(self) -> str:

@@ -5,11 +5,14 @@ use std::fmt;
 
 use crate::incremental::IncrementalModel;
 use crate::model::{Model, ReversibleModel};
+use crate::rate::RateError;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SlotError {
     OutOfRange { slot: usize, slot_count: usize },
     TooLarge { slot_count: usize },
+    InvalidRate { slot: usize, source: RateError },
+    TotalNotFinite,
 }
 
 impl fmt::Display for SlotError {
@@ -21,11 +24,22 @@ impl fmt::Display for SlotError {
             Self::TooLarge { slot_count } => {
                 write!(f, "slot count {slot_count} exceeds sum-tree capacity")
             }
+            Self::InvalidRate { slot, source } => {
+                write!(f, "invalid rate for slot {slot}: {source}")
+            }
+            Self::TotalNotFinite => write!(f, "total slot rate overflowed to non-finite"),
         }
     }
 }
 
-impl Error for SlotError {}
+impl Error for SlotError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidRate { source, .. } => Some(source),
+            Self::OutOfRange { .. } | Self::TooLarge { .. } | Self::TotalNotFinite => None,
+        }
+    }
+}
 
 /// Reversible state-transition geometry independent of transition rates.
 pub trait TransitionTopology {
@@ -71,22 +85,65 @@ pub trait RateModel<T: TransitionTopology> {
     fn rate(&self, topology: &T, state: &T::State, event: &T::Event) -> f64;
 }
 
-/// Composes a [`TransitionTopology`] with a [`RateModel`] into a full KMC model.
-///
-/// Incremental updates require `T::affected_slots` to cover every slot whose `R::rate` or `T::is_slot_active` depends on state modified by `event`.
+/// Declares rate-dependent affected slots beyond a topology's purely geometric dependencies.
+pub trait RateDependencies<T: SlottedTopology> {
+    /// Appends slots whose [`RateModel::rate`] may change after `event` produces `state`.
+    fn affected_rate_slots(
+        &self,
+        topology: &T,
+        state: &T::State,
+        event: &T::Event,
+        out: &mut Vec<usize>,
+    );
+}
+
+/// Default dependency policy assuming [`SlottedTopology::affected_slots`] already covers all rate dependencies.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CoupledModel<T, R> {
+pub struct TopologyOnlyDependencies;
+
+impl<T: SlottedTopology> RateDependencies<T> for TopologyOnlyDependencies {
+    fn affected_rate_slots(
+        &self,
+        _topology: &T,
+        _state: &T::State,
+        _event: &T::Event,
+        _out: &mut Vec<usize>,
+    ) {
+    }
+}
+
+/// Composes a [`TransitionTopology`] with a [`RateModel`] (and optional [`RateDependencies`]) into a full KMC model.
+///
+/// Incremental updates invalidate both `T::affected_slots` and `D::affected_rate_slots`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoupledModel<T, R, D = TopologyOnlyDependencies> {
     pub topology: T,
     pub rates: R,
+    pub dependencies: D,
 }
 
 impl<T, R> CoupledModel<T, R> {
     pub fn new(topology: T, rates: R) -> Self {
-        Self { topology, rates }
+        Self {
+            topology,
+            rates,
+            dependencies: TopologyOnlyDependencies,
+        }
     }
 }
 
-impl<T, R> Model for CoupledModel<T, R>
+impl<T, R, D> CoupledModel<T, R, D> {
+    /// Composes `topology`, `rates`, and an explicit [`RateDependencies`] provider.
+    pub fn with_dependencies(topology: T, rates: R, dependencies: D) -> Self {
+        Self {
+            topology,
+            rates,
+            dependencies,
+        }
+    }
+}
+
+impl<T, R, D> Model for CoupledModel<T, R, D>
 where
     T: EnumeratedTopology,
     R: RateModel<T>,
@@ -107,7 +164,7 @@ where
     }
 }
 
-impl<T, R> ReversibleModel for CoupledModel<T, R>
+impl<T, R, D> ReversibleModel for CoupledModel<T, R, D>
 where
     T: EnumeratedTopology,
     R: RateModel<T>,
@@ -127,10 +184,11 @@ where
     }
 }
 
-impl<T, R> IncrementalModel for CoupledModel<T, R>
+impl<T, R, D> IncrementalModel for CoupledModel<T, R, D>
 where
     T: SlottedTopology,
     R: RateModel<T>,
+    D: RateDependencies<T>,
 {
     fn slot_count(&self, state: &Self::State) -> usize {
         self.topology.slot_count(state)
@@ -153,6 +211,22 @@ where
     }
 
     fn affected_slots(&self, state: &Self::State, event: &Self::Event, out: &mut Vec<usize>) {
+        let start = out.len();
         self.topology.affected_slots(state, event, out);
+        let before_deps = out.len();
+        self.dependencies
+            .affected_rate_slots(&self.topology, state, event, out);
+        if out.len() > before_deps && out.len() - start > 1 {
+            out[start..].sort_unstable();
+            let slice = &mut out[start..];
+            let mut write = 1;
+            for read in 1..slice.len() {
+                if slice[read] != slice[write - 1] {
+                    slice[write] = slice[read];
+                    write += 1;
+                }
+            }
+            out.truncate(start + write);
+        }
     }
 }

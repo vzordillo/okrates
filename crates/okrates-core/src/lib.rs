@@ -20,7 +20,9 @@ pub use catalog::{CatalogBackend, DirectCatalog, Engine, SumTreeCatalog};
 pub use checkpoint::{CheckpointError, Checkpointable, SCHEMA_VERSION};
 pub use clock::{Clock, ClockError};
 pub use ensemble::{EnsembleError, Replica, ReplicaContext, run_ensemble, run_replicas};
-pub use incremental::{IncrementalModel, IncrementalSimulation, SumTree};
+pub use incremental::{
+    IncrementalModel, IncrementalSimulation, SumTree, verify_incremental_step_parity,
+};
 pub use model::{CloneRollback, IndependentSnapshot, Model, ReversibleModel};
 pub use rate::{Rate, RateError};
 pub use rng::{KmcRng, StreamRole};
@@ -30,5 +32,6 @@ pub use sampler::{
 };
 pub use simulation::{RunSummary, SimError, Simulation, Step};
 pub use topology::{
-    CoupledModel, EnumeratedTopology, RateModel, SlotError, SlottedTopology, TransitionTopology,
+    CoupledModel, EnumeratedTopology, RateDependencies, RateModel, SlotError, SlottedTopology,
+    TopologyOnlyDependencies, TransitionTopology,
 };
