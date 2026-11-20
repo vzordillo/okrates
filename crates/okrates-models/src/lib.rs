@@ -11,5 +11,6 @@ pub mod fecr_ris;
 pub mod fecr_ris_segregation;
 pub mod fecr_ris_transport;
 pub mod multi_vacancy;
+pub mod reaction_network;
 pub mod tabulated;
 pub mod vacancy;

@@ -715,3 +715,76 @@ fn fecr_ris_segregation_bad_args() {
         assert_eq!(std::fs::read_to_string(&hl_a).unwrap(), "keep\n");
     }
 }
+
+#[test]
+fn reaction_network_small() {
+    let (code, stdout, stderr) = run(example("reaction_network").args([
+        "--e0",
+        "10",
+        "--s0",
+        "40",
+        "--k-bind",
+        "0.02",
+        "--k-unbind",
+        "0.35",
+        "--k-cat",
+        "0.25",
+        "--t-end",
+        "5.0",
+        "--runs",
+        "8",
+        "--seed",
+        "42",
+    ]));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stderr, "");
+    assert_eq!(
+        stdout,
+        "species = [E, S, ES, P]\n\
+         initial = [10, 40, 0, 0] k_bind = 0.02 k_unbind = 0.35 k_cat = 0.25\n\
+         t_end = 5 runs = 8 seed = 42\n\
+         mean_counts = [4.500000, 29.500000, 5.500000, 5.000000]\n\
+         mean_firings = [18.500000, 8.000000, 5.000000] mean_steps = 32.500000\n\
+         conservation = verified\n"
+    );
+}
+
+#[test]
+fn reaction_network_bad_args() {
+    let usage = "usage: reaction_network --e0 N --s0 N --k-bind F --k-unbind F --k-cat F --t-end F --runs R --seed S";
+    assert_usage_error(&mut example("reaction_network"), usage);
+    assert_usage_error(example("reaction_network").arg("--unknown"), usage);
+    let base = [
+        "--e0",
+        "10",
+        "--s0",
+        "40",
+        "--k-bind",
+        "0.02",
+        "--k-unbind",
+        "0.35",
+        "--k-cat",
+        "0.25",
+        "--t-end",
+        "5.0",
+        "--runs",
+        "8",
+        "--seed",
+        "42",
+    ];
+    for (flag, bad_val) in [("--runs", "0"), ("--t-end", "0"), ("--t-end", "nan")] {
+        let mut args = base;
+        let idx = args.iter().position(|&a| a == flag).unwrap();
+        args[idx + 1] = bad_val;
+        assert_usage_error(example("reaction_network").args(args), usage);
+    }
+    let mut bad_rate = base;
+    bad_rate[5] = "-0.02";
+    let (code, stdout, stderr) = run(example("reaction_network").args(bad_rate));
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("rate constant"),
+        "expected rate constant error on stderr, got: {stderr}"
+    );
+}
