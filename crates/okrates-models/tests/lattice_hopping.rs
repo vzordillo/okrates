@@ -871,9 +871,9 @@ fn t4_reversible_undo_checkpoint_roundtrip_and_validation_errors() {
     let st_max_prep = model.initial_state(&base_sites).unwrap();
     let mut max_bytes = Vec::new();
     model.encode_state(&st_max_prep, &mut max_bytes);
-    // Word offsets: [n, moved_ion, moved_site, s0, o0, dx0, dy0, dz0, h0, s1, o1, dx1, dy1, dz1, h1]
-    // h0 is word 8 (bytes 64..72).
-    max_bytes[64..72].copy_from_slice(&u64::MAX.to_le_bytes());
+    // Word offsets: [n, geometry_hash, moved_ion, moved_site, s0, o0, dx0, dy0, dz0, h0, s1, o1, dx1, dy1, dz1, h1]
+    // h0 is word 9 (bytes 72..80).
+    max_bytes[72..80].copy_from_slice(&u64::MAX.to_le_bytes());
     let mut st_high = model.decode_state(&max_bytes).unwrap();
     assert_eq!(
         model
@@ -925,14 +925,16 @@ fn t4_reversible_undo_checkpoint_roundtrip_and_validation_errors() {
         Some(12.0)
     );
     assert_eq!(m_sparse_a.transition_rate(1_000_001, 0, 0), None);
-    let ckpt_sparse_a = Simulation::new(m_sparse_a, model.initial_state(&[0]).unwrap(), 1);
+    let s_sparse = m_sparse_a.initial_state(&[0]).unwrap();
+    let ckpt_sparse_a = Simulation::new(m_sparse_a, s_sparse, 1);
     let mut pa = Vec::new();
     let mut pb = Vec::new();
     ckpt_sparse_a.model().encode_params(&mut pa);
     m_sparse_b.encode_params(&mut pb);
     assert_ne!(pa, pb);
 
-    // Log-space Arrhenius fallback preserves finite positive rates when exp(-barrier / kbt) underflows f64.
+    // Log-space Arrhenius fallback preserves finite positive rates when exp(-barrier / kbt) underflows f64
+    // (both exact-zero exponents <= -746 and subnormal factors like exp(-720)).
     let t_underflow = 1.0_f64;
     let barrier_750 = 750.0 * BOLTZMANN_EV_PER_K * t_underflow;
     let m_underflow = LatticeHopping::with_energetics(
@@ -946,13 +948,40 @@ fn t4_reversible_undo_checkpoint_roundtrip_and_validation_errors() {
     )
     .unwrap();
     let r_underflow = m_underflow.transition_rate(0, 0, 0).unwrap();
-    assert!(r_underflow > 0.0 && r_underflow.is_finite());
+    let expected_750 = 10_f64.powf(30.0 - 750.0 / 10_f64.ln());
+    assert!(
+        r_underflow > 0.0
+            && r_underflow.is_finite()
+            && (r_underflow - expected_750).abs() / expected_750 <= 1e-12,
+        "r_underflow={r_underflow:e} vs expected={expected_750:e}"
+    );
+    let subnormal_factor = (-720.0_f64).exp();
+    assert!(subnormal_factor > 0.0 && subnormal_factor < f64::MIN_POSITIVE);
+    let barrier_720 = 720.0 * BOLTZMANN_EV_PER_K * t_underflow;
+    let m_subnormal = LatticeHopping::with_energetics(
+        sc.clone(),
+        vec![0.0],
+        vec![PathwayParams {
+            attempt_frequency_hz: 1e30,
+            migration_barrier_ev: barrier_720,
+        }],
+        t_underflow,
+    )
+    .unwrap();
+    let r_subnormal = m_subnormal.transition_rate(0, 0, 0).unwrap();
+    let expected_720 = 10_f64.powf(30.0 - 720.0 / 10_f64.ln());
+    assert!(
+        r_subnormal > 0.0
+            && r_subnormal.is_finite()
+            && (r_subnormal - expected_720).abs() / expected_720 <= 1e-12,
+        "r_subnormal={r_subnormal:e} vs expected={expected_720:e}"
+    );
 
     // Zero-hop non-zero periodic-period displacement is rejected cleanly by check_invariants and decode_state.
     let mut spoof_bytes = Vec::new();
     model.encode_state(&st_max_prep, &mut spoof_bytes);
-    // Word 5 is dx0 (bytes 40..48); set to full period 3 while hop_counts[0] == 0.
-    spoof_bytes[40..48].copy_from_slice(&3_i64.to_le_bytes());
+    // Word 6 is dx0 (bytes 48..56); set to full period 3 while hop_counts[0] == 0.
+    spoof_bytes[48..56].copy_from_slice(&3_i64.to_le_bytes());
     assert!(model.decode_state(&spoof_bytes).is_err());
 
     // Mismatched smaller state in larger model's enumerate_events returns InvalidRate cleanly without panicking.
@@ -965,6 +994,143 @@ fn t4_reversible_undo_checkpoint_roundtrip_and_validation_errors() {
     let mut mismatched_sim = Simulation::new(big_model, small_state, 5);
     assert!(matches!(
         mismatched_sim.step(),
+        Err(SimError::InvalidRate { .. })
+    ));
+
+    // Rank-deficient and nearly coplanar metric matrices (det ~ 5.55e-17 or 1e-13 < RANK_TOL) are rejected.
+    for bad_metric in [
+        [[1.0, 0.0, 1.0], [0.0, 1.0, 1.0], [1.0, 2.0, 3.0]],
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 1e-13]],
+    ] {
+        assert_eq!(
+            PeriodicLattice::from_unit_cell(
+                [2, 2, 2],
+                [1, 1, 1],
+                [true, true, true],
+                bad_metric,
+                &[BasisSite {
+                    offset_ticks: [0, 0, 0],
+                    site_type: 0,
+                }],
+                &st_x,
+            )
+            .unwrap_err(),
+            LatticeHoppingError::InvalidMetric
+        );
+    }
+
+    // Equal site/ion counts on distinct geometries ([2, 3] vs [3, 2]) fail compatibility across direct,
+    // incremental, reversible, and checkpoint seams, while distinct models sharing [2, 3] accept the state.
+    let lat_2x3 = PeriodicLattice::square_2d([2, 3], 3.0e-10).unwrap();
+    let lat_3x2 = PeriodicLattice::square_2d([3, 2], 3.0e-10).unwrap();
+    let m_2x3 = LatticeHopping::homogeneous(lat_2x3.clone(), 10.0).unwrap();
+    let m_2x3_alt = LatticeHopping::homogeneous(lat_2x3, 50.0).unwrap();
+    let m_3x2 = LatticeHopping::homogeneous(lat_3x2, 10.0).unwrap();
+    let mut st_2x3 = m_2x3.initial_state(&[0]).unwrap();
+    m_2x3
+        .apply(&mut st_2x3, &IonHop { ion: 0, branch: 0 })
+        .unwrap();
+    assert_eq!(m_2x3_alt.check_invariants(&st_2x3), Ok(()));
+    assert!(
+        Simulation::new(m_2x3_alt.clone(), st_2x3.clone(), 7)
+            .step()
+            .is_ok()
+    );
+
+    assert!(matches!(
+        m_3x2.check_invariants(&st_2x3),
+        Err(LatticeHoppingError::StateMismatch(_))
+    ));
+    assert!(matches!(
+        Simulation::new(m_3x2.clone(), st_2x3.clone(), 7).step(),
+        Err(SimError::InvalidRate { .. })
+    ));
+    assert!(matches!(
+        IncrementalSimulation::new(m_3x2.clone(), st_2x3.clone(), 7),
+        Err(SimError::InvalidRate { .. })
+    ));
+    let mut rev_buf = st_2x3.clone();
+    assert!(matches!(
+        m_3x2.apply_reversible(&mut rev_buf, &IonHop { ion: 0, branch: 0 }),
+        Err(LatticeHoppingError::StateMismatch(_))
+    ));
+    let mut bytes_2x3 = Vec::new();
+    m_2x3.encode_state(&st_2x3, &mut bytes_2x3);
+    assert!(m_3x2.decode_state(&bytes_2x3).is_err());
+    assert_eq!(m_2x3_alt.decode_state(&bytes_2x3).unwrap(), st_2x3);
+
+    // Even when max_degree == 0 (no exits on open 2-cell chain with step +/-2 ticks),
+    // a valid state absorbs cleanly while an incompatible state still fails in both Direct and Incremental engines.
+    let hop2 = [
+        HopStencil {
+            from_basis: 0,
+            delta_ticks: [2, 0, 0],
+            pathway: 0,
+        },
+        HopStencil {
+            from_basis: 0,
+            delta_ticks: [-2, 0, 0],
+            pathway: 0,
+        },
+    ];
+    let lat_zero_hop = PeriodicLattice::from_unit_cell(
+        [2, 1, 1],
+        [1, 1, 1],
+        [false, false, false],
+        [
+            [3.0e-10, 0.0, 0.0],
+            [0.0, 3.0e-10, 0.0],
+            [0.0, 0.0, 3.0e-10],
+        ],
+        &[BasisSite {
+            offset_ticks: [0, 0, 0],
+            site_type: 0,
+        }],
+        &hop2,
+    )
+    .unwrap();
+    assert_eq!(lat_zero_hop.max_degree(), 0);
+    let m_zero_hop = LatticeHopping::homogeneous(lat_zero_hop, 10.0).unwrap();
+    let st_zero_ok = m_zero_hop.initial_state(&[0]).unwrap();
+    assert!(matches!(
+        Simulation::new(m_zero_hop.clone(), st_zero_ok.clone(), 9)
+            .step()
+            .unwrap(),
+        Step::Absorbed
+    ));
+    assert!(matches!(
+        IncrementalSimulation::new(m_zero_hop.clone(), st_zero_ok, 9)
+            .unwrap()
+            .step()
+            .unwrap(),
+        Step::Absorbed
+    ));
+    let lat_four = PeriodicLattice::from_unit_cell(
+        [4, 1, 1],
+        [1, 1, 1],
+        [false, false, false],
+        [
+            [3.0e-10, 0.0, 0.0],
+            [0.0, 3.0e-10, 0.0],
+            [0.0, 0.0, 3.0e-10],
+        ],
+        &[BasisSite {
+            offset_ticks: [0, 0, 0],
+            site_type: 0,
+        }],
+        &hop2,
+    )
+    .unwrap();
+    let st_four = LatticeHopping::homogeneous(lat_four, 10.0)
+        .unwrap()
+        .initial_state(&[0])
+        .unwrap();
+    assert!(matches!(
+        Simulation::new(m_zero_hop.clone(), st_four.clone(), 9).step(),
+        Err(SimError::InvalidRate { .. })
+    ));
+    assert!(matches!(
+        IncrementalSimulation::new(m_zero_hop, st_four, 9),
         Err(SimError::InvalidRate { .. })
     ));
 }

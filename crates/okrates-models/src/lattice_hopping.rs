@@ -285,18 +285,71 @@ pub struct PeriodicLattice {
     max_degree: usize,
     type_count: usize,
     pathway_count: usize,
+    geometry_hash: u64,
 }
+
+const RANK_TOL: f64 = 1e-12;
 
 fn vec3_norm_sq(v: [f64; 3]) -> f64 {
     v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
 }
 
-fn normalize_axis(v: [f64; 3]) -> Option<[f64; 3]> {
+fn normalize_unit(v: [f64; 3]) -> Option<[f64; 3]> {
     let scale = v[0].abs().max(v[1].abs()).max(v[2].abs());
     if !scale.is_finite() || scale == 0.0 {
         return None;
     }
-    Some([v[0] / scale, v[1] / scale, v[2] / scale])
+    let scaled = [v[0] / scale, v[1] / scale, v[2] / scale];
+    let norm = vec3_norm_sq(scaled).sqrt();
+    if !norm.is_finite() || norm == 0.0 {
+        return None;
+    }
+    Some([scaled[0] / norm, scaled[1] / norm, scaled[2] / norm])
+}
+
+fn fnv1a_mix(hash: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *hash ^= u64::from(b);
+        *hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+}
+
+fn compute_geometry_hash(
+    cells: [usize; 3],
+    sub_ticks: [usize; 3],
+    periodic_axes: [bool; 3],
+    tick_vectors_m: [[f64; 3]; 3],
+    site_coords_ticks: &[[i64; 3]],
+    site_types: &[usize],
+    adjacency: &[Vec<DirectedHop>],
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for a in 0..3 {
+        fnv1a_mix(&mut hash, &(cells[a] as u64).to_le_bytes());
+        fnv1a_mix(&mut hash, &(sub_ticks[a] as u64).to_le_bytes());
+        fnv1a_mix(&mut hash, &[u8::from(periodic_axes[a])]);
+        for c in tick_vectors_m[a] {
+            let bits = (if c == 0.0 { 0.0 } else { c }).to_bits();
+            fnv1a_mix(&mut hash, &bits.to_le_bytes());
+        }
+    }
+    fnv1a_mix(&mut hash, &(site_coords_ticks.len() as u64).to_le_bytes());
+    for site in 0..site_coords_ticks.len() {
+        for q in site_coords_ticks[site] {
+            fnv1a_mix(&mut hash, &q.to_le_bytes());
+        }
+        fnv1a_mix(&mut hash, &(site_types[site] as u64).to_le_bytes());
+        fnv1a_mix(&mut hash, &(adjacency[site].len() as u64).to_le_bytes());
+        for hop in &adjacency[site] {
+            fnv1a_mix(&mut hash, &(hop.target as u64).to_le_bytes());
+            for d in hop.delta_ticks {
+                fnv1a_mix(&mut hash, &d.to_le_bytes());
+            }
+            fnv1a_mix(&mut hash, &(hop.pathway as u64).to_le_bytes());
+            fnv1a_mix(&mut hash, &(hop.reverse_branch as u64).to_le_bytes());
+        }
+    }
+    hash
 }
 
 fn validate_metric(
@@ -311,10 +364,10 @@ fn validate_metric(
     let active: Vec<usize> = (0..3).filter(|&a| active_axes[a]).collect();
     let ok = match active.as_slice() {
         [] => false,
-        [a] => normalize_axis(tick_vectors_m[*a]).is_some(),
+        [a] => normalize_unit(tick_vectors_m[*a]).is_some(),
         [a, b] => match (
-            normalize_axis(tick_vectors_m[*a]),
-            normalize_axis(tick_vectors_m[*b]),
+            normalize_unit(tick_vectors_m[*a]),
+            normalize_unit(tick_vectors_m[*b]),
         ) {
             (Some(u), Some(v)) => {
                 let cross = [
@@ -322,19 +375,19 @@ fn validate_metric(
                     u[2] * v[0] - u[0] * v[2],
                     u[0] * v[1] - u[1] * v[0],
                 ];
-                vec3_norm_sq(cross) > 0.0
+                vec3_norm_sq(cross).sqrt() > RANK_TOL
             }
             _ => false,
         },
         [0, 1, 2] => match (
-            normalize_axis(tick_vectors_m[0]),
-            normalize_axis(tick_vectors_m[1]),
-            normalize_axis(tick_vectors_m[2]),
+            normalize_unit(tick_vectors_m[0]),
+            normalize_unit(tick_vectors_m[1]),
+            normalize_unit(tick_vectors_m[2]),
         ) {
             (Some(a), Some(b), Some(c)) => {
                 let det = a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
                     + a[2] * (b[0] * c[1] - b[1] * c[0]);
-                det != 0.0 && det.is_finite()
+                det.is_finite() && det.abs() > RANK_TOL
             }
             _ => false,
         },
@@ -575,6 +628,16 @@ impl PeriodicLattice {
             }
         }
 
+        let geometry_hash = compute_geometry_hash(
+            cells,
+            sub_ticks,
+            periodic_axes,
+            tick_vectors_m,
+            &site_coords_ticks,
+            &site_types,
+            &adjacency,
+        );
+
         Ok(Self {
             cells,
             sub_ticks,
@@ -588,6 +651,7 @@ impl PeriodicLattice {
             max_degree,
             type_count,
             pathway_count,
+            geometry_hash,
         })
     }
 
@@ -836,6 +900,7 @@ pub struct IonHopUndo {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LatticeHoppingState {
+    geometry_hash: u64,
     site_ion: Vec<Option<usize>>,
     sites: Vec<usize>,
     origins: Vec<usize>,
@@ -1024,7 +1089,7 @@ impl LatticeHopping {
                     } else {
                         let exponent = -barrier / kbt;
                         let factor = exponent.exp();
-                        if factor > 0.0 {
+                        if factor >= f64::MIN_POSITIVE {
                             p.attempt_frequency_hz * factor
                         } else {
                             (p.attempt_frequency_hz.ln() + exponent).exp()
@@ -1123,6 +1188,7 @@ impl LatticeHopping {
             site_ion[site] = Some(ion);
         }
         Ok(LatticeHoppingState {
+            geometry_hash: self.lattice.geometry_hash,
             site_ion,
             sites: ion_sites.to_vec(),
             origins: ion_sites.to_vec(),
@@ -1156,8 +1222,17 @@ impl LatticeHopping {
         self.initial_state(&all)
     }
 
-    pub fn check_invariants(&self, state: &LatticeHoppingState) -> Result<(), LatticeHoppingError> {
+    #[inline]
+    fn check_fast_compatibility(
+        &self,
+        state: &LatticeHoppingState,
+    ) -> Result<(), LatticeHoppingError> {
         let site_count = self.lattice.site_count();
+        if state.geometry_hash != self.lattice.geometry_hash {
+            return Err(LatticeHoppingError::StateMismatch(
+                "state lattice geometry disagrees with model lattice",
+            ));
+        }
         if state.site_ion.len() != site_count {
             return Err(LatticeHoppingError::StateMismatch(
                 "site_ion length disagrees with lattice site_count",
@@ -1175,6 +1250,13 @@ impl LatticeHopping {
                 "per-ion state vectors have unequal lengths",
             ));
         }
+        Ok(())
+    }
+
+    pub fn check_invariants(&self, state: &LatticeHoppingState) -> Result<(), LatticeHoppingError> {
+        self.check_fast_compatibility(state)?;
+        let site_count = self.lattice.site_count();
+        let n = state.sites.len();
         let mut seen_origins = vec![false; site_count];
         for ion in 0..n {
             for site in [state.sites[ion], state.origins[ion]] {
@@ -1259,9 +1341,7 @@ impl Model for LatticeHopping {
 
     fn enumerate_events(&self, state: &Self::State, emit: &mut dyn FnMut(Self::Event, f64)) {
         let site_count = self.lattice.site_count();
-        if state.site_ion.len() != site_count
-            || state.displacements_ticks.len() != state.sites.len()
-            || state.hop_counts.len() != state.sites.len()
+        if self.check_fast_compatibility(state).is_err()
             || state.sites.iter().any(|&s| s >= site_count)
         {
             emit(IonHop { ion: 0, branch: 0 }, f64::NAN);
@@ -1294,16 +1374,9 @@ impl ReversibleModel for LatticeHopping {
     ) -> Result<Self::Undo, Self::Error> {
         let ion = event.ion;
         let ions = state.sites.len();
+        self.check_fast_compatibility(state)?;
         if ion >= ions {
             return Err(LatticeHoppingError::IonOutOfRange { ion, ions });
-        }
-        if state.site_ion.len() != self.lattice.site_count()
-            || state.displacements_ticks.len() != ions
-            || state.hop_counts.len() != ions
-        {
-            return Err(LatticeHoppingError::StateMismatch(
-                "state dimensions disagree with lattice or ion count",
-            ));
         }
         let from_site = state.sites[ion];
         if from_site >= self.lattice.site_count() || state.site_ion[from_site] != Some(ion) {
@@ -1376,10 +1449,16 @@ impl ReversibleModel for LatticeHopping {
 
 impl IncrementalModel for LatticeHopping {
     fn slot_count(&self, state: &Self::State) -> usize {
+        if self.check_fast_compatibility(state).is_err() {
+            return 1;
+        }
         state.sites.len() * self.lattice.max_degree
     }
 
     fn slot_rate(&self, state: &Self::State, slot: usize) -> f64 {
+        if self.check_fast_compatibility(state).is_err() {
+            return f64::NAN;
+        }
         let stride = self.lattice.max_degree;
         if stride == 0 {
             return f64::NAN;
@@ -1389,7 +1468,7 @@ impl IncrementalModel for LatticeHopping {
         let Some(&site) = state.sites.get(ion) else {
             return f64::NAN;
         };
-        if site >= self.lattice.site_count() || state.site_ion.len() != self.lattice.site_count() {
+        if site >= self.lattice.site_count() {
             return f64::NAN;
         }
         self.hop_rate(state, site, branch)
@@ -1489,6 +1568,7 @@ impl Checkpointable for LatticeHopping {
 
     fn encode_state(&self, state: &Self::State, out: &mut Vec<u8>) {
         out.extend_from_slice(&(state.sites.len() as u64).to_le_bytes());
+        out.extend_from_slice(&state.geometry_hash.to_le_bytes());
         let (moved_ion, moved_site) = match state.last_moved_from {
             Some((ion, site)) => (ion as u64, site as u64),
             None => (u64::MAX, u64::MAX),
@@ -1525,7 +1605,7 @@ impl Checkpointable for LatticeHopping {
             .ok_or_else(|| format!("invalid ion count {raw_n}"))?;
         let expected_words = n
             .checked_mul(6)
-            .and_then(|w| w.checked_add(3))
+            .and_then(|w| w.checked_add(4))
             .ok_or("lattice hopping state size overflow")?;
         if chunks.len() != expected_words {
             return Err(format!(
@@ -1534,6 +1614,13 @@ impl Checkpointable for LatticeHopping {
                 bytes.len()
             )
             .into());
+        }
+        let raw_geom = words
+            .next()
+            .map(u64::from_le_bytes)
+            .ok_or("missing geometry hash word")?;
+        if raw_geom != self.lattice.geometry_hash {
+            return Err("lattice geometry hash differs from model lattice".into());
         }
 
         let moved_ion = words
