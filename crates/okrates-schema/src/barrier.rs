@@ -105,8 +105,10 @@ impl BarrierRecord {
 
     /// Returns the detailed-balance ratio `k_fwd(T) / (k_rev(T) * exp(-delta_energy_ev / (k_B T)))`.
     ///
-    /// Uses `reverse_attempt_frequency_hz` when present (falling back to `attempt_frequency_hz`),
-    /// so an exact value of `1.0` indicates both energy reciprocity and equal prefactors.
+    /// Uses `reverse_attempt_frequency_hz` when present (falling back to `attempt_frequency_hz`).
+    /// An exact value of `1.0` indicates rate-level detailed balance at `temperature_k`; energy
+    /// reciprocity (`forward_barrier_ev - reverse_barrier_ev == delta_energy_ev`) and prefactor
+    /// equality should be verified separately because compensating discrepancies can still yield `1.0`.
     pub fn equilibrium_rate_ratio(
         &self,
         temperature_k: f64,
@@ -120,8 +122,10 @@ impl BarrierRecord {
             .unwrap_or(self.attempt_frequency_hz);
         let residual_ev =
             (self.forward_barrier_ev - self.reverse_barrier_ev) - self.delta_energy_ev;
-        Ok((self.attempt_frequency_hz / rev_v0)
-            * (-residual_ev / (BOLTZMANN_EV_PER_K * temperature_k)).exp())
+        Ok((self.attempt_frequency_hz.ln()
+            - rev_v0.ln()
+            - residual_ev / (BOLTZMANN_EV_PER_K * temperature_k))
+            .exp())
     }
 }
 

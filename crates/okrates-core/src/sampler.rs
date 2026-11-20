@@ -405,14 +405,16 @@ where
     O: Observe<S::Model, T>,
 {
     let times = grid.times();
-    if sim.clock().cmp_f64(times[0]).is_gt() {
+    let (Some(&t_first), Some(&t_last)) = (times.first(), times.last()) else {
+        return Err(SamplingError::Grid(GridError::EmptyCount));
+    };
+    if sim.clock().cmp_f64(t_first).is_gt() {
         return Err(SamplingError::GridBeforeSimTime {
-            grid_start: times[0],
+            grid_start: t_first,
             sim_time: sim.clock().time(),
         });
     }
 
-    let t_last = *times.last().expect("SampleGrid is non-empty");
     let mut values = Vec::with_capacity(times.len());
     let mut fired_steps = 0_u64;
     let mut steps_in_window = 0_u64;

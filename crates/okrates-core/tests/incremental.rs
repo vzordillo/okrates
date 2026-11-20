@@ -447,4 +447,137 @@ fn coupled_model_with_rate_dependencies_and_parity_checker() {
             .unwrap();
         s_before = s_next;
     }
+
+    // Balanced pairwise reduction must agree at tol = 0.0 for order-sensitive scales like [1e16, 1, 1, 1].
+    struct IllConditionedModel;
+
+    impl Model for IllConditionedModel {
+        type State = [f64; 2];
+        type Event = usize;
+        type Error = Infallible;
+
+        fn enumerate_events(&self, s: &[f64; 2], emit: &mut dyn FnMut(usize, f64)) {
+            for (slot, rate) in [s[0], 1.0, 1.0, s[1]].into_iter().enumerate() {
+                emit(slot, rate);
+            }
+        }
+
+        fn apply(&self, _: &mut [f64; 2], _: &usize) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    impl ReversibleModel for IllConditionedModel {
+        type Undo = ();
+
+        fn apply_reversible(&self, _: &mut [f64; 2], _: &usize) -> Result<(), Infallible> {
+            Ok(())
+        }
+
+        fn undo(&self, _: &mut [f64; 2], _: ()) {}
+    }
+
+    impl IncrementalModel for IllConditionedModel {
+        fn slot_count(&self, _: &[f64; 2]) -> usize {
+            4
+        }
+
+        fn slot_rate(&self, s: &[f64; 2], slot: usize) -> f64 {
+            match slot {
+                0 => s[0],
+                1 | 2 => 1.0,
+                _ => s[1],
+            }
+        }
+
+        fn slot_event(&self, _: &[f64; 2], slot: usize) -> usize {
+            slot
+        }
+
+        fn affected_slots(&self, _: &[f64; 2], _: &usize, out: &mut Vec<usize>) {
+            out.push(0);
+            out.push(3);
+        }
+    }
+
+    let ill_state = [1e16, 1.0];
+    let ill_cat = SumTreeCatalog::build(&IllConditionedModel, &ill_state).unwrap();
+    verify_incremental_step_parity(
+        &IllConditionedModel,
+        &ill_state,
+        &ill_state,
+        &0,
+        ill_cat.tree(),
+        0.0,
+    )
+    .unwrap();
+
+    // Swapping [1.0, f64::MAX] -> [f64::MAX, 1.0] must apply decreases before increases so intermediate totals stay finite.
+    struct SwapExtremeRatesModel;
+
+    impl Model for SwapExtremeRatesModel {
+        type State = [f64; 2];
+        type Event = usize;
+        type Error = Infallible;
+
+        fn enumerate_events(&self, s: &[f64; 2], emit: &mut dyn FnMut(usize, f64)) {
+            emit(0, s[0]);
+            emit(1, s[1]);
+        }
+
+        fn apply(&self, s: &mut [f64; 2], _: &usize) -> Result<(), Infallible> {
+            s.swap(0, 1);
+            Ok(())
+        }
+    }
+
+    impl ReversibleModel for SwapExtremeRatesModel {
+        type Undo = ();
+
+        fn apply_reversible(&self, s: &mut [f64; 2], _: &usize) -> Result<(), Infallible> {
+            s.swap(0, 1);
+            Ok(())
+        }
+
+        fn undo(&self, s: &mut [f64; 2], _: ()) {
+            s.swap(0, 1);
+        }
+    }
+
+    impl IncrementalModel for SwapExtremeRatesModel {
+        fn slot_count(&self, _: &[f64; 2]) -> usize {
+            2
+        }
+
+        fn slot_rate(&self, s: &[f64; 2], slot: usize) -> f64 {
+            s[slot]
+        }
+
+        fn slot_event(&self, _: &[f64; 2], slot: usize) -> usize {
+            slot
+        }
+
+        fn affected_slots(&self, _: &[f64; 2], _: &usize, out: &mut Vec<usize>) {
+            // Deliberately emit the increasing slot (0) before the decreasing slot (1).
+            out.push(0);
+            out.push(1);
+        }
+    }
+
+    let mut swap_state = [1.0, f64::MAX];
+    let swap_before = swap_state;
+    let mut swap_cat = SumTreeCatalog::build(&SwapExtremeRatesModel, &swap_state).unwrap();
+    swap_cat
+        .apply_and_update(&SwapExtremeRatesModel, &mut swap_state, 1)
+        .unwrap();
+    assert_eq!(swap_state, [f64::MAX, 1.0]);
+    verify_incremental_step_parity(
+        &SwapExtremeRatesModel,
+        &swap_before,
+        &swap_state,
+        &1,
+        swap_cat.tree(),
+        0.0,
+    )
+    .unwrap();
 }

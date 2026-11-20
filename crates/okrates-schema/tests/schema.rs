@@ -297,6 +297,26 @@ fn lossless_barrier_json_and_equilibrium_rate_ratio() {
     let exact = rec.equilibrium_rate_ratio(750.0).unwrap();
     assert!((exact - 1.0).abs() < 1e-14, "got {exact}");
 
+    // Combined log-space prefactor and barrier factor stays finite when individual factors would overflow.
+    let stiff_rec = BarrierRecord {
+        id: "log_space_overflow_guard".to_string(),
+        migrating_species: "Cr".to_string(),
+        env_key: "stiff=1".to_string(),
+        forward_barrier_ev: 0.0,
+        reverse_barrier_ev: 0.612,
+        delta_energy_ev: 0.0,
+        attempt_frequency_hz: 1.0e12,
+        reverse_attempt_frequency_hz: Some(1.0e13),
+        barrier_std_ev: None,
+        temp_range_k: None,
+        provenance: None,
+    };
+    let stiff_ratio = stiff_rec.equilibrium_rate_ratio(10.0).unwrap();
+    assert!(
+        stiff_ratio.is_finite() && stiff_ratio > 1.0e300,
+        "got {stiff_ratio}"
+    );
+
     // Export preserves reverse_attempt_frequency_hz losslessly; validation runs on import and export.
     rec.reverse_attempt_frequency_hz = Some(2.0e13);
     let set = BarrierSet::new("lossless-test", 1e-12, vec![rec.clone()]).unwrap();

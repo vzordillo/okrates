@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,15 +24,50 @@ fn watch_if_exists(path: &Path) {
     }
 }
 
+fn watch_repo_worktree(repo_root: &Path) {
+    let Ok(output) = Command::new("git")
+        .current_dir(repo_root)
+        .args(["-c", "core.quotePath=false", "ls-files", "-z"])
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let mut top_dirs = BTreeSet::new();
+    for raw in output.stdout.split(|&b| b == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(rel_str) = std::str::from_utf8(raw) else {
+            continue;
+        };
+        let rel = Path::new(rel_str);
+        watch_if_exists(&repo_root.join(rel));
+        // Watch tracked top-level directories (`crates`, `python`, ...) without watching `..` (which contains `target/` and `.git/`).
+        let mut comps = rel.components();
+        if let Some(first) = comps.next()
+            && comps.next().is_some()
+        {
+            top_dirs.insert(PathBuf::from(first.as_os_str()));
+        }
+    }
+    for dir in top_dirs {
+        watch_if_exists(&repo_root.join(dir));
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=OKRATES_GIT_SHA");
     println!("cargo:rerun-if-env-changed=OKRATES_GIT_DIRTY");
-    let dot_git = Path::new("../../.git");
+    let repo_root = Path::new("../..");
+    let dot_git = repo_root.join(".git");
     if dot_git.is_file() {
-        watch_if_exists(dot_git);
+        watch_if_exists(&dot_git);
     }
-    let git_dirs = resolve_git_dirs(dot_git);
+    let git_dirs = resolve_git_dirs(&dot_git);
     if let Some((git_dir, common_dir)) = &git_dirs {
         let head_path = git_dir.join("HEAD");
         watch_if_exists(&head_path);
@@ -43,6 +79,9 @@ fn main() {
         {
             watch_if_exists(&common_dir.join(ref_path));
         }
+        if env::var_os("OKRATES_GIT_DIRTY").is_none() {
+            watch_repo_worktree(repo_root);
+        }
     }
     let sha = env::var("OKRATES_GIT_SHA")
         .ok()
@@ -50,6 +89,7 @@ fn main() {
         .filter(|s| !s.is_empty())
         .or_else(|| {
             Command::new("git")
+                .current_dir(repo_root)
                 .args(["rev-parse", "--short=12", "HEAD"])
                 .output()
                 .ok()
@@ -66,6 +106,7 @@ fn main() {
         .or_else(|| {
             git_dirs.as_ref().and_then(|_| {
                 Command::new("git")
+                    .current_dir(repo_root)
                     .args(["status", "--porcelain"])
                     .output()
                     .ok()

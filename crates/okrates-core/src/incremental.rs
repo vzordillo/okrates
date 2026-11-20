@@ -292,7 +292,7 @@ pub fn verify_incremental_step_parity<M: IncrementalModel>(
     affected.sort_unstable();
     affected.dedup();
 
-    let mut expected_total = 0.0_f64;
+    let mut after_rates = Vec::with_capacity(slot_count);
     for slot in 0..slot_count {
         let before_rate = Rate::new(model.slot_rate(before, slot))
             .map_err(|e| format!("invalid rate before step at slot {slot}: {e}"))?
@@ -313,15 +313,15 @@ pub fn verify_incremental_step_parity<M: IncrementalModel>(
                 "slot {slot} rate mismatch: tree={tree_rate}, expected={after_rate}"
             ));
         }
-        expected_total += after_rate;
+        after_rates.push(after_rate);
     }
-    if !expected_total.is_finite() {
-        return Err("freshly summed total rate is not finite".to_string());
-    }
-    if (tree.total() - expected_total).abs() > tol {
+    let expected_tree =
+        SumTree::try_new(&after_rates).map_err(|e| format!("fresh sum-tree build failed: {e}"))?;
+    if (tree.total() - expected_tree.total()).abs() > tol {
         return Err(format!(
-            "total rate mismatch: tree={}, expected={expected_total}",
-            tree.total()
+            "total rate mismatch: tree={}, expected={}",
+            tree.total(),
+            expected_tree.total()
         ));
     }
     Ok(())

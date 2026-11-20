@@ -285,6 +285,7 @@ impl<M: IncrementalModel> CatalogBackend<M> for SumTreeCatalog {
             }
         }
 
+        self.staged.sort_by_key(|&(_, prev, rate)| rate > prev);
         for (applied, &(affected, _, rate)) in self.staged.iter().enumerate() {
             if let Err(err) = self.tree.try_set(affected, rate) {
                 for &(prev_slot, prev_rate, _) in self.staged[..applied].iter().rev() {
