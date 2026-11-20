@@ -162,7 +162,7 @@ fn main() {
         Ok::<ReplicaResult, String>(ReplicaResult {
             tracer_msd,
             collective_msd,
-            steps: traj.fired_steps,
+            steps: traj.steps_in_window,
         })
     });
 

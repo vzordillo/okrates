@@ -291,6 +291,14 @@ fn vec3_norm_sq(v: [f64; 3]) -> f64 {
     v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
 }
 
+fn normalize_axis(v: [f64; 3]) -> Option<[f64; 3]> {
+    let scale = v[0].abs().max(v[1].abs()).max(v[2].abs());
+    if !scale.is_finite() || scale == 0.0 {
+        return None;
+    }
+    Some([v[0] / scale, v[1] / scale, v[2] / scale])
+}
+
 fn validate_metric(
     tick_vectors_m: [[f64; 3]; 3],
     active_axes: [bool; 3],
@@ -303,23 +311,33 @@ fn validate_metric(
     let active: Vec<usize> = (0..3).filter(|&a| active_axes[a]).collect();
     let ok = match active.as_slice() {
         [] => false,
-        [a] => vec3_norm_sq(tick_vectors_m[*a]) > 0.0,
-        [a, b] => {
-            let u = tick_vectors_m[*a];
-            let v = tick_vectors_m[*b];
-            let cross = [
-                u[1] * v[2] - u[2] * v[1],
-                u[2] * v[0] - u[0] * v[2],
-                u[0] * v[1] - u[1] * v[0],
-            ];
-            vec3_norm_sq(cross) > 0.0
-        }
-        [0, 1, 2] => {
-            let [a, b, c] = tick_vectors_m;
-            let det = a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
-                + a[2] * (b[0] * c[1] - b[1] * c[0]);
-            det != 0.0 && det.is_finite()
-        }
+        [a] => normalize_axis(tick_vectors_m[*a]).is_some(),
+        [a, b] => match (
+            normalize_axis(tick_vectors_m[*a]),
+            normalize_axis(tick_vectors_m[*b]),
+        ) {
+            (Some(u), Some(v)) => {
+                let cross = [
+                    u[1] * v[2] - u[2] * v[1],
+                    u[2] * v[0] - u[0] * v[2],
+                    u[0] * v[1] - u[1] * v[0],
+                ];
+                vec3_norm_sq(cross) > 0.0
+            }
+            _ => false,
+        },
+        [0, 1, 2] => match (
+            normalize_axis(tick_vectors_m[0]),
+            normalize_axis(tick_vectors_m[1]),
+            normalize_axis(tick_vectors_m[2]),
+        ) {
+            (Some(a), Some(b), Some(c)) => {
+                let det = a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+                    + a[2] * (b[0] * c[1] - b[1] * c[0]);
+                det != 0.0 && det.is_finite()
+            }
+            _ => false,
+        },
         _ => unreachable!(),
     };
     if !ok {
@@ -766,12 +784,12 @@ impl PeriodicLattice {
         self.adjacency.get(site).map_or(&[], Vec::as_slice)
     }
 
-    pub fn site_type(&self, site: usize) -> usize {
-        self.site_types[site]
+    pub fn site_type(&self, site: usize) -> Option<usize> {
+        self.site_types.get(site).copied()
     }
 
-    pub fn site_coord_ticks(&self, site: usize) -> [i64; 3] {
-        self.site_coords_ticks[site]
+    pub fn site_coord_ticks(&self, site: usize) -> Option<[i64; 3]> {
+        self.site_coords_ticks.get(site).copied()
     }
 
     pub fn displacement_m(&self, delta_ticks: [i64; 3]) -> [f64; 3] {
@@ -861,8 +879,10 @@ impl LatticeHoppingState {
         self.hop_counts.iter().copied().map(u128::from).sum()
     }
 
-    pub fn ion_displacement_m(&self, lattice: &PeriodicLattice, ion: usize) -> [f64; 3] {
-        lattice.displacement_m(self.displacements_ticks[ion])
+    pub fn ion_displacement_m(&self, lattice: &PeriodicLattice, ion: usize) -> Option<[f64; 3]> {
+        self.displacements_ticks
+            .get(ion)
+            .map(|&d| lattice.displacement_m(d))
     }
 
     /// Mean single-ion tracer squared displacement `mean_i ||dr_i||^2` in `m^2`.
@@ -896,13 +916,21 @@ impl LatticeHoppingState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum RateTable {
+    Uniform(f64),
+    Table {
+        type_stride: usize,
+        pathway_count: usize,
+        rates: Vec<f64>,
+    },
+}
+
 /// Multi-ion site-exclusion lattice-hopping KMC model over [`PeriodicLattice`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct LatticeHopping {
     lattice: PeriodicLattice,
-    type_stride: usize,
-    pathway_count: usize,
-    rate_table: Vec<f64>,
+    rates: RateTable,
 }
 
 impl LatticeHopping {
@@ -914,22 +942,9 @@ impl LatticeHopping {
             return Err(LatticeHoppingError::InvalidJumpRate(jump_rate));
         }
         let rate = if jump_rate == 0.0 { 0.0 } else { jump_rate };
-        let type_stride = lattice.type_count.max(1);
-        let pathway_count = lattice.pathway_count.max(1);
-        let table_len = pathway_count
-            .checked_mul(type_stride)
-            .and_then(|n| n.checked_mul(type_stride))
-            .ok_or(LatticeHoppingError::InvalidMetric)?;
-        let mut rate_table = Vec::new();
-        if rate_table.try_reserve_exact(table_len).is_err() {
-            return Err(LatticeHoppingError::InvalidMetric);
-        }
-        rate_table.resize(table_len, rate);
         Ok(Self {
             lattice,
-            type_stride,
-            pathway_count,
-            rate_table,
+            rates: RateTable::Uniform(rate),
         })
     }
 
@@ -992,8 +1007,8 @@ impl LatticeHopping {
             .checked_mul(type_stride)
             .and_then(|n| n.checked_mul(type_stride))
             .ok_or(LatticeHoppingError::InvalidMetric)?;
-        let mut rate_table = Vec::new();
-        if rate_table.try_reserve_exact(table_len).is_err() {
+        let mut rates = Vec::new();
+        if rates.try_reserve_exact(table_len).is_err() {
             return Err(LatticeHoppingError::InvalidMetric);
         }
 
@@ -1004,20 +1019,32 @@ impl LatticeHopping {
                     let delta_e = e_to - e_from;
                     let raw = p.migration_barrier_ev + 0.5 * delta_e;
                     let barrier = raw.max(0.0).max(delta_e);
-                    let rate = p.attempt_frequency_hz * (-barrier / kbt).exp();
+                    let rate = if barrier == 0.0 {
+                        p.attempt_frequency_hz
+                    } else {
+                        let exponent = -barrier / kbt;
+                        let factor = exponent.exp();
+                        if factor > 0.0 {
+                            p.attempt_frequency_hz * factor
+                        } else {
+                            (p.attempt_frequency_hz.ln() + exponent).exp()
+                        }
+                    };
                     if !rate.is_finite() || rate < 0.0 {
                         return Err(LatticeHoppingError::InvalidJumpRate(rate));
                     }
-                    rate_table.push(if rate == 0.0 { 0.0 } else { rate });
+                    rates.push(if rate == 0.0 { 0.0 } else { rate });
                 }
             }
         }
 
         Ok(Self {
             lattice,
-            type_stride,
-            pathway_count,
-            rate_table,
+            rates: RateTable::Table {
+                type_stride,
+                pathway_count,
+                rates,
+            },
         })
     }
 
@@ -1025,10 +1052,41 @@ impl LatticeHopping {
         &self.lattice
     }
 
+    pub fn transition_rate(&self, from_type: usize, to_type: usize, pathway: usize) -> Option<f64> {
+        match &self.rates {
+            RateTable::Uniform(rate) => {
+                if from_type < self.lattice.type_count
+                    && to_type < self.lattice.type_count
+                    && pathway < self.lattice.pathway_count
+                {
+                    Some(*rate)
+                } else {
+                    None
+                }
+            }
+            RateTable::Table {
+                type_stride,
+                pathway_count,
+                rates,
+            } => {
+                if from_type >= *type_stride || to_type >= *type_stride || pathway >= *pathway_count
+                {
+                    return None;
+                }
+                let idx = (pathway * type_stride + from_type) * type_stride + to_type;
+                rates.get(idx).copied()
+            }
+        }
+    }
+
     #[inline]
-    pub fn transition_rate(&self, from_type: usize, to_type: usize, pathway: usize) -> f64 {
-        let idx = (pathway * self.type_stride + from_type) * self.type_stride + to_type;
-        self.rate_table[idx]
+    fn transition_rate_for_hop(&self, from_type: usize, to_type: usize, pathway: usize) -> f64 {
+        match &self.rates {
+            RateTable::Uniform(rate) => *rate,
+            RateTable::Table {
+                type_stride, rates, ..
+            } => rates[(pathway * type_stride + from_type) * type_stride + to_type],
+        }
     }
 
     pub fn initial_state(
@@ -1140,6 +1198,11 @@ impl LatticeHopping {
             let q0 = self.lattice.site_coords_ticks[state.origins[ion]];
             let q = self.lattice.site_coords_ticks[state.sites[ion]];
             let d = state.displacements_ticks[ion];
+            if state.hop_counts[ion] == 0 && d != [0, 0, 0] {
+                return Err(LatticeHoppingError::StateMismatch(
+                    "ion with zero hops has non-zero displacement",
+                ));
+            }
             for a in 0..3 {
                 let sum = i128::from(q0[a]) + i128::from(d[a]);
                 let expected = if self.lattice.periodic_axes[a] {
@@ -1185,7 +1248,7 @@ impl LatticeHopping {
         }
         let from_type = self.lattice.site_types[site];
         let to_type = self.lattice.site_types[hop.target];
-        self.transition_rate(from_type, to_type, hop.pathway)
+        self.transition_rate_for_hop(from_type, to_type, hop.pathway)
     }
 }
 
@@ -1195,6 +1258,15 @@ impl Model for LatticeHopping {
     type Error = LatticeHoppingError;
 
     fn enumerate_events(&self, state: &Self::State, emit: &mut dyn FnMut(Self::Event, f64)) {
+        let site_count = self.lattice.site_count();
+        if state.site_ion.len() != site_count
+            || state.displacements_ticks.len() != state.sites.len()
+            || state.hop_counts.len() != state.sites.len()
+            || state.sites.iter().any(|&s| s >= site_count)
+        {
+            emit(IonHop { ion: 0, branch: 0 }, f64::NAN);
+            return;
+        }
         for (ion, &site) in state.sites.iter().enumerate() {
             let deg = self.lattice.degree(site);
             for branch in 0..deg {
@@ -1395,10 +1467,23 @@ impl Checkpointable for LatticeHopping {
                 out.extend_from_slice(&(hop.reverse_branch as u64).to_le_bytes());
             }
         }
-        out.extend_from_slice(&(self.type_stride as u64).to_le_bytes());
-        out.extend_from_slice(&(self.pathway_count as u64).to_le_bytes());
-        for &r in &self.rate_table {
-            out.extend_from_slice(&r.to_bits().to_le_bytes());
+        match &self.rates {
+            RateTable::Uniform(rate) => {
+                out.push(0);
+                out.extend_from_slice(&rate.to_bits().to_le_bytes());
+            }
+            RateTable::Table {
+                type_stride,
+                pathway_count,
+                rates,
+            } => {
+                out.push(1);
+                out.extend_from_slice(&(*type_stride as u64).to_le_bytes());
+                out.extend_from_slice(&(*pathway_count as u64).to_le_bytes());
+                for &r in rates {
+                    out.extend_from_slice(&r.to_bits().to_le_bytes());
+                }
+            }
         }
     }
 

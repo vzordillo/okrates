@@ -1,8 +1,8 @@
 use okrates_core::testing::{chi2_statistic, chi2_upper_quantile, mat_exp, solve_stationary_ctmc};
 use okrates_core::{
     AbsorptionPolicy, CheckpointError, Checkpointable, IncrementalModel, IncrementalSimulation,
-    KmcRng, Model, ReversibleModel, SampleGrid, Simulation, Step, StreamRole, run_ensemble,
-    sample_trajectory, verify_incremental_step_parity,
+    KmcRng, Model, ReversibleModel, SampleGrid, SimError, Simulation, Step, StreamRole,
+    run_ensemble, sample_trajectory, verify_incremental_step_parity,
 };
 use okrates_models::lattice_hopping::{
     BasisSite, HopStencil, IonHop, LatticeHopping, LatticeHoppingError, PathwayParams,
@@ -110,7 +110,7 @@ fn t1_non_bcc_single_ion_analytic_tracer_diffusion_sc_fcc_and_square2d() {
         sample_trajectory(&mut sim, &grid, None, AbsorptionPolicy::Error, |m, st| {
             m.check_invariants(st).unwrap();
             assert_eq!(st.displacements_ticks()[0][2], 0);
-            assert_eq!(st.ion_displacement_m(m.lattice(), 0)[2], 0.0);
+            assert_eq!(st.ion_displacement_m(m.lattice(), 0).unwrap()[2], 0.0);
             st.mean_tracer_msd_m2(m.lattice())
         })
         .unwrap()
@@ -186,42 +186,58 @@ fn t2_multi_sublattice_energetics_obeys_exact_ctmc_stationary_boltzmann_and_tran
     assert_eq!(n_sites, 8);
     assert_eq!(lattice.max_degree(), 4);
 
-    let site_energies_ev = vec![0.0_f64, 0.08_f64];
+    let site_energies_ev = vec![0.0_f64, 0.16_f64];
     let pathways = vec![
         PathwayParams {
             attempt_frequency_hz: 1e12,
-            migration_barrier_ev: 0.30,
+            migration_barrier_ev: 0.05,
         },
         PathwayParams {
             attempt_frequency_hz: 2e12,
-            migration_barrier_ev: 0.35,
+            migration_barrier_ev: 0.25,
         },
     ];
     let temperature_k = 600.0_f64;
-    let model =
-        LatticeHopping::with_energetics(lattice, site_energies_ev.clone(), pathways, temperature_k)
-            .unwrap();
+    let model = LatticeHopping::with_energetics(
+        lattice,
+        site_energies_ev.clone(),
+        pathways.clone(),
+        temperature_k,
+    )
+    .unwrap();
 
-    // Verify exact 8-state off-diagonal generator, rate-level detailed balance, and analytical Boltzmann weights.
+    // Independent analytical generator oracle activating SymmetricFloor on pathway 0 (1->0 clamps -0.03 to 0; 0->1 clamps 0.13 to 0.16).
+    let kbt = BOLTZMANN_EV_PER_K * temperature_k;
     let mut rates = vec![vec![0.0_f64; n_sites]; n_sites];
     for (i, row) in rates.iter_mut().enumerate() {
+        let e_from = site_energies_ev[model.lattice().site_type(i).unwrap()];
+        for hop in model.lattice().hops(i) {
+            let e_to = site_energies_ev[model.lattice().site_type(hop.target).unwrap()];
+            let delta_e = e_to - e_from;
+            let pw = pathways[hop.pathway];
+            let act_ev = (pw.migration_barrier_ev + 0.5 * delta_e)
+                .max(0.0)
+                .max(delta_e);
+            row[hop.target] += pw.attempt_frequency_hz * (-act_ev / kbt).exp();
+        }
         let st_i = model.initial_state(&[i]).unwrap();
-        let mut emitted = Vec::new();
+        let mut model_row = vec![0.0_f64; n_sites];
         model.enumerate_events(&st_i, &mut |IonHop { branch, .. }, r| {
-            emitted.push((branch, r));
-        });
-        assert_eq!(emitted.len(), model.lattice().degree(i));
-        for (branch, r) in emitted {
             let target = model.lattice().hops(i)[branch].target;
-            row[target] += r;
+            model_row[target] += r;
+        });
+        for (target, (&oracle_r, &model_r)) in row.iter().zip(&model_row).enumerate() {
+            assert!(
+                (model_r - oracle_r).abs() <= 1e-13 * oracle_r.max(1.0),
+                "site {i} -> {target}: model={model_r} vs oracle={oracle_r}"
+            );
         }
     }
 
     let pi = solve_stationary_ctmc(&rates);
-    let kbt = BOLTZMANN_EV_PER_K * temperature_k;
     let mut exact_boltzmann: Vec<f64> = (0..n_sites)
         .map(|s| {
-            let e = site_energies_ev[model.lattice().site_type(s)];
+            let e = site_energies_ev[model.lattice().site_type(s).unwrap()];
             (-e / kbt).exp()
         })
         .collect();
@@ -238,7 +254,8 @@ fn t2_multi_sublattice_energetics_obeys_exact_ctmc_stationary_boltzmann_and_tran
         );
         for j in 0..n_sites {
             assert!(
-                (pi[i] * rates[i][j] - pi[j] * rates[j][i]).abs() <= 1e-4 * pi[i].max(1e-12),
+                (pi[i] * rates[i][j] - pi[j] * rates[j][i]).abs()
+                    <= 1e-12 * (pi[i] * rates[i][j]).max(1.0),
                 "detailed balance violated ({i}, {j})"
             );
         }
@@ -260,8 +277,8 @@ fn t2_multi_sublattice_energetics_obeys_exact_ctmc_stationary_boltzmann_and_tran
         q
     };
 
-    let t_transient = 1.5e-10_f64;
-    let t_stationary = 5.0e-9_f64;
+    let t_transient = 2.0e-11_f64;
+    let t_stationary = 1.0e-9_f64;
     let p_transient = mat_exp(&scaled_q(t_transient))[0].clone();
     let p_eq = mat_exp(&scaled_q(t_stationary))[0].clone();
     let max_eq_err = p_eq
@@ -868,4 +885,86 @@ fn t4_reversible_undo_checkpoint_roundtrip_and_validation_errors() {
         .apply(&mut st_high, &IonHop { ion: 1, branch: 0 })
         .unwrap();
     assert_eq!(st_high.total_hops(), u128::from(u64::MAX) + 1);
+
+    // Checked accessors return None for out-of-range indices and Some for valid ones.
+    assert_eq!(sc.site_type(sc.site_count()), None);
+    assert_eq!(sc.site_coord_ticks(sc.site_count()), None);
+    assert!(sc.site_coord_ticks(0).is_some());
+    assert_eq!(
+        st_max_prep.ion_displacement_m(&sc, st_max_prep.ion_count()),
+        None
+    );
+    assert!(st_max_prep.ion_displacement_m(&sc, 0).is_some());
+    assert_eq!(model.transition_rate(0, 0, 0), Some(100.0));
+    assert_eq!(model.transition_rate(1, 0, 0), None);
+    assert_eq!(model.transition_rate(0, 1, 0), None);
+    assert_eq!(model.transition_rate(0, 0, 1), None);
+
+    // Sub-1e-90 metric scale stays valid without cross-product squaring underflow.
+    let tiny_sq = PeriodicLattice::square_2d([2, 2], 1e-90).unwrap();
+    assert_eq!(tiny_sq.site_count(), 4);
+    assert_eq!(tiny_sq.squared_displacement_m2([1, 0, 0]), 1e-180);
+
+    // Sparse site_type label in homogeneous model does not allocate label^2 storage and distinguishes param checkpoints.
+    let sparse_lat = PeriodicLattice::from_unit_cell(
+        [2, 2, 1],
+        [1, 1, 1],
+        [true, true, false],
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+        &[BasisSite {
+            offset_ticks: [0, 0, 0],
+            site_type: 1_000_000,
+        }],
+        &st_x,
+    )
+    .unwrap();
+    let m_sparse_a = LatticeHopping::homogeneous(sparse_lat.clone(), 12.0).unwrap();
+    let m_sparse_b = LatticeHopping::homogeneous(sparse_lat, 24.0).unwrap();
+    assert_eq!(
+        m_sparse_a.transition_rate(1_000_000, 1_000_000, 0),
+        Some(12.0)
+    );
+    assert_eq!(m_sparse_a.transition_rate(1_000_001, 0, 0), None);
+    let ckpt_sparse_a = Simulation::new(m_sparse_a, model.initial_state(&[0]).unwrap(), 1);
+    let mut pa = Vec::new();
+    let mut pb = Vec::new();
+    ckpt_sparse_a.model().encode_params(&mut pa);
+    m_sparse_b.encode_params(&mut pb);
+    assert_ne!(pa, pb);
+
+    // Log-space Arrhenius fallback preserves finite positive rates when exp(-barrier / kbt) underflows f64.
+    let t_underflow = 1.0_f64;
+    let barrier_750 = 750.0 * BOLTZMANN_EV_PER_K * t_underflow;
+    let m_underflow = LatticeHopping::with_energetics(
+        sc.clone(),
+        vec![0.0],
+        vec![PathwayParams {
+            attempt_frequency_hz: 1e30,
+            migration_barrier_ev: barrier_750,
+        }],
+        t_underflow,
+    )
+    .unwrap();
+    let r_underflow = m_underflow.transition_rate(0, 0, 0).unwrap();
+    assert!(r_underflow > 0.0 && r_underflow.is_finite());
+
+    // Zero-hop non-zero periodic-period displacement is rejected cleanly by check_invariants and decode_state.
+    let mut spoof_bytes = Vec::new();
+    model.encode_state(&st_max_prep, &mut spoof_bytes);
+    // Word 5 is dx0 (bytes 40..48); set to full period 3 while hop_counts[0] == 0.
+    spoof_bytes[40..48].copy_from_slice(&3_i64.to_le_bytes());
+    assert!(model.decode_state(&spoof_bytes).is_err());
+
+    // Mismatched smaller state in larger model's enumerate_events returns InvalidRate cleanly without panicking.
+    let big_model = LatticeHopping::homogeneous(
+        PeriodicLattice::simple_cubic([4, 4, 4], 3.0e-10).unwrap(),
+        10.0,
+    )
+    .unwrap();
+    let small_state = model.initial_state(&[0]).unwrap();
+    let mut mismatched_sim = Simulation::new(big_model, small_state, 5);
+    assert!(matches!(
+        mismatched_sim.step(),
+        Err(SimError::InvalidRate { .. })
+    ));
 }

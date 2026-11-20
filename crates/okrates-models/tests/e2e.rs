@@ -818,7 +818,7 @@ fn ionic_diffusion_small() {
         "lattice = fcc dim = 3 cells = [2, 2, 2] sites = 32 ions = 8 theta = 0.250000\n\
          rate = 1000 a_m = 3.6e-10 t_end = 0.005 runs = 8 seed = 42\n\
          mean_tracer_msd_m2 = 3.072937500000e-18 mean_collective_msd_m2 = 2.467462500000e-18\n\
-         D_tracer_m2_s = 1.024312500000e-16 D_collective_m2_s = 8.224875000000e-17 H_R = 1.245384 mean_steps = 369.875000\n\
+         D_tracer_m2_s = 1.024312500000e-16 D_collective_m2_s = 8.224875000000e-17 H_R = 1.245384 mean_steps = 368.875000\n\
          invariants = verified\n"
     );
 }
