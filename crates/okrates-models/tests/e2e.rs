@@ -865,3 +865,47 @@ fn ionic_diffusion_bad_args() {
     assert_eq!(stdout, "");
     assert!(stderr.contains("jump rate"), "stderr: {stderr}");
 }
+
+#[test]
+fn surface_catalysis_small() {
+    let (code, stdout, stderr) =
+        run(example("surface_catalysis").args(["19", "4", "0.05", "4", "4", "1.0", "1.0"]));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stderr, "");
+    assert_eq!(
+        stdout,
+        "surface = square2d cells = [4, 4] sites = 16 T = 550 p_CO = 1 p_O2 = 1\n\
+         t_end = 0.05 runs = 4 seed = 19\n\
+         mean_theta_CO = 0.218750 mean_theta_O = 0.328125 mean_theta_empty = 0.453125\n\
+         mean_tof_per_site_hz = 5.937500 mean_co2_events = 4.750000 mean_steps = 30.000000\n\
+         conservation = verified\n"
+    );
+}
+
+#[test]
+fn surface_catalysis_bad_args() {
+    let usage = "usage: surface_catalysis [seed] [runs] [t_end] [nx] [ny] [p_co_bar] [p_o2_bar]";
+    assert_usage_error(example("surface_catalysis").arg("bad"), usage);
+    assert_usage_error(
+        example("surface_catalysis").args(["19", "0", "0.05"]),
+        usage,
+    );
+    assert_usage_error(example("surface_catalysis").args(["19", "4", "0"]), usage);
+    assert_usage_error(example("surface_catalysis").args(["19", "4", "NaN"]), usage);
+    assert_usage_error(
+        example("surface_catalysis").args(["19", "4", "0.05", "4", "4", "1.0", "1.0", "extra"]),
+        usage,
+    );
+
+    let (code_nx, stdout_nx, stderr_nx) =
+        run(example("surface_catalysis").args(["19", "4", "0.05", "0", "4"]));
+    assert_eq!(code_nx, 1, "stderr: {stderr_nx}");
+    assert_eq!(stdout_nx, "");
+    assert!(stderr_nx.starts_with("error: "), "stderr: {stderr_nx}");
+
+    let (code_p, stdout_p, stderr_p) =
+        run(example("surface_catalysis").args(["19", "4", "0.05", "4", "4", "-1.0", "1.0"]));
+    assert_eq!(code_p, 1, "stderr: {stderr_p}");
+    assert_eq!(stdout_p, "");
+    assert!(stderr_p.contains("pressure"), "stderr: {stderr_p}");
+}
