@@ -871,6 +871,37 @@ impl PeriodicLattice {
     pub fn squared_displacement_m2(&self, delta_ticks: [i64; 3]) -> f64 {
         vec3_norm_sq(self.displacement_m(delta_ticks))
     }
+
+    pub fn geometry_hash(&self) -> u64 {
+        self.geometry_hash
+    }
+
+    pub(crate) fn encode_geometry(&self, out: &mut Vec<u8>) {
+        for axis in 0..3 {
+            out.extend_from_slice(&(self.cells[axis] as u64).to_le_bytes());
+            out.extend_from_slice(&(self.sub_ticks[axis] as u64).to_le_bytes());
+            out.push(u8::from(self.periodic_axes[axis]));
+            for component in self.tick_vectors_m[axis] {
+                out.extend_from_slice(&component.to_bits().to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&(self.site_count() as u64).to_le_bytes());
+        for site in 0..self.site_count() {
+            for q in self.site_coords_ticks[site] {
+                out.extend_from_slice(&q.to_le_bytes());
+            }
+            out.extend_from_slice(&(self.site_types[site] as u64).to_le_bytes());
+            out.extend_from_slice(&(self.adjacency[site].len() as u64).to_le_bytes());
+            for hop in &self.adjacency[site] {
+                out.extend_from_slice(&(hop.target as u64).to_le_bytes());
+                for d in hop.delta_ticks {
+                    out.extend_from_slice(&d.to_le_bytes());
+                }
+                out.extend_from_slice(&(hop.pathway as u64).to_le_bytes());
+                out.extend_from_slice(&(hop.reverse_branch as u64).to_le_bytes());
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1522,30 +1553,7 @@ impl Checkpointable for LatticeHopping {
     const MODEL_ID: &'static str = "okrates.lattice_hopping.v1";
 
     fn encode_params(&self, out: &mut Vec<u8>) {
-        for axis in 0..3 {
-            out.extend_from_slice(&(self.lattice.cells[axis] as u64).to_le_bytes());
-            out.extend_from_slice(&(self.lattice.sub_ticks[axis] as u64).to_le_bytes());
-            out.push(u8::from(self.lattice.periodic_axes[axis]));
-            for component in self.lattice.tick_vectors_m[axis] {
-                out.extend_from_slice(&component.to_bits().to_le_bytes());
-            }
-        }
-        out.extend_from_slice(&(self.lattice.site_count() as u64).to_le_bytes());
-        for site in 0..self.lattice.site_count() {
-            for q in self.lattice.site_coords_ticks[site] {
-                out.extend_from_slice(&q.to_le_bytes());
-            }
-            out.extend_from_slice(&(self.lattice.site_types[site] as u64).to_le_bytes());
-            out.extend_from_slice(&(self.lattice.adjacency[site].len() as u64).to_le_bytes());
-            for hop in &self.lattice.adjacency[site] {
-                out.extend_from_slice(&(hop.target as u64).to_le_bytes());
-                for d in hop.delta_ticks {
-                    out.extend_from_slice(&d.to_le_bytes());
-                }
-                out.extend_from_slice(&(hop.pathway as u64).to_le_bytes());
-                out.extend_from_slice(&(hop.reverse_branch as u64).to_le_bytes());
-            }
-        }
+        self.lattice.encode_geometry(out);
         match &self.rates {
             RateTable::Uniform(rate) => {
                 out.push(0);
